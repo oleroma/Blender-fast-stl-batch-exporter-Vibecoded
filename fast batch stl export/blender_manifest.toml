@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+id = "fast_batch_stl_exporter"
+version = "4.2.0"
+name = "Fast Batch STL Exporter"
+tagline = "Export to stl of collections to a directory with sub folders"
+description = "High-performance export of collections to a dynamic root directory using viewport evaluated data."
+maintainer = "AI"
+type = "add-on"
+build_date = "2026-07-24"
+license = [
+    "SPDX:GPL-3.0-or-later"
+]
+tags = ["Import-Export"]
+blender_version_min = "5.2.0"
