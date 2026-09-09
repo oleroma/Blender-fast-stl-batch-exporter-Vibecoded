@@ -1,6 +1,15 @@
 import os
+import json
 import bpy
 import struct
+from bpy_extras.io_utils import ExportHelper, ImportHelper
+
+# --- SESSION CLIPBOARD ---
+# Stores copied items in memory during the Blender session
+_clipboard = {
+    "mapping": None,
+    "override": None
+}
 
 # --- FAST EXPORT FUNCTION ---
 
@@ -87,7 +96,6 @@ class BatchSTLNodeInput(bpy.types.PropertyGroup):
 
 class BatchSTLNodeOverride(bpy.types.PropertyGroup):
     parent_group: bpy.props.StringProperty(name="Parent Group", default="")
-    # Updated to reflect comma-separated capability
     node_name: bpy.props.StringProperty(name="Node Name(s)", description="Comma-separated list of nodes", default="")
 
     inputs: bpy.props.CollectionProperty(type=BatchSTLNodeInput)
@@ -106,6 +114,91 @@ class BatchSTLExportPreset(bpy.types.PropertyGroup):
 
     show_mappings: bpy.props.BoolProperty(default=True)
     show_overrides: bpy.props.BoolProperty(default=True)
+
+# --- JSON IMPORT/EXPORT OPERATORS ---
+
+class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
+    bl_idname = "batch_stl.export_presets_json"
+    bl_label = "Export Presets to JSON"
+    filename_ext = ".json"
+
+    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
+
+    def execute(self, context):
+        data = []
+        for p in context.scene.batch_stl_presets:
+            p_data = {"name": p.name, "mappings": [], "overrides": []}
+            for m in p.mappings:
+                p_data["mappings"].append({
+                    "collection_name": m.collection_name,
+                    "sub_path": m.sub_path
+                })
+            for o in p.node_overrides:
+                o_data = {
+                    "parent_group": o.parent_group,
+                    "node_name": o.node_name,
+                    "inputs": []
+                }
+                for i in o.inputs:
+                    o_data["inputs"].append({
+                        "input_name": i.input_name,
+                        "override_type": i.override_type,
+                        "value_bool": i.value_bool,
+                        "value_int": i.value_int,
+                        "value_float": i.value_float,
+                        "value_string": i.value_string
+                    })
+                p_data["overrides"].append(o_data)
+            data.append(p_data)
+
+        try:
+            with open(self.filepath, 'w') as f:
+                json.dump(data, f, indent=4)
+            self.report({'INFO'}, f"Exported presets to {self.filepath}")
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to export JSON: {e}")
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
+    bl_idname = "batch_stl.import_presets_json"
+    bl_label = "Import Presets from JSON"
+    filename_ext = ".json"
+
+    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
+
+    def execute(self, context):
+        try:
+            with open(self.filepath, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to read JSON: {e}")
+            return {'CANCELLED'}
+
+        lst = context.scene.batch_stl_presets
+        for p_data in data:
+            p = lst.add()
+            p.name = p_data.get("name", "Imported Preset")
+            for m_data in p_data.get("mappings", []):
+                m = p.mappings.add()
+                m.collection_name = m_data.get("collection_name", "")
+                m.sub_path = m_data.get("sub_path", "")
+            for o_data in p_data.get("overrides", []):
+                o = p.node_overrides.add()
+                o.parent_group = o_data.get("parent_group", "")
+                o.node_name = o_data.get("node_name", "")
+                for i_data in o_data.get("inputs", []):
+                    i = o.inputs.add()
+                    i.input_name = i_data.get("input_name", "")
+                    i.override_type = i_data.get("override_type", "BOOLEAN")
+                    i.value_bool = i_data.get("value_bool", True)
+                    i.value_int = i_data.get("value_int", 0)
+                    i.value_float = i_data.get("value_float", 0.0)
+                    i.value_string = i_data.get("value_string", "")
+
+        self.report({'INFO'}, f"Imported presets from {self.filepath}")
+        return {'FINISHED'}
 
 # --- PRESET OPERATORS ---
 
@@ -160,7 +253,11 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
 class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
     bl_idname = "batch_stl.mapping_actions"
     bl_label = "Mapping Actions"
-    action: bpy.props.EnumProperty(items=(('ADD', "Add", ""), ('REMOVE', "Remove", ""), ('UP', "Up", ""), ('DOWN', "Down", ""), ('DUPLICATE', "Duplicate", "")))
+    action: bpy.props.EnumProperty(items=(
+        ('ADD', "Add", ""), ('REMOVE', "Remove", ""),
+        ('UP', "Up", ""), ('DOWN', "Down", ""),
+        ('DUPLICATE', "Duplicate", ""), ('COPY', "Copy", ""), ('PASTE', "Paste", "")
+    ))
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -186,6 +283,20 @@ class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
             new_item.collection_name = src.collection_name
             new_item.sub_path = src.sub_path
             preset.mapping_index = len(lst) - 1
+        elif self.action == 'COPY' and lst:
+            src = lst[idx]
+            _clipboard["mapping"] = {
+                "collection_name": src.collection_name,
+                "sub_path": src.sub_path
+            }
+            self.report({'INFO'}, f"Copied Mapping: {src.collection_name}")
+        elif self.action == 'PASTE' and _clipboard.get("mapping"):
+            data = _clipboard["mapping"]
+            new_item = lst.add()
+            new_item.collection_name = data["collection_name"]
+            new_item.sub_path = data["sub_path"]
+            preset.mapping_index = len(lst) - 1
+            self.report({'INFO'}, f"Pasted Mapping: {data['collection_name']}")
         return {'FINISHED'}
 
 # --- OVERRIDE OPERATORS ---
@@ -193,7 +304,11 @@ class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
 class BATCH_STL_OT_override_actions(bpy.types.Operator):
     bl_idname = "batch_stl.override_actions"
     bl_label = "Override Actions"
-    action: bpy.props.EnumProperty(items=(('ADD', "Add", ""), ('REMOVE', "Remove", ""), ('UP', "Up", ""), ('DOWN', "Down", ""), ('DUPLICATE', "Duplicate", "")))
+    action: bpy.props.EnumProperty(items=(
+        ('ADD', "Add", ""), ('REMOVE', "Remove", ""),
+        ('UP', "Up", ""), ('DOWN', "Down", ""),
+        ('DUPLICATE', "Duplicate", ""), ('COPY', "Copy", ""), ('PASTE', "Paste", "")
+    ))
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -227,6 +342,39 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
                 new_i.value_float = i.value_float
                 new_i.value_string = i.value_string
             preset.node_override_index = len(lst) - 1
+        elif self.action == 'COPY' and lst:
+            src = lst[idx]
+            data = {
+                "parent_group": src.parent_group,
+                "node_name": src.node_name,
+                "inputs": []
+            }
+            for i in src.inputs:
+                data["inputs"].append({
+                    "input_name": i.input_name,
+                    "override_type": i.override_type,
+                    "value_bool": i.value_bool,
+                    "value_int": i.value_int,
+                    "value_float": i.value_float,
+                    "value_string": i.value_string
+                })
+            _clipboard["override"] = data
+            self.report({'INFO'}, f"Copied Node Target: {src.node_name}")
+        elif self.action == 'PASTE' and _clipboard.get("override"):
+            data = _clipboard["override"]
+            new_item = lst.add()
+            new_item.parent_group = data["parent_group"]
+            new_item.node_name = data["node_name"]
+            for i_data in data["inputs"]:
+                new_i = new_item.inputs.add()
+                new_i.input_name = i_data["input_name"]
+                new_i.override_type = i_data["override_type"]
+                new_i.value_bool = i_data["value_bool"]
+                new_i.value_int = i_data["value_int"]
+                new_i.value_float = i_data["value_float"]
+                new_i.value_string = i_data["value_string"]
+            preset.node_override_index = len(lst) - 1
+            self.report({'INFO'}, f"Pasted Node Target: {data['node_name']}")
         return {'FINISHED'}
 
 # --- INPUT OPERATORS ---
@@ -305,7 +453,6 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         total_exported = 0
 
         try:
-            # 1. Validate and Apply Overrides
             for override in preset.node_overrides:
                 if not override.parent_group or not override.node_name:
                     continue
@@ -315,7 +462,6 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                     self.report({'WARNING'}, f"Node group '{override.parent_group}' not found. Export aborted.")
                     return {"CANCELLED"}
 
-                # Split comma-separated node names
                 node_names = [n.strip() for n in override.node_name.split(',')]
 
                 for n_name in node_names:
@@ -336,7 +482,6 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                             self.report({'WARNING'}, f"Input '{inp.input_name}' not found on node '{n_name}'. Skipping.")
                             continue
 
-                        # Record the original state before changing it
                         original_states.append((socket, socket.default_value))
 
                         if inp.override_type == 'BOOLEAN':
@@ -351,7 +496,6 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             if original_states:
                 context.view_layer.update()
 
-            # 2. Export Phase
             depsgraph = context.evaluated_depsgraph_get()
 
             for item in preset.mappings:
@@ -383,12 +527,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                     total_exported += 1
 
         except Exception as e:
-            # Catch unexpected Python errors during override application or export
             self.report({'ERROR'}, f"Export failed with error: {str(e)}")
             return {"CANCELLED"}
 
         finally:
-            # 3. Guaranteed Cleanup and Restoration
             for socket, original_val in original_states:
                 try:
                     socket.default_value = original_val
@@ -445,7 +587,7 @@ class BATCH_STL_UL_inputs(bpy.types.UIList):
 
 # --- UI PANEL ---
 
-def draw_list_controls(layout, operator_id):
+def draw_list_controls(layout, operator_id, use_clipboard=False):
     col = layout.column(align=True)
     col.operator(operator_id, icon='ADD', text="").action = 'ADD'
     col.operator(operator_id, icon='REMOVE', text="").action = 'REMOVE'
@@ -454,6 +596,10 @@ def draw_list_controls(layout, operator_id):
     col.operator(operator_id, icon='TRIA_DOWN', text="").action = 'DOWN'
     col.separator()
     col.operator(operator_id, icon='DUPLICATE', text="").action = 'DUPLICATE'
+    if use_clipboard:
+        col.separator()
+        col.operator(operator_id, icon='COPYDOWN', text="").action = 'COPY'
+        col.operator(operator_id, icon='PASTEDOWN', text="").action = 'PASTE'
 
 class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
@@ -473,10 +619,14 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         row.prop(scene, "batch_stl_show_presets", icon=icon_presets, icon_only=True, emboss=False)
         row.label(text="Export Presets:", icon='PRESET')
 
+        # Add global Import/Export JSON buttons
+        row.operator("batch_stl.import_presets_json", text="", icon='IMPORT')
+        row.operator("batch_stl.export_presets_json", text="", icon='EXPORT')
+
         if scene.batch_stl_show_presets:
             p_row = layout.row()
             p_row.template_list("BATCH_STL_UL_presets", "", scene, "batch_stl_presets", scene, "batch_stl_preset_index", rows=3)
-            draw_list_controls(p_row, "batch_stl.preset_actions")
+            draw_list_controls(p_row, "batch_stl.preset_actions", use_clipboard=False)
 
         active_preset = get_active_preset(scene)
         if active_preset is None:
@@ -493,7 +643,8 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         if active_preset.show_mappings:
             m_row = box.row()
             m_row.template_list("BATCH_STL_UL_items", "", active_preset, "mappings", active_preset, "mapping_index", rows=3)
-            draw_list_controls(m_row, "batch_stl.mapping_actions")
+            # Enabled Clipboard Support
+            draw_list_controls(m_row, "batch_stl.mapping_actions", use_clipboard=True)
 
             if active_preset.mappings and 0 <= active_preset.mapping_index < len(active_preset.mappings):
                 active_item = active_preset.mappings[active_preset.mapping_index]
@@ -512,13 +663,13 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         if active_preset.show_overrides:
             orow = obox.row()
             orow.template_list("BATCH_STL_UL_overrides", "", active_preset, "node_overrides", active_preset, "node_override_index", rows=3)
-            draw_list_controls(orow, "batch_stl.override_actions")
+            # Enabled Clipboard Support
+            draw_list_controls(orow, "batch_stl.override_actions", use_clipboard=True)
 
             active_ovr = get_active_override(active_preset)
             if active_ovr:
                 sub_obox = obox.box()
                 sub_obox.prop_search(active_ovr, "parent_group", bpy.data, "node_groups", text="Parent Group")
-                # Updated UI label to show users they can use multiple names
                 sub_obox.prop(active_ovr, "node_name", text="Target Node Name(s)")
 
                 sub_obox.separator()
@@ -531,7 +682,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 if active_ovr.show_inputs:
                     irow = sub_obox.row()
                     irow.template_list("BATCH_STL_UL_inputs", "", active_ovr, "inputs", active_ovr, "input_index", rows=3)
-                    draw_list_controls(irow, "batch_stl.input_actions")
+                    draw_list_controls(irow, "batch_stl.input_actions", use_clipboard=False)
 
                     if active_ovr.inputs and 0 <= active_ovr.input_index < len(active_ovr.inputs):
                         active_inp = active_ovr.inputs[active_ovr.input_index]
@@ -563,6 +714,8 @@ classes = (
     BATCH_STL_OT_mapping_actions,
     BATCH_STL_OT_override_actions,
     BATCH_STL_OT_input_actions,
+    BATCH_STL_OT_export_presets_json,
+    BATCH_STL_OT_import_presets_json,
     EXPORT_OT_batch_stl_multi,
     VIEW3D_PT_batch_export_stl_multi,
 )
