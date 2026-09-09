@@ -120,6 +120,7 @@ class BatchSTLExportPreset(bpy.types.PropertyGroup):
 class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
     bl_idname = "batch_stl.export_presets_json"
     bl_label = "Export Presets to JSON"
+    bl_description = "Export all presets and their settings to a JSON file"
     filename_ext = ".json"
 
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
@@ -164,6 +165,7 @@ class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
 class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     bl_idname = "batch_stl.import_presets_json"
     bl_label = "Import Presets from JSON"
+    bl_description = "Import presets and their settings from a JSON file"
     filename_ext = ".json"
 
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
@@ -206,6 +208,16 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     bl_idname = "batch_stl.preset_actions"
     bl_label = "Preset Actions"
     action: bpy.props.EnumProperty(items=(('ADD', "Add", ""), ('REMOVE', "Remove", ""), ('UP', "Up", ""), ('DOWN', "Down", ""), ('DUPLICATE', "Duplicate", "")))
+
+    @classmethod
+    def description(cls, context, properties):
+        action = properties.action
+        if action == 'ADD': return "Add a new preset"
+        if action == 'REMOVE': return "Remove the selected preset"
+        if action == 'UP': return "Move preset up"
+        if action == 'DOWN': return "Move preset down"
+        if action == 'DUPLICATE': return "Duplicate the selected preset"
+        return "Modify presets"
 
     def execute(self, context):
         scene = context.scene
@@ -259,6 +271,18 @@ class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
         ('DUPLICATE', "Duplicate", ""), ('COPY', "Copy", ""), ('PASTE', "Paste", "")
     ))
 
+    @classmethod
+    def description(cls, context, properties):
+        action = properties.action
+        if action == 'ADD': return "Add a new collection mapping"
+        if action == 'REMOVE': return "Remove the selected mapping"
+        if action == 'UP': return "Move mapping up"
+        if action == 'DOWN': return "Move mapping down"
+        if action == 'DUPLICATE': return "Duplicate the selected mapping"
+        if action == 'COPY': return "Copy the selected mapping to clipboard"
+        if action == 'PASTE': return "Paste mapping from clipboard"
+        return "Modify mappings"
+
     def execute(self, context):
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}
@@ -309,6 +333,18 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
         ('UP', "Up", ""), ('DOWN', "Down", ""),
         ('DUPLICATE', "Duplicate", ""), ('COPY', "Copy", ""), ('PASTE', "Paste", "")
     ))
+
+    @classmethod
+    def description(cls, context, properties):
+        action = properties.action
+        if action == 'ADD': return "Add a new node override"
+        if action == 'REMOVE': return "Remove the selected override"
+        if action == 'UP': return "Move override up"
+        if action == 'DOWN': return "Move override down"
+        if action == 'DUPLICATE': return "Duplicate the selected override"
+        if action == 'COPY': return "Copy the selected override (and its inputs) to clipboard"
+        if action == 'PASTE': return "Paste override from clipboard"
+        return "Modify node overrides"
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -384,6 +420,16 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
     bl_label = "Input Actions"
     action: bpy.props.EnumProperty(items=(('ADD', "Add", ""), ('REMOVE', "Remove", ""), ('UP', "Up", ""), ('DOWN', "Down", ""), ('DUPLICATE', "Duplicate", "")))
 
+    @classmethod
+    def description(cls, context, properties):
+        action = properties.action
+        if action == 'ADD': return "Add a new input parameter"
+        if action == 'REMOVE': return "Remove the selected input parameter"
+        if action == 'UP': return "Move input up"
+        if action == 'DOWN': return "Move input down"
+        if action == 'DUPLICATE': return "Duplicate the selected input"
+        return "Modify inputs"
+
     def execute(self, context):
         preset = get_active_preset(context.scene)
         ovr = get_active_override(preset)
@@ -421,6 +467,7 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
     bl_label = "Batch Export STLs"
+    bl_description = "Export collections to STL files using the configured preset overrides"
     bl_options = {"REGISTER"}
 
     preset_index: bpy.props.IntProperty(default=-1)
@@ -643,7 +690,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         if active_preset.show_mappings:
             m_row = box.row()
             m_row.template_list("BATCH_STL_UL_items", "", active_preset, "mappings", active_preset, "mapping_index", rows=3)
-            # Enabled Clipboard Support
             draw_list_controls(m_row, "batch_stl.mapping_actions", use_clipboard=True)
 
             if active_preset.mappings and 0 <= active_preset.mapping_index < len(active_preset.mappings):
@@ -663,7 +709,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         if active_preset.show_overrides:
             orow = obox.row()
             orow.template_list("BATCH_STL_UL_overrides", "", active_preset, "node_overrides", active_preset, "node_override_index", rows=3)
-            # Enabled Clipboard Support
             draw_list_controls(orow, "batch_stl.override_actions", use_clipboard=True)
 
             active_ovr = get_active_override(active_preset)
