@@ -87,7 +87,8 @@ class BatchSTLNodeInput(bpy.types.PropertyGroup):
 
 class BatchSTLNodeOverride(bpy.types.PropertyGroup):
     parent_group: bpy.props.StringProperty(name="Parent Group", default="")
-    node_name: bpy.props.StringProperty(name="Node Name", default="")
+    # Updated to reflect comma-separated capability
+    node_name: bpy.props.StringProperty(name="Node Name(s)", description="Comma-separated list of nodes", default="")
 
     inputs: bpy.props.CollectionProperty(type=BatchSTLNodeInput)
     input_index: bpy.props.IntProperty(default=0)
@@ -269,8 +270,6 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
 
 # --- FAST EXPORT OPERATOR ---
 
-# --- FAST EXPORT OPERATOR ---
-
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
     bl_label = "Batch Export STLs"
@@ -316,31 +315,38 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                     self.report({'WARNING'}, f"Node group '{override.parent_group}' not found. Export aborted.")
                     return {"CANCELLED"}
 
-                target_node = parent_tree.nodes.get(override.node_name)
-                if not target_node:
-                    self.report({'WARNING'}, f"Node '{override.node_name}' not found in '{override.parent_group}'. Export aborted.")
-                    return {"CANCELLED"}
+                # Split comma-separated node names
+                node_names = [n.strip() for n in override.node_name.split(',')]
 
-                for inp in override.inputs:
-                    if not inp.input_name:
+                for n_name in node_names:
+                    if not n_name:
                         continue
 
-                    socket = target_node.inputs.get(inp.input_name)
-                    if not socket:
-                        self.report({'WARNING'}, f"Input '{inp.input_name}' not found on node '{override.node_name}'. Export aborted.")
-                        return {"CANCELLED"}
+                    target_node = parent_tree.nodes.get(n_name)
+                    if not target_node:
+                        self.report({'WARNING'}, f"Node '{n_name}' not found in '{override.parent_group}'. Skipping.")
+                        continue
 
-                    # Record the original state before changing it
-                    original_states.append((socket, socket.default_value))
+                    for inp in override.inputs:
+                        if not inp.input_name:
+                            continue
 
-                    if inp.override_type == 'BOOLEAN':
-                        socket.default_value = inp.value_bool
-                    elif inp.override_type == 'INT':
-                        socket.default_value = inp.value_int
-                    elif inp.override_type == 'FLOAT':
-                        socket.default_value = inp.value_float
-                    elif inp.override_type == 'STRING':
-                        socket.default_value = inp.value_string
+                        socket = target_node.inputs.get(inp.input_name)
+                        if not socket:
+                            self.report({'WARNING'}, f"Input '{inp.input_name}' not found on node '{n_name}'. Skipping.")
+                            continue
+
+                        # Record the original state before changing it
+                        original_states.append((socket, socket.default_value))
+
+                        if inp.override_type == 'BOOLEAN':
+                            socket.default_value = inp.value_bool
+                        elif inp.override_type == 'INT':
+                            socket.default_value = inp.value_int
+                        elif inp.override_type == 'FLOAT':
+                            socket.default_value = inp.value_float
+                        elif inp.override_type == 'STRING':
+                            socket.default_value = inp.value_string
 
             if original_states:
                 context.view_layer.update()
@@ -512,7 +518,8 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             if active_ovr:
                 sub_obox = obox.box()
                 sub_obox.prop_search(active_ovr, "parent_group", bpy.data, "node_groups", text="Parent Group")
-                sub_obox.prop(active_ovr, "node_name", text="Target Node Name")
+                # Updated UI label to show users they can use multiple names
+                sub_obox.prop(active_ovr, "node_name", text="Target Node Name(s)")
 
                 sub_obox.separator()
 
