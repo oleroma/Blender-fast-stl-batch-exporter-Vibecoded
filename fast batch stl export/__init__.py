@@ -269,6 +269,8 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
 
 # --- FAST EXPORT OPERATOR ---
 
+# --- FAST EXPORT OPERATOR ---
+
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
     bl_label = "Batch Export STLs"
@@ -301,45 +303,49 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             bpy.ops.object.mode_set(mode="OBJECT")
 
         original_states = []
-        for override in preset.node_overrides:
-            if not override.parent_group or not override.node_name:
-                continue
-
-            parent_tree = bpy.data.node_groups.get(override.parent_group)
-            if not parent_tree:
-                continue
-
-            target_node = parent_tree.nodes.get(override.node_name)
-            if not target_node:
-                self.report({'WARNING'}, f"Node '{override.node_name}' not found in '{override.parent_group}'")
-                continue
-
-            for inp in override.inputs:
-                if not inp.input_name:
-                    continue
-
-                socket = target_node.inputs.get(inp.input_name)
-                if not socket:
-                    self.report({'WARNING'}, f"Input '{inp.input_name}' not found on node '{override.node_name}'")
-                    continue
-
-                original_states.append((socket, socket.default_value))
-
-                if inp.override_type == 'BOOLEAN':
-                    socket.default_value = inp.value_bool
-                elif inp.override_type == 'INT':
-                    socket.default_value = inp.value_int
-                elif inp.override_type == 'FLOAT':
-                    socket.default_value = inp.value_float
-                elif inp.override_type == 'STRING':
-                    socket.default_value = inp.value_string
-
-        if original_states:
-            context.view_layer.update()
-
         total_exported = 0
 
         try:
+            # 1. Validate and Apply Overrides
+            for override in preset.node_overrides:
+                if not override.parent_group or not override.node_name:
+                    continue
+
+                parent_tree = bpy.data.node_groups.get(override.parent_group)
+                if not parent_tree:
+                    self.report({'WARNING'}, f"Node group '{override.parent_group}' not found. Export aborted.")
+                    return {"CANCELLED"}
+
+                target_node = parent_tree.nodes.get(override.node_name)
+                if not target_node:
+                    self.report({'WARNING'}, f"Node '{override.node_name}' not found in '{override.parent_group}'. Export aborted.")
+                    return {"CANCELLED"}
+
+                for inp in override.inputs:
+                    if not inp.input_name:
+                        continue
+
+                    socket = target_node.inputs.get(inp.input_name)
+                    if not socket:
+                        self.report({'WARNING'}, f"Input '{inp.input_name}' not found on node '{override.node_name}'. Export aborted.")
+                        return {"CANCELLED"}
+
+                    # Record the original state before changing it
+                    original_states.append((socket, socket.default_value))
+
+                    if inp.override_type == 'BOOLEAN':
+                        socket.default_value = inp.value_bool
+                    elif inp.override_type == 'INT':
+                        socket.default_value = inp.value_int
+                    elif inp.override_type == 'FLOAT':
+                        socket.default_value = inp.value_float
+                    elif inp.override_type == 'STRING':
+                        socket.default_value = inp.value_string
+
+            if original_states:
+                context.view_layer.update()
+
+            # 2. Export Phase
             depsgraph = context.evaluated_depsgraph_get()
 
             for item in preset.mappings:
@@ -370,14 +376,24 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                     obj_eval.to_mesh_clear()
                     total_exported += 1
 
+        except Exception as e:
+            # Catch unexpected Python errors during override application or export
+            self.report({'ERROR'}, f"Export failed with error: {str(e)}")
+            return {"CANCELLED"}
+
         finally:
+            # 3. Guaranteed Cleanup and Restoration
             for socket, original_val in original_states:
-                socket.default_value = original_val
+                try:
+                    socket.default_value = original_val
+                except Exception:
+                    pass
 
             if original_states:
                 context.view_layer.update()
 
-        self.report({'INFO'}, f"Successfully exported {total_exported} STLs using '{preset.name}'")
+        if total_exported > 0:
+            self.report({'INFO'}, f"Successfully exported {total_exported} STLs using '{preset.name}'")
         return {"FINISHED"}
 
 # --- UI LISTS ---
