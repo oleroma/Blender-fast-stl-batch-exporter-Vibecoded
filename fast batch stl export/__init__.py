@@ -5,7 +5,6 @@ import struct
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 # --- SESSION CLIPBOARD ---
-# Stores copied items in memory during the Blender session
 _clipboard = {
     "mapping": None,
     "override": None
@@ -71,6 +70,78 @@ def get_active_override(preset):
         return preset.node_overrides[preset.node_override_index]
     return None
 
+def get_modifier_socket_identifier(node_group, socket_name):
+    if hasattr(node_group, "interface"):
+        for item in node_group.interface.items_tree:
+            if getattr(item, "item_type", "") == 'SOCKET' and item.name == socket_name:
+                return item.identifier
+    else:
+        for inp in node_group.inputs:
+            if inp.name == socket_name:
+                return inp.identifier
+    return None
+
+def get_modifier_socket_default(node_group, socket_name):
+    if hasattr(node_group, "interface"):
+        for item in node_group.interface.items_tree:
+            if getattr(item, "item_type", "") == 'SOCKET' and item.name == socket_name:
+                return getattr(item, "default_value", None)
+    else:
+        for inp in node_group.inputs:
+            if inp.name == socket_name:
+                return getattr(inp, "default_value", None)
+    return None
+
+# --- MODERN MODIFIER INPUT HELPERS ---
+
+def get_modifier_input(mod, ident):
+    # Try Blender < 5.x ID Property method
+    try:
+        if mod.is_property_set(ident):
+            return mod[ident], True
+    except Exception:
+        pass
+
+    # Try Blender 5.x+ specific properties.inputs grouping
+    if hasattr(mod, "properties") and hasattr(mod.properties, "inputs"):
+        prop_input = getattr(mod.properties.inputs, ident, None)
+        if prop_input is not None and hasattr(prop_input, "value"):
+            return prop_input.value, True
+
+    return None, False
+
+def set_modifier_input(mod, ident, value):
+    # Try Blender < 5.x ID Property method
+    try:
+        mod[ident] = value
+        return
+    except TypeError:
+        # Fails explicitly when 'id properties not supported for this type'
+        pass
+    except Exception:
+        pass
+
+    # Try Blender 5.x+ specific properties.inputs grouping
+    if hasattr(mod, "properties") and hasattr(mod.properties, "inputs"):
+        prop_input = getattr(mod.properties.inputs, ident, None)
+        if prop_input is not None and hasattr(prop_input, "value"):
+            prop_input.value = value
+
+def unset_modifier_input(mod, ident, default_val):
+    # Try Blender < 5.x native unset
+    try:
+        mod.property_unset(ident)
+        return
+    except Exception:
+        pass
+
+    # Try Blender 5.x+ specific properties.inputs grouping (restore to default)
+    if hasattr(mod, "properties") and hasattr(mod.properties, "inputs"):
+        prop_input = getattr(mod.properties.inputs, ident, None)
+        if prop_input is not None and hasattr(prop_input, "value") and default_val is not None:
+            prop_input.value = default_val
+
+
 # --- PROPERTIES ---
 
 class BatchSTLExportItem(bpy.types.PropertyGroup):
@@ -95,8 +166,16 @@ class BatchSTLNodeInput(bpy.types.PropertyGroup):
     value_string: bpy.props.StringProperty(name="Value", default="")
 
 class BatchSTLNodeOverride(bpy.types.PropertyGroup):
-    parent_group: bpy.props.StringProperty(name="Parent Group", default="")
-    node_name: bpy.props.StringProperty(name="Node Name(s)", description="Comma-separated list of nodes", default="")
+    override_target: bpy.props.EnumProperty(
+        name="Target",
+        items=(
+            ('NODE', "Internal Node", "Override a specific node inside a group globally"),
+            ('MODIFIER', "Modifier", "Override the geometry node modifier properties per-object")
+        ),
+        default='NODE'
+    )
+    parent_group: bpy.props.StringProperty(name="Node Group", default="")
+    node_name: bpy.props.StringProperty(name="Node Name(s)", description="Comma-separated list of nodes (Only used for Internal Node target)", default="")
 
     inputs: bpy.props.CollectionProperty(type=BatchSTLNodeInput)
     input_index: bpy.props.IntProperty(default=0)
@@ -137,6 +216,7 @@ class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
                 })
             for o in p.node_overrides:
                 o_data = {
+                    "override_target": o.override_target,
                     "parent_group": o.parent_group,
                     "node_name": o.node_name,
                     "inputs": []
@@ -190,6 +270,7 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
                 m.sub_path = m_data.get("sub_path", "")
             for o_data in p_data.get("overrides", []):
                 o = p.node_overrides.add()
+                o.override_target = o_data.get("override_target", 'NODE')
                 o.parent_group = o_data.get("parent_group", "")
                 o.node_name = o_data.get("node_name", "")
                 for i_data in o_data.get("inputs", []):
@@ -210,16 +291,6 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     bl_idname = "batch_stl.preset_actions"
     bl_label = "Preset Actions"
     action: bpy.props.EnumProperty(items=(('ADD', "Add", ""), ('REMOVE', "Remove", ""), ('UP', "Up", ""), ('DOWN', "Down", ""), ('DUPLICATE', "Duplicate", "")))
-
-    @classmethod
-    def description(cls, context, properties):
-        action = properties.action
-        if action == 'ADD': return "Add a new preset"
-        if action == 'REMOVE': return "Remove the selected preset"
-        if action == 'UP': return "Move preset up"
-        if action == 'DOWN': return "Move preset down"
-        if action == 'DUPLICATE': return "Duplicate the selected preset"
-        return "Modify presets"
 
     def execute(self, context):
         scene = context.scene
@@ -250,6 +321,7 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
                 new_m.sub_path = m.sub_path
             for o in src.node_overrides:
                 new_o = new_item.node_overrides.add()
+                new_o.override_target = o.override_target
                 new_o.parent_group = o.parent_group
                 new_o.node_name = o.node_name
                 for i in o.inputs:
@@ -273,18 +345,6 @@ class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
         ('UP', "Up", ""), ('DOWN', "Down", ""),
         ('DUPLICATE', "Duplicate", ""), ('COPY', "Copy", ""), ('PASTE', "Paste", "")
     ))
-
-    @classmethod
-    def description(cls, context, properties):
-        action = properties.action
-        if action == 'ADD': return "Add a new collection mapping"
-        if action == 'REMOVE': return "Remove the selected mapping"
-        if action == 'UP': return "Move mapping up"
-        if action == 'DOWN': return "Move mapping down"
-        if action == 'DUPLICATE': return "Duplicate the selected mapping"
-        if action == 'COPY': return "Copy the selected mapping to clipboard"
-        if action == 'PASTE': return "Paste mapping from clipboard"
-        return "Modify mappings"
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -337,18 +397,6 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
         ('DUPLICATE', "Duplicate", ""), ('COPY', "Copy", ""), ('PASTE', "Paste", "")
     ))
 
-    @classmethod
-    def description(cls, context, properties):
-        action = properties.action
-        if action == 'ADD': return "Add a new node override"
-        if action == 'REMOVE': return "Remove the selected override"
-        if action == 'UP': return "Move override up"
-        if action == 'DOWN': return "Move override down"
-        if action == 'DUPLICATE': return "Duplicate the selected override"
-        if action == 'COPY': return "Copy the selected override (and its inputs) to clipboard"
-        if action == 'PASTE': return "Paste override from clipboard"
-        return "Modify node overrides"
-
     def execute(self, context):
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}
@@ -370,6 +418,7 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
         elif self.action == 'DUPLICATE' and lst:
             src = lst[idx]
             new_item = lst.add()
+            new_item.override_target = src.override_target
             new_item.parent_group = src.parent_group
             new_item.node_name = src.node_name
             for i in src.inputs:
@@ -384,6 +433,7 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
         elif self.action == 'COPY' and lst:
             src = lst[idx]
             data = {
+                "override_target": src.override_target,
                 "parent_group": src.parent_group,
                 "node_name": src.node_name,
                 "inputs": []
@@ -398,10 +448,11 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
                     "value_string": i.value_string
                 })
             _clipboard["override"] = data
-            self.report({'INFO'}, f"Copied Node Target: {src.node_name}")
+            self.report({'INFO'}, f"Copied Target: {src.parent_group}")
         elif self.action == 'PASTE' and _clipboard.get("override"):
             data = _clipboard["override"]
             new_item = lst.add()
+            new_item.override_target = data["override_target"]
             new_item.parent_group = data["parent_group"]
             new_item.node_name = data["node_name"]
             for i_data in data["inputs"]:
@@ -413,7 +464,7 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
                 new_i.value_float = i_data["value_float"]
                 new_i.value_string = i_data["value_string"]
             preset.node_override_index = len(lst) - 1
-            self.report({'INFO'}, f"Pasted Node Target: {data['node_name']}")
+            self.report({'INFO'}, f"Pasted Target: {data['parent_group']}")
         return {'FINISHED'}
 
 # --- INPUT OPERATORS ---
@@ -422,16 +473,6 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
     bl_idname = "batch_stl.input_actions"
     bl_label = "Input Actions"
     action: bpy.props.EnumProperty(items=(('ADD', "Add", ""), ('REMOVE', "Remove", ""), ('UP', "Up", ""), ('DOWN', "Down", ""), ('DUPLICATE', "Duplicate", "")))
-
-    @classmethod
-    def description(cls, context, properties):
-        action = properties.action
-        if action == 'ADD': return "Add a new input parameter"
-        if action == 'REMOVE': return "Remove the selected input parameter"
-        if action == 'UP': return "Move input up"
-        if action == 'DOWN': return "Move input down"
-        if action == 'DUPLICATE': return "Duplicate the selected input"
-        return "Modify inputs"
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -496,19 +537,19 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
         root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
 
-        # Apply preset specific root directory prefix if set
         if preset.preset_prefix:
             root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
 
         if context.active_object and context.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
 
-        original_states = []
+        global_original_states = []
         total_exported = 0
 
         try:
+            # 1. Apply GLOBAL internal node overrides first
             for override in preset.node_overrides:
-                if not override.parent_group or not override.node_name:
+                if override.override_target != 'NODE' or not override.parent_group or not override.node_name:
                     continue
 
                 parent_tree = bpy.data.node_groups.get(override.parent_group)
@@ -536,11 +577,9 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                             self.report({'WARNING'}, f"Input '{inp.input_name}' not found on node '{n_name}'. Skipping.")
                             continue
 
-                        # Save state including existing connections
                         link_from = socket.links[0].from_socket if socket.is_linked else None
-                        original_states.append((socket, socket.default_value, link_from, parent_tree))
+                        global_original_states.append((socket, socket.default_value, link_from, parent_tree))
 
-                        # Unlink if something is connected so the default_value override takes effect
                         if socket.is_linked:
                             parent_tree.links.remove(socket.links[0])
 
@@ -553,10 +592,8 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                         elif inp.override_type == 'STRING':
                             socket.default_value = inp.value_string
 
-            if original_states:
+            if global_original_states:
                 context.view_layer.update()
-
-            depsgraph = context.evaluated_depsgraph_get()
 
             for item in preset.mappings:
                 if not item.collection_name:
@@ -571,37 +608,84 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
                 objects_to_export = list(set(get_enabled_objects_recursive(root_layer_coll)))
 
+                # 2. Iterate through objects and apply PER-OBJECT modifier overrides
                 for obj in objects_to_export:
+                    obj_mod_states = []
+
+                    for override in preset.node_overrides:
+                        if override.override_target != 'MODIFIER' or not override.parent_group:
+                            continue
+
+                        for mod in obj.modifiers:
+                            if mod.type == 'NODES' and mod.node_group and mod.node_group.name == override.parent_group:
+                                for inp in override.inputs:
+                                    ident = get_modifier_socket_identifier(mod.node_group, inp.input_name)
+                                    if ident:
+                                        # Safely capture current state
+                                        orig_val, is_set = get_modifier_input(mod, ident)
+                                        default_val = get_modifier_socket_default(mod.node_group, inp.input_name)
+
+                                        obj_mod_states.append((mod, ident, is_set, orig_val, default_val))
+
+                                        # Determine value to set
+                                        set_val = None
+                                        if inp.override_type == 'BOOLEAN':
+                                            set_val = inp.value_bool
+                                        elif inp.override_type == 'INT':
+                                            set_val = inp.value_int
+                                        elif inp.override_type == 'FLOAT':
+                                            set_val = inp.value_float
+                                        elif inp.override_type == 'STRING':
+                                            set_val = inp.value_string
+
+                                        if set_val is not None:
+                                            set_modifier_input(mod, ident, set_val)
+
+                    if obj_mod_states:
+                        obj.update_tag()
+                        context.view_layer.update()
+
+                    # Evaluate and Export Object
+                    depsgraph = context.evaluated_depsgraph_get()
                     obj_eval = obj.evaluated_get(depsgraph)
+
                     try:
                         mesh = obj_eval.to_mesh()
                     except RuntimeError:
                         continue
 
-                    if not mesh:
-                        continue
+                    if mesh:
+                        filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}.stl")
+                        write_fast_binary_stl(filepath, mesh, obj.matrix_world)
+                        obj_eval.to_mesh_clear()
+                        total_exported += 1
 
-                    filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}.stl")
-                    write_fast_binary_stl(filepath, mesh, obj.matrix_world)
-                    obj_eval.to_mesh_clear()
-                    total_exported += 1
+                    # 3. Restore PER-OBJECT modifier overrides immediately after exporting
+                    for mod, ident, is_set, orig_val, default_val in obj_mod_states:
+                        if is_set and orig_val is not None:
+                            set_modifier_input(mod, ident, orig_val)
+                        else:
+                            unset_modifier_input(mod, ident, default_val)
+
+                    if obj_mod_states:
+                        obj.update_tag()
+                        context.view_layer.update()
 
         except Exception as e:
             self.report({'ERROR'}, f"Export failed with error: {str(e)}")
             return {"CANCELLED"}
 
         finally:
-            for socket, original_val, link_from, parent_tree in original_states:
+            # 4. Restore GLOBAL internal node overrides
+            for socket, original_val, link_from, parent_tree in global_original_states:
                 try:
-                    # Restore value
                     socket.default_value = original_val
-                    # Restore previous connection if it existed
                     if link_from:
                         parent_tree.links.new(link_from, socket)
                 except Exception:
                     pass
 
-            if original_states:
+            if global_original_states:
                 context.view_layer.update()
 
         if total_exported > 0:
@@ -614,7 +698,6 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         row.prop(item, "name", text="", emboss=False, icon='PRESET')
-
         op = row.operator("export_scene.batch_stl_multi", text="", icon='EXPORT')
         op.preset_index = index
 
@@ -629,10 +712,16 @@ class BATCH_STL_UL_items(bpy.types.UIList):
 
 class BATCH_STL_UL_overrides(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        if item.parent_group and item.node_name:
-            layout.label(text=f"{item.parent_group} -> {item.node_name} ({len(item.inputs)} inputs)", icon='NODETREE')
+        if item.override_target == 'MODIFIER':
+            if item.parent_group:
+                layout.label(text=f"Modifier: {item.parent_group} ({len(item.inputs)} inputs)", icon='MODIFIER')
+            else:
+                layout.label(text="Unassigned Modifier Target", icon='ERROR')
         else:
-            layout.label(text="Unassigned Target Node", icon='ERROR')
+            if item.parent_group and item.node_name:
+                layout.label(text=f"{item.parent_group} -> {item.node_name} ({len(item.inputs)} inputs)", icon='NODETREE')
+            else:
+                layout.label(text="Unassigned Node Target", icon='ERROR')
 
 class BATCH_STL_UL_inputs(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
@@ -683,7 +772,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         row.prop(scene, "batch_stl_show_presets", icon=icon_presets, icon_only=True, emboss=False)
         row.label(text="Export Presets:", icon='PRESET')
 
-        # Add global Import/Export JSON buttons
         row.operator("batch_stl.import_presets_json", text="", icon='IMPORT')
         row.operator("batch_stl.export_presets_json", text="", icon='EXPORT')
 
@@ -723,7 +811,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         oheader_row = obox.row()
         icon_overrides = 'TRIA_DOWN' if active_preset.show_overrides else 'TRIA_RIGHT'
         oheader_row.prop(active_preset, "show_overrides", icon=icon_overrides, icon_only=True, emboss=False)
-        oheader_row.label(text=f"Node Instance Targets:", icon='MODIFIER')
+        oheader_row.label(text=f"Overrides & Targets:", icon='MODIFIER')
 
         if active_preset.show_overrides:
             orow = obox.row()
@@ -733,8 +821,12 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             active_ovr = get_active_override(active_preset)
             if active_ovr:
                 sub_obox = obox.box()
-                sub_obox.prop_search(active_ovr, "parent_group", bpy.data, "node_groups", text="Parent Group")
-                sub_obox.prop(active_ovr, "node_name", text="Target Node Name(s)")
+
+                sub_obox.prop(active_ovr, "override_target", text="Target")
+                sub_obox.prop_search(active_ovr, "parent_group", bpy.data, "node_groups", text="Node Group")
+
+                if active_ovr.override_target == 'NODE':
+                    sub_obox.prop(active_ovr, "node_name", text="Internal Node Name(s)")
 
                 sub_obox.separator()
 
@@ -794,7 +886,6 @@ def register():
         subtype="DIR_PATH",
     )
     bpy.types.Scene.batch_stl_show_presets = bpy.props.BoolProperty(default=True)
-
     bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
     bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(default=0)
 
