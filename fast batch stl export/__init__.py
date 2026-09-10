@@ -536,7 +536,13 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                             self.report({'WARNING'}, f"Input '{inp.input_name}' not found on node '{n_name}'. Skipping.")
                             continue
 
-                        original_states.append((socket, socket.default_value))
+                        # Save state including existing connections
+                        link_from = socket.links[0].from_socket if socket.is_linked else None
+                        original_states.append((socket, socket.default_value, link_from, parent_tree))
+
+                        # Unlink if something is connected so the default_value override takes effect
+                        if socket.is_linked:
+                            parent_tree.links.remove(socket.links[0])
 
                         if inp.override_type == 'BOOLEAN':
                             socket.default_value = inp.value_bool
@@ -585,9 +591,13 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             return {"CANCELLED"}
 
         finally:
-            for socket, original_val in original_states:
+            for socket, original_val, link_from, parent_tree in original_states:
                 try:
+                    # Restore value
                     socket.default_value = original_val
+                    # Restore previous connection if it existed
+                    if link_from:
+                        parent_tree.links.new(link_from, socket)
                 except Exception:
                     pass
 
