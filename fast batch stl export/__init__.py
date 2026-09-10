@@ -105,6 +105,7 @@ class BatchSTLNodeOverride(bpy.types.PropertyGroup):
 
 class BatchSTLExportPreset(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Preset Name", default="New Preset")
+    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", description="Optional directory prefix for this preset")
 
     mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem)
     mapping_index: bpy.props.IntProperty(default=0)
@@ -128,7 +129,7 @@ class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
     def execute(self, context):
         data = []
         for p in context.scene.batch_stl_presets:
-            p_data = {"name": p.name, "mappings": [], "overrides": []}
+            p_data = {"name": p.name, "preset_prefix": p.preset_prefix, "mappings": [], "overrides": []}
             for m in p.mappings:
                 p_data["mappings"].append({
                     "collection_name": m.collection_name,
@@ -182,6 +183,7 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
         for p_data in data:
             p = lst.add()
             p.name = p_data.get("name", "Imported Preset")
+            p.preset_prefix = p_data.get("preset_prefix", "")
             for m_data in p_data.get("mappings", []):
                 m = p.mappings.add()
                 m.collection_name = m_data.get("collection_name", "")
@@ -241,6 +243,7 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
             src = lst[idx]
             new_item = lst.add()
             new_item.name = f"{src.name} Copy"
+            new_item.preset_prefix = src.preset_prefix
             for m in src.mappings:
                 new_m = new_item.mappings.add()
                 new_m.collection_name = m.collection_name
@@ -493,6 +496,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
         root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
 
+        # Apply preset specific root directory prefix if set
+        if preset.preset_prefix:
+            root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
+
         if context.active_object and context.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
 
@@ -679,6 +686,8 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         if active_preset is None:
             return
 
+        layout.separator()
+        layout.prop(active_preset, "preset_prefix", icon='FILE_FOLDER')
         layout.separator()
 
         box = layout.box()
