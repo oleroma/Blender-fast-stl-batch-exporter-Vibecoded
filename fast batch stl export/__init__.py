@@ -65,9 +65,14 @@ def get_active_preset(scene):
         return presets[index]
     return None
 
-def get_active_override(preset):
-    if preset and preset.node_overrides and 0 <= preset.node_override_index < len(preset.node_overrides):
-        return preset.node_overrides[preset.node_override_index]
+def get_active_mapping(preset):
+    if preset and preset.mappings and 0 <= preset.mapping_index < len(preset.mappings):
+        return preset.mappings[preset.mapping_index]
+    return None
+
+def get_active_override(mapping):
+    if mapping and mapping.node_overrides and 0 <= mapping.node_override_index < len(mapping.node_overrides):
+        return mapping.node_overrides[mapping.node_override_index]
     return None
 
 def get_modifier_socket_identifier(node_group, socket_name):
@@ -95,14 +100,12 @@ def get_modifier_socket_default(node_group, socket_name):
 # --- MODERN MODIFIER INPUT HELPERS ---
 
 def get_modifier_input(mod, ident):
-    # Try Blender < 5.x ID Property method
     try:
         if mod.is_property_set(ident):
             return mod[ident], True
     except Exception:
         pass
 
-    # Try Blender 5.x+ specific properties.inputs grouping
     if hasattr(mod, "properties") and hasattr(mod.properties, "inputs"):
         prop_input = getattr(mod.properties.inputs, ident, None)
         if prop_input is not None and hasattr(prop_input, "value"):
@@ -111,42 +114,32 @@ def get_modifier_input(mod, ident):
     return None, False
 
 def set_modifier_input(mod, ident, value):
-    # Try Blender < 5.x ID Property method
     try:
         mod[ident] = value
         return
     except TypeError:
-        # Fails explicitly when 'id properties not supported for this type'
         pass
     except Exception:
         pass
 
-    # Try Blender 5.x+ specific properties.inputs grouping
     if hasattr(mod, "properties") and hasattr(mod.properties, "inputs"):
         prop_input = getattr(mod.properties.inputs, ident, None)
         if prop_input is not None and hasattr(prop_input, "value"):
             prop_input.value = value
 
 def unset_modifier_input(mod, ident, default_val):
-    # Try Blender < 5.x native unset
     try:
         mod.property_unset(ident)
         return
     except Exception:
         pass
 
-    # Try Blender 5.x+ specific properties.inputs grouping (restore to default)
     if hasattr(mod, "properties") and hasattr(mod.properties, "inputs"):
         prop_input = getattr(mod.properties.inputs, ident, None)
         if prop_input is not None and hasattr(prop_input, "value") and default_val is not None:
             prop_input.value = default_val
 
-
 # --- PROPERTIES ---
-
-class BatchSTLExportItem(bpy.types.PropertyGroup):
-    collection_name: bpy.props.StringProperty(name="Collection", default="")
-    sub_path: bpy.props.StringProperty(name="Sub-folder Path", default="")
 
 class BatchSTLNodeInput(bpy.types.PropertyGroup):
     input_name: bpy.props.StringProperty(name="Input Name", default="")
@@ -175,25 +168,28 @@ class BatchSTLNodeOverride(bpy.types.PropertyGroup):
         default='NODE'
     )
     parent_group: bpy.props.StringProperty(name="Node Group", default="")
-    node_name: bpy.props.StringProperty(name="Node Name(s)", description="Comma-separated list of nodes (Only used for Internal Node target)", default="")
+    node_name: bpy.props.StringProperty(name="Node Name(s)", description="Comma-separated list of nodes", default="")
 
     inputs: bpy.props.CollectionProperty(type=BatchSTLNodeInput)
     input_index: bpy.props.IntProperty(default=0)
-
     show_inputs: bpy.props.BoolProperty(default=True)
 
-class BatchSTLExportPreset(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Preset Name", default="New Preset")
-    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", description="Optional directory prefix for this preset")
-
-    mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem)
-    mapping_index: bpy.props.IntProperty(default=0)
+class BatchSTLExportItem(bpy.types.PropertyGroup):
+    collection_name: bpy.props.StringProperty(name="Collection", default="")
+    sub_path: bpy.props.StringProperty(name="Sub-folder Path", default="")
 
     node_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride)
     node_override_index: bpy.props.IntProperty(default=0)
-
-    show_mappings: bpy.props.BoolProperty(default=True)
     show_overrides: bpy.props.BoolProperty(default=True)
+
+class BatchSTLExportPreset(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty(name="Preset Name", default="New Preset")
+    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="")
+
+    mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem)
+    mapping_index: bpy.props.IntProperty(default=0)
+    show_mappings: bpy.props.BoolProperty(default=True)
+
 
 # --- JSON IMPORT/EXPORT OPERATORS ---
 
@@ -208,29 +204,31 @@ class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
     def execute(self, context):
         data = []
         for p in context.scene.batch_stl_presets:
-            p_data = {"name": p.name, "preset_prefix": p.preset_prefix, "mappings": [], "overrides": []}
+            p_data = {"name": p.name, "preset_prefix": p.preset_prefix, "mappings": []}
             for m in p.mappings:
-                p_data["mappings"].append({
+                m_data = {
                     "collection_name": m.collection_name,
-                    "sub_path": m.sub_path
-                })
-            for o in p.node_overrides:
-                o_data = {
-                    "override_target": o.override_target,
-                    "parent_group": o.parent_group,
-                    "node_name": o.node_name,
-                    "inputs": []
+                    "sub_path": m.sub_path,
+                    "overrides": []
                 }
-                for i in o.inputs:
-                    o_data["inputs"].append({
-                        "input_name": i.input_name,
-                        "override_type": i.override_type,
-                        "value_bool": i.value_bool,
-                        "value_int": i.value_int,
-                        "value_float": i.value_float,
-                        "value_string": i.value_string
-                    })
-                p_data["overrides"].append(o_data)
+                for o in m.node_overrides:
+                    o_data = {
+                        "override_target": o.override_target,
+                        "parent_group": o.parent_group,
+                        "node_name": o.node_name,
+                        "inputs": []
+                    }
+                    for i in o.inputs:
+                        o_data["inputs"].append({
+                            "input_name": i.input_name,
+                            "override_type": i.override_type,
+                            "value_bool": i.value_bool,
+                            "value_int": i.value_int,
+                            "value_float": i.value_float,
+                            "value_string": i.value_string
+                        })
+                    m_data["overrides"].append(o_data)
+                p_data["mappings"].append(m_data)
             data.append(p_data)
 
         try:
@@ -268,19 +266,20 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
                 m = p.mappings.add()
                 m.collection_name = m_data.get("collection_name", "")
                 m.sub_path = m_data.get("sub_path", "")
-            for o_data in p_data.get("overrides", []):
-                o = p.node_overrides.add()
-                o.override_target = o_data.get("override_target", 'NODE')
-                o.parent_group = o_data.get("parent_group", "")
-                o.node_name = o_data.get("node_name", "")
-                for i_data in o_data.get("inputs", []):
-                    i = o.inputs.add()
-                    i.input_name = i_data.get("input_name", "")
-                    i.override_type = i_data.get("override_type", "BOOLEAN")
-                    i.value_bool = i_data.get("value_bool", True)
-                    i.value_int = i_data.get("value_int", 0)
-                    i.value_float = i_data.get("value_float", 0.0)
-                    i.value_string = i_data.get("value_string", "")
+
+                for o_data in m_data.get("overrides", []):
+                    o = m.node_overrides.add()
+                    o.override_target = o_data.get("override_target", 'NODE')
+                    o.parent_group = o_data.get("parent_group", "")
+                    o.node_name = o_data.get("node_name", "")
+                    for i_data in o_data.get("inputs", []):
+                        i = o.inputs.add()
+                        i.input_name = i_data.get("input_name", "")
+                        i.override_type = i_data.get("override_type", "BOOLEAN")
+                        i.value_bool = i_data.get("value_bool", True)
+                        i.value_int = i_data.get("value_int", 0)
+                        i.value_float = i_data.get("value_float", 0.0)
+                        i.value_string = i_data.get("value_string", "")
 
         self.report({'INFO'}, f"Imported presets from {self.filepath}")
         return {'FINISHED'}
@@ -319,23 +318,65 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
                 new_m = new_item.mappings.add()
                 new_m.collection_name = m.collection_name
                 new_m.sub_path = m.sub_path
-            for o in src.node_overrides:
-                new_o = new_item.node_overrides.add()
-                new_o.override_target = o.override_target
-                new_o.parent_group = o.parent_group
-                new_o.node_name = o.node_name
-                for i in o.inputs:
-                    new_i = new_o.inputs.add()
-                    new_i.input_name = i.input_name
-                    new_i.override_type = i.override_type
-                    new_i.value_bool = i.value_bool
-                    new_i.value_int = i.value_int
-                    new_i.value_float = i.value_float
-                    new_i.value_string = i.value_string
+                for o in m.node_overrides:
+                    new_o = new_m.node_overrides.add()
+                    new_o.override_target = o.override_target
+                    new_o.parent_group = o.parent_group
+                    new_o.node_name = o.node_name
+                    for i in o.inputs:
+                        new_i = new_o.inputs.add()
+                        new_i.input_name = i.input_name
+                        new_i.override_type = i.override_type
+                        new_i.value_bool = i.value_bool
+                        new_i.value_int = i.value_int
+                        new_i.value_float = i.value_float
+                        new_i.value_string = i.value_string
             scene.batch_stl_preset_index = len(lst) - 1
         return {'FINISHED'}
 
 # --- MAPPING OPERATORS ---
+
+def copy_mapping_to_dict(src):
+    data = {
+        "collection_name": src.collection_name,
+        "sub_path": src.sub_path,
+        "overrides": []
+    }
+    for o in src.node_overrides:
+        o_data = {
+            "override_target": o.override_target,
+            "parent_group": o.parent_group,
+            "node_name": o.node_name,
+            "inputs": []
+        }
+        for i in o.inputs:
+            o_data["inputs"].append({
+                "input_name": i.input_name,
+                "override_type": i.override_type,
+                "value_bool": i.value_bool,
+                "value_int": i.value_int,
+                "value_float": i.value_float,
+                "value_string": i.value_string
+            })
+        data["overrides"].append(o_data)
+    return data
+
+def paste_mapping_from_dict(new_m, data):
+    new_m.collection_name = data.get("collection_name", "")
+    new_m.sub_path = data.get("sub_path", "")
+    for o_data in data.get("overrides", []):
+        new_o = new_m.node_overrides.add()
+        new_o.override_target = o_data["override_target"]
+        new_o.parent_group = o_data["parent_group"]
+        new_o.node_name = o_data["node_name"]
+        for i_data in o_data["inputs"]:
+            new_i = new_o.inputs.add()
+            new_i.input_name = i_data["input_name"]
+            new_i.override_type = i_data["override_type"]
+            new_i.value_bool = i_data["value_bool"]
+            new_i.value_int = i_data["value_int"]
+            new_i.value_float = i_data["value_float"]
+            new_i.value_string = i_data["value_string"]
 
 class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
     bl_idname = "batch_stl.mapping_actions"
@@ -367,23 +408,17 @@ class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
         elif self.action == 'DUPLICATE' and lst:
             src = lst[idx]
             new_item = lst.add()
-            new_item.collection_name = src.collection_name
-            new_item.sub_path = src.sub_path
+            data = copy_mapping_to_dict(src)
+            paste_mapping_from_dict(new_item, data)
             preset.mapping_index = len(lst) - 1
         elif self.action == 'COPY' and lst:
-            src = lst[idx]
-            _clipboard["mapping"] = {
-                "collection_name": src.collection_name,
-                "sub_path": src.sub_path
-            }
-            self.report({'INFO'}, f"Copied Mapping: {src.collection_name}")
+            _clipboard["mapping"] = copy_mapping_to_dict(lst[idx])
+            self.report({'INFO'}, f"Copied Mapping: {lst[idx].collection_name}")
         elif self.action == 'PASTE' and _clipboard.get("mapping"):
-            data = _clipboard["mapping"]
             new_item = lst.add()
-            new_item.collection_name = data["collection_name"]
-            new_item.sub_path = data["sub_path"]
+            paste_mapping_from_dict(new_item, _clipboard["mapping"])
             preset.mapping_index = len(lst) - 1
-            self.report({'INFO'}, f"Pasted Mapping: {data['collection_name']}")
+            self.report({'INFO'}, f"Pasted Mapping: {_clipboard['mapping']['collection_name']}")
         return {'FINISHED'}
 
 # --- OVERRIDE OPERATORS ---
@@ -399,22 +434,24 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
-        if not preset: return {'CANCELLED'}
-        lst = preset.node_overrides
-        idx = preset.node_override_index
+        mapping = get_active_mapping(preset)
+        if not mapping: return {'CANCELLED'}
+
+        lst = mapping.node_overrides
+        idx = mapping.node_override_index
 
         if self.action == 'ADD':
             lst.add()
-            preset.node_override_index = len(lst) - 1
+            mapping.node_override_index = len(lst) - 1
         elif self.action == 'REMOVE' and lst:
             lst.remove(idx)
-            preset.node_override_index = min(max(0, idx - 1), len(lst) - 1)
+            mapping.node_override_index = min(max(0, idx - 1), len(lst) - 1)
         elif self.action == 'UP' and idx > 0:
             lst.move(idx, idx - 1)
-            preset.node_override_index -= 1
+            mapping.node_override_index -= 1
         elif self.action == 'DOWN' and idx < len(lst) - 1:
             lst.move(idx, idx + 1)
-            preset.node_override_index += 1
+            mapping.node_override_index += 1
         elif self.action == 'DUPLICATE' and lst:
             src = lst[idx]
             new_item = lst.add()
@@ -429,7 +466,7 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
                 new_i.value_int = i.value_int
                 new_i.value_float = i.value_float
                 new_i.value_string = i.value_string
-            preset.node_override_index = len(lst) - 1
+            mapping.node_override_index = len(lst) - 1
         elif self.action == 'COPY' and lst:
             src = lst[idx]
             data = {
@@ -463,7 +500,7 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
                 new_i.value_int = i_data["value_int"]
                 new_i.value_float = i_data["value_float"]
                 new_i.value_string = i_data["value_string"]
-            preset.node_override_index = len(lst) - 1
+            mapping.node_override_index = len(lst) - 1
             self.report({'INFO'}, f"Pasted Target: {data['parent_group']}")
         return {'FINISHED'}
 
@@ -476,7 +513,8 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
-        ovr = get_active_override(preset)
+        mapping = get_active_mapping(preset)
+        ovr = get_active_override(mapping)
         if not ovr: return {'CANCELLED'}
 
         lst = ovr.inputs
@@ -543,76 +581,77 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         if context.active_object and context.mode != "OBJECT":
             bpy.ops.object.mode_set(mode="OBJECT")
 
-        global_original_states = []
         total_exported = 0
 
-        try:
-            # 1. Apply GLOBAL internal node overrides first
-            for override in preset.node_overrides:
-                if override.override_target != 'NODE' or not override.parent_group or not override.node_name:
-                    continue
+        for item in preset.mappings:
+            if not item.collection_name:
+                continue
 
-                parent_tree = bpy.data.node_groups.get(override.parent_group)
-                if not parent_tree:
-                    self.report({'WARNING'}, f"Node group '{override.parent_group}' not found. Export aborted.")
-                    return {"CANCELLED"}
+            out_dir = os.path.normpath(os.path.join(root_dir, item.sub_path))
+            os.makedirs(out_dir, exist_ok=True)
 
-                node_names = [n.strip() for n in override.node_name.split(',')]
+            root_layer_coll = find_layer_collection(context.view_layer.layer_collection, item.collection_name)
+            if not root_layer_coll:
+                continue
 
-                for n_name in node_names:
-                    if not n_name:
+            objects_to_export = list(set(get_enabled_objects_recursive(root_layer_coll)))
+            if not objects_to_export:
+                continue
+
+            global_original_states = []
+
+            try:
+                # 1. Apply GLOBAL internal node overrides specific to THIS mapped collection
+                for override in item.node_overrides:
+                    if override.override_target != 'NODE' or not override.parent_group or not override.node_name:
                         continue
 
-                    target_node = parent_tree.nodes.get(n_name)
-                    if not target_node:
-                        self.report({'WARNING'}, f"Node '{n_name}' not found in '{override.parent_group}'. Skipping.")
+                    parent_tree = bpy.data.node_groups.get(override.parent_group)
+                    if not parent_tree:
+                        self.report({'WARNING'}, f"Node group '{override.parent_group}' not found. Skipping.")
                         continue
 
-                    for inp in override.inputs:
-                        if not inp.input_name:
+                    node_names = [n.strip() for n in override.node_name.split(',')]
+
+                    for n_name in node_names:
+                        if not n_name: continue
+
+                        target_node = parent_tree.nodes.get(n_name)
+                        if not target_node:
+                            self.report({'WARNING'}, f"Node '{n_name}' not found in '{override.parent_group}'.")
                             continue
 
-                        socket = target_node.inputs.get(inp.input_name)
-                        if not socket:
-                            self.report({'WARNING'}, f"Input '{inp.input_name}' not found on node '{n_name}'. Skipping.")
-                            continue
+                        for inp in override.inputs:
+                            if not inp.input_name: continue
 
-                        link_from = socket.links[0].from_socket if socket.is_linked else None
-                        global_original_states.append((socket, socket.default_value, link_from, parent_tree))
+                            socket = target_node.inputs.get(inp.input_name)
+                            if not socket:
+                                self.report({'WARNING'}, f"Input '{inp.input_name}' not found on node '{n_name}'.")
+                                continue
 
-                        if socket.is_linked:
-                            parent_tree.links.remove(socket.links[0])
+                            link_from = socket.links[0].from_socket if socket.is_linked else None
+                            global_original_states.append((socket, socket.default_value, link_from, parent_tree))
 
-                        if inp.override_type == 'BOOLEAN':
-                            socket.default_value = inp.value_bool
-                        elif inp.override_type == 'INT':
-                            socket.default_value = inp.value_int
-                        elif inp.override_type == 'FLOAT':
-                            socket.default_value = inp.value_float
-                        elif inp.override_type == 'STRING':
-                            socket.default_value = inp.value_string
+                            if socket.is_linked:
+                                parent_tree.links.remove(socket.links[0])
 
-            if global_original_states:
-                context.view_layer.update()
+                            if inp.override_type == 'BOOLEAN':
+                                socket.default_value = inp.value_bool
+                            elif inp.override_type == 'INT':
+                                socket.default_value = inp.value_int
+                            elif inp.override_type == 'FLOAT':
+                                socket.default_value = inp.value_float
+                            elif inp.override_type == 'STRING':
+                                socket.default_value = inp.value_string
 
-            for item in preset.mappings:
-                if not item.collection_name:
-                    continue
-
-                out_dir = os.path.normpath(os.path.join(root_dir, item.sub_path))
-                os.makedirs(out_dir, exist_ok=True)
-
-                root_layer_coll = find_layer_collection(context.view_layer.layer_collection, item.collection_name)
-                if not root_layer_coll:
-                    continue
-
-                objects_to_export = list(set(get_enabled_objects_recursive(root_layer_coll)))
+                if global_original_states:
+                    context.view_layer.update()
 
                 # 2. Iterate through objects and apply PER-OBJECT modifier overrides
                 for obj in objects_to_export:
                     obj_mod_states = []
 
-                    for override in preset.node_overrides:
+                    for override in item.node_overrides:
                         if override.override_target != 'MODIFIER' or not override.parent_group:
                             continue
 
@@ -621,13 +660,11 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                                 for inp in override.inputs:
                                     ident = get_modifier_socket_identifier(mod.node_group, inp.input_name)
                                     if ident:
-                                        # Safely capture current state
                                         orig_val, is_set = get_modifier_input(mod, ident)
                                         default_val = get_modifier_socket_default(mod.node_group, inp.input_name)
 
                                         obj_mod_states.append((mod, ident, is_set, orig_val, default_val))
 
-                                        # Determine value to set
                                         set_val = None
                                         if inp.override_type == 'BOOLEAN':
                                             set_val = inp.value_bool
@@ -671,22 +708,21 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                         obj.update_tag()
                         context.view_layer.update()
 
-        except Exception as e:
-            self.report({'ERROR'}, f"Export failed with error: {str(e)}")
-            return {"CANCELLED"}
+            except Exception as e:
+                self.report({'ERROR'}, f"Export failed on {item.collection_name}: {str(e)}")
 
-        finally:
-            # 4. Restore GLOBAL internal node overrides
-            for socket, original_val, link_from, parent_tree in global_original_states:
-                try:
-                    socket.default_value = original_val
-                    if link_from:
-                        parent_tree.links.new(link_from, socket)
-                except Exception:
-                    pass
+            finally:
+                # 4. Restore GLOBAL internal node overrides before moving to next mapped collection
+                for socket, original_val, link_from, parent_tree in global_original_states:
+                    try:
+                        socket.default_value = original_val
+                        if link_from:
+                            parent_tree.links.new(link_from, socket)
+                    except Exception:
+                        pass
 
-            if global_original_states:
-                context.view_layer.update()
+                if global_original_states:
+                    context.view_layer.update()
 
         if total_exported > 0:
             self.report({'INFO'}, f"Successfully exported {total_exported} STLs using '{preset.name}'")
@@ -799,68 +835,67 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             m_row.template_list("BATCH_STL_UL_items", "", active_preset, "mappings", active_preset, "mapping_index", rows=3)
             draw_list_controls(m_row, "batch_stl.mapping_actions", use_clipboard=True)
 
-            if active_preset.mappings and 0 <= active_preset.mapping_index < len(active_preset.mappings):
-                active_item = active_preset.mappings[active_preset.mapping_index]
+            active_item = get_active_mapping(active_preset)
+            if active_item:
                 sub_box = box.box()
                 sub_box.prop_search(active_item, "collection_name", bpy.data, "collections", text="Collection")
                 sub_box.prop(active_item, "sub_path")
 
-        layout.separator()
+                # NESTED OVERRIDES SECTION
+                layout.separator()
+                obox = layout.box()
+                oheader_row = obox.row()
+                icon_overrides = 'TRIA_DOWN' if active_item.show_overrides else 'TRIA_RIGHT'
+                oheader_row.prop(active_item, "show_overrides", icon=icon_overrides, icon_only=True, emboss=False)
+                oheader_row.label(text=f"Overrides for '{active_item.collection_name}':", icon='MODIFIER')
 
-        obox = layout.box()
-        oheader_row = obox.row()
-        icon_overrides = 'TRIA_DOWN' if active_preset.show_overrides else 'TRIA_RIGHT'
-        oheader_row.prop(active_preset, "show_overrides", icon=icon_overrides, icon_only=True, emboss=False)
-        oheader_row.label(text=f"Overrides & Targets:", icon='MODIFIER')
+                if active_item.show_overrides:
+                    orow = obox.row()
+                    orow.template_list("BATCH_STL_UL_overrides", "", active_item, "node_overrides", active_item, "node_override_index", rows=3)
+                    draw_list_controls(orow, "batch_stl.override_actions", use_clipboard=True)
 
-        if active_preset.show_overrides:
-            orow = obox.row()
-            orow.template_list("BATCH_STL_UL_overrides", "", active_preset, "node_overrides", active_preset, "node_override_index", rows=3)
-            draw_list_controls(orow, "batch_stl.override_actions", use_clipboard=True)
+                    active_ovr = get_active_override(active_item)
+                    if active_ovr:
+                        sub_obox = obox.box()
+                        sub_obox.prop(active_ovr, "override_target", text="Target")
+                        sub_obox.prop_search(active_ovr, "parent_group", bpy.data, "node_groups", text="Node Group")
 
-            active_ovr = get_active_override(active_preset)
-            if active_ovr:
-                sub_obox = obox.box()
+                        if active_ovr.override_target == 'NODE':
+                            sub_obox.prop(active_ovr, "node_name", text="Internal Node Name(s)")
 
-                sub_obox.prop(active_ovr, "override_target", text="Target")
-                sub_obox.prop_search(active_ovr, "parent_group", bpy.data, "node_groups", text="Node Group")
+                        sub_obox.separator()
 
-                if active_ovr.override_target == 'NODE':
-                    sub_obox.prop(active_ovr, "node_name", text="Internal Node Name(s)")
+                        iheader = sub_obox.row()
+                        icon_inputs = 'TRIA_DOWN' if active_ovr.show_inputs else 'TRIA_RIGHT'
+                        iheader.prop(active_ovr, "show_inputs", icon=icon_inputs, icon_only=True, emboss=False)
+                        iheader.label(text="Inputs to Override:", icon='NODE_COMPOSITING')
 
-                sub_obox.separator()
+                        if active_ovr.show_inputs:
+                            irow = sub_obox.row()
+                            irow.template_list("BATCH_STL_UL_inputs", "", active_ovr, "inputs", active_ovr, "input_index", rows=3)
+                            draw_list_controls(irow, "batch_stl.input_actions", use_clipboard=False)
 
-                iheader = sub_obox.row()
-                icon_inputs = 'TRIA_DOWN' if active_ovr.show_inputs else 'TRIA_RIGHT'
-                iheader.prop(active_ovr, "show_inputs", icon=icon_inputs, icon_only=True, emboss=False)
-                iheader.label(text="Inputs to Override:", icon='NODE_COMPOSITING')
+                            if active_ovr.inputs and 0 <= active_ovr.input_index < len(active_ovr.inputs):
+                                active_inp = active_ovr.inputs[active_ovr.input_index]
+                                ibox = sub_obox.box()
+                                ibox.prop(active_inp, "input_name", text="Input Name")
+                                ibox.prop(active_inp, "override_type", text="Type")
 
-                if active_ovr.show_inputs:
-                    irow = sub_obox.row()
-                    irow.template_list("BATCH_STL_UL_inputs", "", active_ovr, "inputs", active_ovr, "input_index", rows=3)
-                    draw_list_controls(irow, "batch_stl.input_actions", use_clipboard=False)
-
-                    if active_ovr.inputs and 0 <= active_ovr.input_index < len(active_ovr.inputs):
-                        active_inp = active_ovr.inputs[active_ovr.input_index]
-                        ibox = sub_obox.box()
-                        ibox.prop(active_inp, "input_name", text="Input Name")
-                        ibox.prop(active_inp, "override_type", text="Type")
-
-                        if active_inp.override_type == 'BOOLEAN':
-                            ibox.prop(active_inp, "value_bool")
-                        elif active_inp.override_type == 'INT':
-                            ibox.prop(active_inp, "value_int")
-                        elif active_inp.override_type == 'FLOAT':
-                            ibox.prop(active_inp, "value_float")
-                        elif active_inp.override_type == 'STRING':
-                            ibox.prop(active_inp, "value_string")
+                                if active_inp.override_type == 'BOOLEAN':
+                                    ibox.prop(active_inp, "value_bool")
+                                elif active_inp.override_type == 'INT':
+                                    ibox.prop(active_inp, "value_int")
+                                elif active_inp.override_type == 'FLOAT':
+                                    ibox.prop(active_inp, "value_float")
+                                elif active_inp.override_type == 'STRING':
+                                    ibox.prop(active_inp, "value_string")
 
 # --- REGISTRATION ---
 
 classes = (
-    BatchSTLExportItem,
     BatchSTLNodeInput,
     BatchSTLNodeOverride,
+    BatchSTLExportItem,
     BatchSTLExportPreset,
     BATCH_STL_UL_items,
     BATCH_STL_UL_presets,
