@@ -821,12 +821,13 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
 
 class BATCH_STL_UL_items(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
         if item.collection_name:
-            layout.label(text=item.collection_name, icon='OUTLINER_COLLECTION')
-            if item.sub_path:
-                layout.label(text=f"/{item.sub_path}", icon='FILE_FOLDER')
+            row.prop(item, "collection_name", text="", emboss=False, icon='OUTLINER_COLLECTION')
         else:
-            layout.label(text="Assign a Collection", icon='ERROR')
+            row.label(text="Assign a Collection", icon='ERROR')
+
+        row.prop(item, "sub_path", text="", emboss=False, icon='FILE_FOLDER')
 
 class BATCH_STL_UL_overrides(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
