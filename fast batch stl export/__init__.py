@@ -7,7 +7,8 @@ from bpy_extras.io_utils import ExportHelper, ImportHelper
 # --- SESSION CLIPBOARD ---
 _clipboard = {
     "mapping": None,
-    "override": None
+    "override": None,
+    "input": None
 }
 
 # --- FAST EXPORT FUNCTION ---
@@ -509,7 +510,12 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
 class BATCH_STL_OT_input_actions(bpy.types.Operator):
     bl_idname = "batch_stl.input_actions"
     bl_label = "Input Actions"
-    action: bpy.props.EnumProperty(items=(('ADD', "Add", ""), ('REMOVE', "Remove", ""), ('UP', "Up", ""), ('DOWN', "Down", ""), ('DUPLICATE', "Duplicate", "")))
+    action: bpy.props.EnumProperty(items=(
+        ('ADD', "Add", ""), ('REMOVE', "Remove", ""),
+        ('UP', "Up", ""), ('DOWN', "Down", ""),
+        ('DUPLICATE', "Duplicate", ""),
+        ('COPY', "Copy", ""), ('PASTE', "Paste", "")
+    ))
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -542,6 +548,29 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
             new_item.value_float = src.value_float
             new_item.value_string = src.value_string
             ovr.input_index = len(lst) - 1
+        elif self.action == 'COPY' and lst:
+            src = lst[idx]
+            _clipboard["input"] = {
+                "input_name": src.input_name,
+                "override_type": src.override_type,
+                "value_bool": src.value_bool,
+                "value_int": src.value_int,
+                "value_float": src.value_float,
+                "value_string": src.value_string
+            }
+            self.report({'INFO'}, f"Copied Input: {src.input_name}")
+        elif self.action == 'PASTE' and _clipboard.get("input"):
+            data = _clipboard["input"]
+            new_item = lst.add()
+            new_item.input_name = data["input_name"]
+            new_item.override_type = data["override_type"]
+            new_item.value_bool = data["value_bool"]
+            new_item.value_int = data["value_int"]
+            new_item.value_float = data["value_float"]
+            new_item.value_string = data["value_string"]
+            ovr.input_index = len(lst) - 1
+            self.report({'INFO'}, f"Pasted Input: {data['input_name']}")
+
         return {'FINISHED'}
 
 # --- FAST EXPORT OPERATOR ---
@@ -873,7 +902,8 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                         if active_ovr.show_inputs:
                             irow = sub_obox.row()
                             irow.template_list("BATCH_STL_UL_inputs", "", active_ovr, "inputs", active_ovr, "input_index", rows=3)
-                            draw_list_controls(irow, "batch_stl.input_actions", use_clipboard=False)
+                            # Changed to use_clipboard=True
+                            draw_list_controls(irow, "batch_stl.input_actions", use_clipboard=True)
 
                             if active_ovr.inputs and 0 <= active_ovr.input_index < len(active_ovr.inputs):
                                 active_inp = active_ovr.inputs[active_ovr.input_index]
