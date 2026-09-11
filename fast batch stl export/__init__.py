@@ -290,7 +290,21 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
 class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     bl_idname = "batch_stl.preset_actions"
     bl_label = "Preset Actions"
-    action: bpy.props.EnumProperty(items=(('ADD', "Add", ""), ('REMOVE', "Remove", ""), ('UP', "Up", ""), ('DOWN', "Down", ""), ('DUPLICATE', "Duplicate", "")))
+    bl_description = "Manage export presets"
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.action == 'ADD': return "Add a new export preset"
+        if properties.action == 'REMOVE': return "Remove the selected preset"
+        if properties.action == 'UP': return "Move the selected preset up in the list"
+        if properties.action == 'DOWN': return "Move the selected preset down in the list"
+        if properties.action == 'DUPLICATE': return "Duplicate the selected preset and its mappings"
+        return "Manage export presets"
+
+    action: bpy.props.EnumProperty(items=(
+        ('ADD', "Add", ""), ('REMOVE', "Remove", ""), ('UP', "Up", ""),
+        ('DOWN', "Down", ""), ('DUPLICATE', "Duplicate", "")
+    ))
 
     def execute(self, context):
         scene = context.scene
@@ -382,6 +396,19 @@ def paste_mapping_from_dict(new_m, data):
 class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
     bl_idname = "batch_stl.mapping_actions"
     bl_label = "Mapping Actions"
+    bl_description = "Manage collection mappings"
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.action == 'ADD': return "Add a new collection mapping to the preset"
+        if properties.action == 'REMOVE': return "Remove the selected collection mapping"
+        if properties.action == 'UP': return "Move the selected mapping up in the list"
+        if properties.action == 'DOWN': return "Move the selected mapping down in the list"
+        if properties.action == 'DUPLICATE': return "Duplicate the selected mapping and its overrides"
+        if properties.action == 'COPY': return "Copy the selected mapping to the clipboard"
+        if properties.action == 'PASTE': return "Paste a mapping from the clipboard"
+        return "Manage collection mappings"
+
     action: bpy.props.EnumProperty(items=(
         ('ADD', "Add", ""), ('REMOVE', "Remove", ""),
         ('UP', "Up", ""), ('DOWN', "Down", ""),
@@ -427,6 +454,19 @@ class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
 class BATCH_STL_OT_override_actions(bpy.types.Operator):
     bl_idname = "batch_stl.override_actions"
     bl_label = "Override Actions"
+    bl_description = "Manage geometry node overrides"
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.action == 'ADD': return "Add a new node override target"
+        if properties.action == 'REMOVE': return "Remove the selected override target"
+        if properties.action == 'UP': return "Move the selected override target up in the list"
+        if properties.action == 'DOWN': return "Move the selected override target down in the list"
+        if properties.action == 'DUPLICATE': return "Duplicate the selected override target and its inputs"
+        if properties.action == 'COPY': return "Copy the selected override target to the clipboard"
+        if properties.action == 'PASTE': return "Paste an override target from the clipboard"
+        return "Manage geometry node overrides"
+
     action: bpy.props.EnumProperty(items=(
         ('ADD', "Add", ""), ('REMOVE', "Remove", ""),
         ('UP', "Up", ""), ('DOWN', "Down", ""),
@@ -510,6 +550,19 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
 class BATCH_STL_OT_input_actions(bpy.types.Operator):
     bl_idname = "batch_stl.input_actions"
     bl_label = "Input Actions"
+    bl_description = "Manage input overrides"
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.action == 'ADD': return "Add a new input configuration"
+        if properties.action == 'REMOVE': return "Remove the selected input"
+        if properties.action == 'UP': return "Move the selected input up in the list"
+        if properties.action == 'DOWN': return "Move the selected input down in the list"
+        if properties.action == 'DUPLICATE': return "Duplicate the selected input configuration"
+        if properties.action == 'COPY': return "Copy the selected input configuration to the clipboard"
+        if properties.action == 'PASTE': return "Paste an input configuration from the clipboard"
+        return "Manage input overrides"
+
     action: bpy.props.EnumProperty(items=(
         ('ADD', "Add", ""), ('REMOVE', "Remove", ""),
         ('UP', "Up", ""), ('DOWN', "Down", ""),
@@ -902,7 +955,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                         if active_ovr.show_inputs:
                             irow = sub_obox.row()
                             irow.template_list("BATCH_STL_UL_inputs", "", active_ovr, "inputs", active_ovr, "input_index", rows=3)
-                            # Changed to use_clipboard=True
                             draw_list_controls(irow, "batch_stl.input_actions", use_clipboard=True)
 
                             if active_ovr.inputs and 0 <= active_ovr.input_index < len(active_ovr.inputs):
