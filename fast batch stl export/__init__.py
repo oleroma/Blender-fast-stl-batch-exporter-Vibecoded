@@ -2,6 +2,8 @@ import os
 import json
 import bpy
 import struct
+import time
+import numpy as np
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 # --- SESSION CLIPBOARD ---
@@ -15,38 +17,71 @@ _clipboard = {
 # --- FAST EXPORT FUNCTION ---
 
 def write_fast_binary_stl(filepath, mesh, matrix_world):
-    mesh.calc_loop_triangles()
-    tris = mesh.loop_triangles
+    t_start = time.perf_counter()
 
-    if len(tris) == 0:
+    mesh.calc_loop_triangles()
+    num_tris = len(mesh.loop_triangles)
+    if num_tris == 0:
         return
 
-    verts = [matrix_world @ v.co for v in mesh.vertices]
-    mat_norm = matrix_world.to_3x3().inverted_safe().transposed()
+    t_tri = time.perf_counter()
+
+    verts = np.empty((len(mesh.vertices), 3), dtype=np.float32)
+    mesh.vertices.foreach_get("co", verts.ravel())
+    mat = np.array(matrix_world, dtype=np.float32)
+    verts_vec4 = np.c_[verts, np.ones(len(verts), dtype=np.float32)]
+    verts = np.dot(verts_vec4, mat.T)[:, :3]
+
+    tri_verts = np.empty((num_tris, 3), dtype=np.int32)
+    mesh.loop_triangles.foreach_get("vertices", tri_verts.ravel())
+
+    tri_normals = np.empty((num_tris, 3), dtype=np.float32)
+    mesh.loop_triangles.foreach_get("normal", tri_normals.ravel())
+
+    t_extract = time.perf_counter()
+
+    mat_norm = np.array(matrix_world.to_3x3().inverted_safe().transposed(), dtype=np.float32)
+    tri_normals = np.dot(tri_normals, mat_norm.T)
+    norms = np.linalg.norm(tri_normals, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    tri_normals /= norms
+
+    stl_dtype = np.dtype([
+        ('normals', np.float32, (3,)),
+        ('v0', np.float32, (3,)),
+        ('v1', np.float32, (3,)),
+        ('v2', np.float32, (3,)),
+        ('attr', np.uint16)
+    ])
+    data = np.zeros(num_tris, dtype=stl_dtype)
+    data['normals'] = tri_normals
+    data['v0'] = verts[tri_verts[:, 0]]
+    data['v1'] = verts[tri_verts[:, 1]]
+    data['v2'] = verts[tri_verts[:, 2]]
+
+    t_format = time.perf_counter()
 
     with open(filepath, 'wb') as f:
         f.write(b'Batch STL Fast Export' + b'\x00' * 59)
-        f.write(struct.pack('<I', len(tris)))
+        f.write(struct.pack('<I', num_tris))
+        f.write(data.tobytes())
 
-        for tri in tris:
-            n = (mat_norm @ tri.normal).normalized()
-            f.write(struct.pack('<3f', n.x, n.y, n.z))
+    t_write = time.perf_counter()
 
-            for loop_idx in tri.vertices:
-                v = verts[loop_idx]
-                f.write(struct.pack('<3f', v.x, v.y, v.z))
+    print(f"      └─ STL Write Detail: Triangulate: {t_tri-t_start:.4f}s | Extract: {t_extract-t_tri:.4f}s | Format: {t_format-t_extract:.4f}s | Disk: {t_write-t_format:.4f}s")
 
-            f.write(b'\x00\x00')
 
 # --- HELPER FUNCTIONS ---
 
-def get_enabled_objects_recursive(collection):
+def get_enabled_objects_recursive(collection, view_layer_objects):
     objects = []
     for obj in collection.objects:
         if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
-            objects.append(obj)
+            # CRITICAL FIX: Only collect objects that are active in the current view layer
+            if obj.name in view_layer_objects:
+                objects.append(obj)
     for child in collection.children:
-        objects.extend(get_enabled_objects_recursive(child))
+        objects.extend(get_enabled_objects_recursive(child, view_layer_objects))
     return objects
 
 def get_active_preset(scene):
@@ -522,6 +557,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         return len(context.scene.batch_stl_presets) > 0
 
     def execute(self, context):
+        total_time_start = time.perf_counter()
         scene = context.scene
         preset = scene.batch_stl_presets[self.preset_index] if 0 <= self.preset_index < len(scene.batch_stl_presets) else get_active_preset(scene)
         if not preset or not scene.batch_stl_root_dir: return {"CANCELLED"}
@@ -531,85 +567,131 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         if context.active_object and context.mode != "OBJECT": bpy.ops.object.mode_set(mode="OBJECT")
         total_exported = 0
 
+        # Pass the view layer objects map so we don't fetch it repeatedly
+        view_layer_objects = context.view_layer.objects
+
+        print(f"\n=== STARTING BATCH EXPORT: {preset.name} ===")
+
         for item in preset.mappings:
             if not item.collection_ptr: continue
+
+            c_start = time.perf_counter()
+            print(f"\n  Processing Collection: {item.collection_ptr.name}")
+
             out_dir = os.path.normpath(os.path.join(root_dir, item.sub_path))
             os.makedirs(out_dir, exist_ok=True)
 
-            objects_to_export = list(set(get_enabled_objects_recursive(item.collection_ptr)))
-            if not objects_to_export: continue
+            objects_to_export = list(set(get_enabled_objects_recursive(item.collection_ptr, view_layer_objects)))
+            if not objects_to_export:
+                print("    ├─ Skipped: No active/visible objects found in current View Layer.")
+                continue
+
             global_original_states = []
+            all_obj_mod_states = []
 
             try:
+                # 1. Apply Global Node Overrides
+                t0 = time.perf_counter()
                 for override in item.node_overrides:
-                    if override.override_target != 'NODE' or not override.parent_group_ptr or not override.node_name: continue
-                    parent_tree = override.parent_group_ptr
+                    if override.override_target == 'NODE' and override.parent_group_ptr and override.node_name:
+                        parent_tree = override.parent_group_ptr
+                        for n_name in [n.strip() for n in override.node_name.split(',') if n.strip()]:
+                            target_node = parent_tree.nodes.get(n_name)
+                            if not target_node: continue
+                            for inp in override.inputs:
+                                socket = target_node.inputs.get(inp.input_name)
+                                if not socket: continue
+                                link_from = socket.links[0].from_socket if socket.is_linked else None
+                                global_original_states.append((socket, socket.default_value, link_from, parent_tree))
+                                if socket.is_linked: parent_tree.links.remove(socket.links[0])
+                                val = getattr(inp, f"value_{inp.override_type.lower()}", None)
+                                if val is not None: socket.default_value = val
+                t1 = time.perf_counter()
+                print(f"    ├─ Applied Global Node Overrides: {t1 - t0:.4f}s")
 
-                    for n_name in [n.strip() for n in override.node_name.split(',') if n.strip()]:
-                        target_node = parent_tree.nodes.get(n_name)
-                        if not target_node: continue
-
-                        for inp in override.inputs:
-                            socket = target_node.inputs.get(inp.input_name)
-                            if not socket: continue
-
-                            link_from = socket.links[0].from_socket if socket.is_linked else None
-                            global_original_states.append((socket, socket.default_value, link_from, parent_tree))
-                            if socket.is_linked: parent_tree.links.remove(socket.links[0])
-
-                            val = getattr(inp, f"value_{inp.override_type.lower()}", None)
-                            if val is not None: socket.default_value = val
-
-                if global_original_states: context.view_layer.update()
-
+                # 2. Apply Modifier Overrides
                 for obj in objects_to_export:
-                    obj_mod_states = []
+                    obj_changed = False
                     for override in item.node_overrides:
-                        if override.override_target != 'MODIFIER' or not override.parent_group_ptr: continue
-                        for mod in obj.modifiers:
-                            if mod.type == 'NODES' and mod.node_group == override.parent_group_ptr:
-                                for inp in override.inputs:
-                                    ident = get_modifier_socket_identifier(mod.node_group, inp.input_name)
-                                    if ident:
-                                        orig_val, is_set = get_modifier_input(mod, ident)
-                                        default_val = get_modifier_socket_default(mod.node_group, inp.input_name)
-                                        obj_mod_states.append((mod, ident, is_set, orig_val, default_val))
-                                        val = getattr(inp, f"value_{inp.override_type.lower()}", None)
-                                        if val is not None: set_modifier_input(mod, ident, val)
-
-                    if obj_mod_states:
+                        if override.override_target == 'MODIFIER' and override.parent_group_ptr:
+                            for mod in obj.modifiers:
+                                if mod.type == 'NODES' and mod.node_group == override.parent_group_ptr:
+                                    for inp in override.inputs:
+                                        ident = get_modifier_socket_identifier(mod.node_group, inp.input_name)
+                                        if ident:
+                                            orig_val, is_set = get_modifier_input(mod, ident)
+                                            default_val = get_modifier_socket_default(mod.node_group, inp.input_name)
+                                            all_obj_mod_states.append((mod, ident, is_set, orig_val, default_val))
+                                            val = getattr(inp, f"value_{inp.override_type.lower()}", None)
+                                            if val is not None:
+                                                set_modifier_input(mod, ident, val)
+                                                obj_changed = True
+                    if obj_changed:
                         obj.update_tag()
-                        context.view_layer.update()
 
-                    depsgraph = context.evaluated_depsgraph_get()
+                t2 = time.perf_counter()
+                print(f"    ├─ Applied Modifier Overrides: {t2 - t1:.4f}s")
+
+                # 3. View Layer Update
+                if global_original_states or all_obj_mod_states:
+                    context.view_layer.update()
+
+                t3 = time.perf_counter()
+                print(f"    ├─ View Layer Update: {t3 - t2:.4f}s")
+
+                # 4. Dependency Graph Retrieval
+                depsgraph = context.evaluated_depsgraph_get()
+                t4 = time.perf_counter()
+                print(f"    ├─ Depsgraph Evaluated: {t4 - t3:.4f}s")
+
+                # 5. Mesh Generation & Writing
+                print(f"    ├─ Exporting {len(objects_to_export)} objects...")
+                for obj in objects_to_export:
+                    t_obj_start = time.perf_counter()
                     obj_eval = obj.evaluated_get(depsgraph)
+                    t_eval = time.perf_counter()
 
                     try:
                         mesh = obj_eval.to_mesh()
+                        t_to_mesh = time.perf_counter()
+
                         if mesh:
                             filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{item.tag}.stl")
                             write_fast_binary_stl(filepath, mesh, obj.matrix_world)
                             obj_eval.to_mesh_clear()
                             total_exported += 1
-                    except RuntimeError: pass
+                            t_written = time.perf_counter()
 
-                    for mod, ident, is_set, orig_val, default_val in obj_mod_states:
-                        if is_set and orig_val is not None: set_modifier_input(mod, ident, orig_val)
-                        else: unset_modifier_input(mod, ident, default_val)
+                            print(f"      ├─ {obj.name}: Eval {t_eval-t_obj_start:.4f}s | MeshGen {t_to_mesh-t_eval:.4f}s | TotalWrite {t_written-t_to_mesh:.4f}s")
+                    except RuntimeError:
+                        print(f"      ├─ {obj.name}: FAILED TO GENERATE MESH")
 
-                    if obj_mod_states:
-                        obj.update_tag()
-                        context.view_layer.update()
+                t5 = time.perf_counter()
 
             finally:
+                # 6. Revert States
+                t_revert_start = time.perf_counter()
+                for mod, ident, is_set, orig_val, default_val in all_obj_mod_states:
+                    if is_set and orig_val is not None: set_modifier_input(mod, ident, orig_val)
+                    else: unset_modifier_input(mod, ident, default_val)
+                    mod.id_data.update_tag()
+
                 for socket, original_val, link_from, parent_tree in global_original_states:
                     try:
                         socket.default_value = original_val
                         if link_from: parent_tree.links.new(link_from, socket)
                     except Exception: pass
-                if global_original_states: context.view_layer.update()
 
-        if total_exported > 0: self.report({'INFO'}, f"Exported {total_exported} STLs")
+                if global_original_states or all_obj_mod_states:
+                    context.view_layer.update()
+
+                t_revert_end = time.perf_counter()
+                print(f"    └─ Reverted States & Final Update: {t_revert_end - t_revert_start:.4f}s")
+                print(f"  Collection Finished in {t_revert_end - c_start:.4f}s")
+
+        print(f"=== BATCH EXPORT COMPLETE: {time.perf_counter() - total_time_start:.4f}s Total ===")
+
+        if total_exported > 0: self.report({'INFO'}, f"Exported {total_exported} STLs (Check console for timings)")
         return {"FINISHED"}
 
 # --- UI PANEL ---
