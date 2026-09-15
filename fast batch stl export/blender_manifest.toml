@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "fast_batch_stl_exporter"
-version = "4.0.0"
+version = "5.0.0"
 name = "Fast Batch STL Exporter with flags"
 tagline = "Export to stl of collections to a directory with sub folders"
 description = "High-performance export of collections to a root directory with sub folders using viewport evaluated data. Override geometry nodes inputs on export."
