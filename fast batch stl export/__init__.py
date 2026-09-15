@@ -77,7 +77,6 @@ def get_enabled_objects_recursive(collection, view_layer_objects):
     objects = []
     for obj in collection.objects:
         if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
-            # CRITICAL FIX: Only collect objects that are active in the current view layer
             if obj.name in view_layer_objects:
                 objects.append(obj)
     for child in collection.children:
@@ -180,6 +179,7 @@ def on_input_name_update(self, context):
                     elif s_type == 'INT': self.override_type = 'INT'
                     elif s_type == 'BOOLEAN': self.override_type = 'BOOLEAN'
                     elif s_type == 'STRING': self.override_type = 'STRING'
+                    elif s_type == 'MENU': self.override_type = 'MENU'
     except Exception:
         pass
 
@@ -192,6 +192,7 @@ class BatchSTLNodeInput(bpy.types.PropertyGroup):
             ('INT', "Int", ""),
             ('FLOAT', "Float", ""),
             ('STRING', "Str", ""),
+            ('MENU', "Menu", ""),
         ),
         default='BOOLEAN'
     )
@@ -199,6 +200,7 @@ class BatchSTLNodeInput(bpy.types.PropertyGroup):
     value_int: bpy.props.IntProperty(name="Value", default=0)
     value_float: bpy.props.FloatProperty(name="Value", default=0.0)
     value_string: bpy.props.StringProperty(name="Value", default="")
+    value_menu: bpy.props.StringProperty(name="Value", default="")
 
 class BatchSTLNodeOverride(bpy.types.PropertyGroup):
     override_target: bpy.props.EnumProperty(
@@ -261,7 +263,8 @@ def copy_mapping_to_dict(src):
                 "value_bool": i.value_bool,
                 "value_int": i.value_int,
                 "value_float": i.value_float,
-                "value_string": i.value_string
+                "value_string": i.value_string,
+                "value_menu": i.value_menu
             })
         data["overrides"].append(o_data)
     return data
@@ -285,6 +288,7 @@ def paste_mapping_from_dict(new_m, data):
             new_i.value_int = i_data["value_int"]
             new_i.value_float = i_data["value_float"]
             new_i.value_string = i_data["value_string"]
+            new_i.value_menu = i_data.get("value_menu", "")
 
 class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
     bl_idname = "batch_stl.export_presets_json"
@@ -463,7 +467,7 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
                 "override_target": o.override_target,
                 "parent_group": o.parent_group_ptr.name if o.parent_group_ptr else "",
                 "node_name": o.node_name,
-                "inputs": [{"input_name": i.input_name, "override_type": i.override_type, "value_bool": i.value_bool, "value_int": i.value_int, "value_float": i.value_float, "value_string": i.value_string} for i in o.inputs]
+                "inputs": [{"input_name": i.input_name, "override_type": i.override_type, "value_bool": i.value_bool, "value_int": i.value_int, "value_float": i.value_float, "value_string": i.value_string, "value_menu": i.value_menu} for i in o.inputs]
             }
         elif self.action == 'PASTE' and _clipboard.get("override"):
             data = _clipboard["override"]
@@ -480,6 +484,7 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
                 new_i.value_int = i_data["value_int"]
                 new_i.value_float = i_data["value_float"]
                 new_i.value_string = i_data["value_string"]
+                new_i.value_menu = i_data.get("value_menu", "")
             if 0 <= idx < len(lst):
                 lst.move(len(lst) - 1, idx + 1)
         return {'FINISHED'}
@@ -529,7 +534,8 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
                 "value_bool": i.value_bool,
                 "value_int": i.value_int,
                 "value_float": i.value_float,
-                "value_string": i.value_string
+                "value_string": i.value_string,
+                "value_menu": i.value_menu
             }
         elif self.action == 'PASTE' and _clipboard.get("input"):
             data = _clipboard["input"]
@@ -540,6 +546,7 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
             new_i.value_int = data["value_int"]
             new_i.value_float = data["value_float"]
             new_i.value_string = data["value_string"]
+            new_i.value_menu = data.get("value_menu", "")
             if 0 <= idx < len(lst):
                 lst.move(len(lst) - 1, idx + 1)
         return {'FINISHED'}
@@ -604,7 +611,11 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                                 link_from = socket.links[0].from_socket if socket.is_linked else None
                                 global_original_states.append((socket, socket.default_value, link_from, parent_tree))
                                 if socket.is_linked: parent_tree.links.remove(socket.links[0])
-                                val = getattr(inp, f"value_{inp.override_type.lower()}", None)
+
+                                # FIX: Map 'BOOLEAN' to 'value_bool' to prevent retrieving None
+                                prop_name = 'value_bool' if inp.override_type == 'BOOLEAN' else f"value_{inp.override_type.lower()}"
+                                val = getattr(inp, prop_name, None)
+
                                 if val is not None: socket.default_value = val
                 t1 = time.perf_counter()
                 print(f"    ├─ Applied Global Node Overrides: {t1 - t0:.4f}s")
@@ -622,7 +633,11 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                                             orig_val, is_set = get_modifier_input(mod, ident)
                                             default_val = get_modifier_socket_default(mod.node_group, inp.input_name)
                                             all_obj_mod_states.append((mod, ident, is_set, orig_val, default_val))
-                                            val = getattr(inp, f"value_{inp.override_type.lower()}", None)
+
+                                            # FIX: Map 'BOOLEAN' to 'value_bool'
+                                            prop_name = 'value_bool' if inp.override_type == 'BOOLEAN' else f"value_{inp.override_type.lower()}"
+                                            val = getattr(inp, prop_name, None)
+
                                             if val is not None:
                                                 set_modifier_input(mod, ident, val)
                                                 obj_changed = True
@@ -822,6 +837,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                         elif inp.override_type == 'INT': irow.prop(inp, "value_int", text="")
                         elif inp.override_type == 'FLOAT': irow.prop(inp, "value_float", text="")
                         elif inp.override_type == 'STRING': irow.prop(inp, "value_string", text="")
+                        elif inp.override_type == 'MENU': irow.prop(inp, "value_menu", text="")
 
                         irow.prop(inp, "override_type", text="")
 
