@@ -174,12 +174,23 @@ def on_input_name_update(self, context):
                 node = ovr.parent_group_ptr.nodes.get(ovr.node_name)
                 if node and self.input_name in node.inputs:
                     socket = node.inputs[self.input_name]
-                    s_type = socket.type
+                    s_type = getattr(socket, "type", "")
                     if s_type in ['VALUE', 'FLOAT']: self.override_type = 'FLOAT'
                     elif s_type == 'INT': self.override_type = 'INT'
                     elif s_type == 'BOOLEAN': self.override_type = 'BOOLEAN'
                     elif s_type == 'STRING': self.override_type = 'STRING'
                     elif s_type == 'MENU': self.override_type = 'MENU'
+            elif ovr.override_target == 'MODIFIER':
+                if hasattr(ovr.parent_group_ptr, "interface"):
+                    for item in ovr.parent_group_ptr.interface.items_tree:
+                        if getattr(item, "item_type", "") == 'SOCKET' and item.name == self.input_name:
+                            s_type = getattr(item, "socket_type", "")
+                            if 'Float' in s_type: self.override_type = 'FLOAT'
+                            elif 'Int' in s_type: self.override_type = 'INT'
+                            elif 'Bool' in s_type: self.override_type = 'BOOLEAN'
+                            elif 'String' in s_type: self.override_type = 'STRING'
+                            elif 'Menu' in s_type: self.override_type = 'MENU'
+                            break
     except Exception:
         pass
 
@@ -206,8 +217,8 @@ class BatchSTLNodeOverride(bpy.types.PropertyGroup):
     override_target: bpy.props.EnumProperty(
         name="Target",
         items=(
-            ('NODE', "Node", ""),
-            ('MODIFIER', "Mod", "")
+            ('NODE', "Nodegroup", ""),
+            ('MODIFIER', "Modifier", "")
         ),
         default='NODE'
     )
