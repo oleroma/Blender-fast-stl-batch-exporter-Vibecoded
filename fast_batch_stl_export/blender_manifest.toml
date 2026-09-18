@@ -1,0 +1,14 @@
+schema_version = "1.0.0"
+id = "fast_batch_stl_exporter"
+version = "6.0.0"
+name = "Batch STL Export with geometry nodes overrides"
+tagline = "export of mapped collections with node overrides"
+description = "Export of collections to mapped directories with geometry nodes overrides."
+maintainer = "AI"
+type = "add-on"
+build_date = "2026-09-10"
+license = [
+    "SPDX:GPL-3.0-or-later"
+]
+tags = ["Import-Export"]
+blender_version_min = "5.2.0"

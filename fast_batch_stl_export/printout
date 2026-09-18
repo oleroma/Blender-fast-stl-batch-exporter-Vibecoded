@@ -1,0 +1,28 @@
+=== STARTING BATCH EXPORT: test ===
+  ├─ Applied Pinned Overrides (Global): 61.3325s
+  ├─ Processing Clean Collections (Pinned Overrides Only)...
+  │         ├─ Eval Object case_middle_plate: 0.0001s
+      ├─ Write Detail: Triangulate/Format: 0.0388s | Disk Write: 0.0024s
+  │    └─ case middle plate: 0.0438s
+  │         ├─ Eval Object case_bottom: 0.0000s
+      ├─ Write Detail: Triangulate/Format: 0.7235s | Disk Write: 0.1000s
+  │    └─ case bottom: 0.8259s
+  ├─ Processing Dirty Collections (Applying Local Overrides)...
+  │    ├─ Processing case top...
+  │    │    ├─ Local Overrides Applied: 60.6204s
+  │         ├─ Eval Object case_top: 0.0001s
+      ├─ Write Detail: Triangulate/Format: 0.4806s | Disk Write: 0.0536s
+  │    │    ├─ Export Completed: 0.5376s
+  │    │    └─ Reverted: 58.4560s
+  │    └─ Total for case top: 119.6165s
+  │    ├─ Processing case top...
+  │    │    ├─ Local Overrides Applied: 48.9428s
+  │         ├─ Eval Object case_top: 0.0000s
+      ├─ Write Detail: Triangulate/Format: 0.3724s | Disk Write: 0.0432s
+  │    │    ├─ Export Completed: 0.4217s
+  │    │    └─ Reverted: 42.7746s
+  │    └─ Total for case top: 228.9519s
+  ├─ Reverted Pinned Overrides (Global): 2.0395s
+=== BATCH EXPORT COMPLETE: 412.8273s Total ===
+
+01:49:36.063  operator         | Batch Export Complete for test. See console for timings.
