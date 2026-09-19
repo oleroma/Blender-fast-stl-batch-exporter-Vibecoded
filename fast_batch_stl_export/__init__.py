@@ -1,3 +1,4 @@
+from math import factorial
 import os
 import json
 import time
@@ -380,10 +381,12 @@ class BATCH_STL_UL_items(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         row.prop(item, "collection_ptr", text="")
+        row.separator(factor=0.5)
         sub_row = row.row(align=True)
         sub_row.prop(item, "use_tag", text="", icon='BOOKMARKS')
+        sub_row.separator(factor=0.5)
         tag_row = sub_row.row(align=True)
-        tag_row.prop(item, "tag", text="")
+        tag_row.prop(item, "tag", text="", emboss=False)
         row.prop(item, "sub_path", text="", emboss=False, icon='FILE_FOLDER')
 
 class BATCH_STL_OT_preset_actions(bpy.types.Operator):
@@ -579,7 +582,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 is_clean_batch = len(mappings_in_batch[0].node_overrides) == 0
                 batch_type = "Clean (Pinned Only)" if is_clean_batch else f"Dirty ({len(mappings_in_batch[0].node_overrides)} Local Overrides)"
 
-                collection_names = [m.collection_ptr.name for m in mappings_in_batch]
+                collection_names = [f"{m.collection_ptr.name} [{m.tag}]" for m in mappings_in_batch]
                 print(f"  ├─ Batch {batch_counter}/{len(execution_batches)} [{batch_type}]: Processing {len(collection_names)} mapped instances -> {', '.join(collection_names)}")
 
                 batch_objects = set()
@@ -755,7 +758,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         layout.prop(active_preset, "preset_prefix", icon='FILE_FOLDER')
         box = layout.box()
         m_header = box.row()
-        m_header.label(text="Collections Mapping:", icon='OUTLINER_COLLECTION')
+        m_header.label(text=f"Collections Mapping for: {active_preset.preset_prefix}", icon='OUTLINER_COLLECTION')
         draw_inline_controls(m_header, "batch_stl.mapping_actions", use_clipboard=True)
         box.template_list("BATCH_STL_UL_items", "", active_preset, "mappings", active_preset, "mapping_index", rows=5)
 
