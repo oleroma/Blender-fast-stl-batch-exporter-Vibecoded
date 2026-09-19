@@ -262,48 +262,50 @@ def on_input_name_update(self, context):
         pass
 
 class BatchSTLNodeInput(bpy.types.PropertyGroup):
-    input_name: bpy.props.StringProperty(name="Input", default="", update=on_input_name_update)
+    input_name: bpy.props.StringProperty(name="Input", default="", update=on_input_name_update, description="Name of the node group input socket or modifier property to override")
     override_type: bpy.props.EnumProperty(
         name="Type",
         items=(
-            ('BOOLEAN', "Bool", ""),
-            ('INT', "Int", ""),
-            ('FLOAT', "Float", ""),
-            ('STRING', "Str", ""),
-            ('MENU', "Menu", ""),
+            ('BOOLEAN', "Bool", "Boolean data type"),
+            ('INT', "Int", "Integer data type"),
+            ('FLOAT', "Float", "Floating-point data type"),
+            ('STRING', "Str", "String text data type"),
+            ('MENU', "Menu", "Menu or Enum data type"),
         ),
-        default='BOOLEAN'
+        default='BOOLEAN',
+        description="Data type of the override value"
     )
-    value_bool: bpy.props.BoolProperty(name="Value", default=True)
-    value_int: bpy.props.IntProperty(name="Value", default=0)
-    value_float: bpy.props.FloatProperty(name="Value", default=0.0)
-    value_string: bpy.props.StringProperty(name="Value", default="")
-    value_menu: bpy.props.StringProperty(name="Value", default="")
+    value_bool: bpy.props.BoolProperty(name="Value", default=True, description="Boolean override value to apply")
+    value_int: bpy.props.IntProperty(name="Value", default=0, description="Integer override value to apply")
+    value_float: bpy.props.FloatProperty(name="Value", default=0.0, description="Float override value to apply")
+    value_string: bpy.props.StringProperty(name="Value", default="", description="String override value to apply")
+    value_menu: bpy.props.StringProperty(name="Value", default="", description="Menu or Enum override value to apply")
 
 class BatchSTLNodeOverride(bpy.types.PropertyGroup):
     override_target: bpy.props.EnumProperty(
         name="Target",
-        items=(('NODE', "Node", ""), ('MODIFIER', "Mod", "")),
-        default='NODE'
+        items=(('NODE', "Node", "Target an internal node within a Geometry Nodes group"),
+               ('MODIFIER', "Modifier", "Target a socket directly on the Modifier interface")),
+        default='NODE',
+        description="Target type to override"
     )
-    parent_group_ptr: bpy.props.PointerProperty(type=bpy.types.NodeTree, name="Group")
-    node_name: bpy.props.StringProperty(name="Node", default="")
-    inputs: bpy.props.CollectionProperty(type=BatchSTLNodeInput)
+    parent_group_ptr: bpy.props.PointerProperty(type=bpy.types.NodeTree, name="Group", description="The parent node tree/group containing the target node or modifier interface")
+    node_name: bpy.props.StringProperty(name="Node", default="", description="Exact name of the internal node to override")
+    inputs: bpy.props.CollectionProperty(type=BatchSTLNodeInput, description="List of specific input sockets to override")
 
 class BatchSTLExportItem(bpy.types.PropertyGroup):
-    collection_ptr: bpy.props.PointerProperty(type=bpy.types.Collection, name="Collection")
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, description="Append tag to object name")
-    tag: bpy.props.StringProperty(name="Tag", default="")
-    sub_path: bpy.props.StringProperty(name="Sub-folder", default="")
-    node_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride)
+    collection_ptr: bpy.props.PointerProperty(type=bpy.types.Collection, name="Collection", description="Target collection containing the objects to be exported")
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, description="Append the specified tag suffix to the exported STL filenames")
+    tag: bpy.props.StringProperty(name="Tag", default="", description="Suffix tag string to append to the filename (e.g., '_v2')")
+    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", description="Sub-directory path where these STLs will be saved, relative to the preset root")
+    node_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride, description="Collection of local overrides applied specifically to this mapped collection")
 
 class BatchSTLExportPreset(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Preset Name", default="New Preset")
-    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="")
-    pinned_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride)
-    mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem)
-    mapping_index: bpy.props.IntProperty(default=0)
-
+    name: bpy.props.StringProperty(name="Preset Name", default="New Preset", description="Name of the batch export preset")
+    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", description="Root folder name for this preset, created inside the global export directory")
+    pinned_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride, description="Global overrides applied to all mapped collections in this preset")
+    mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem, description="List of collections mapped to this preset for batch export")
+    mapping_index: bpy.props.IntProperty(default=0, description="Index of the currently active collection mapping")
 
 # --- JSON UTILS ---
 
@@ -324,6 +326,24 @@ def paste_override_from_dict(new_o, data):
     for i_data in data["inputs"]:
         new_i = new_o.inputs.add()
         for k, v in i_data.items(): setattr(new_i, k, v)
+
+def copy_mapping_to_dict(m):
+    return {
+        "collection_name": m.collection_ptr.name if m.collection_ptr else "",
+        "use_tag": m.use_tag,
+        "tag": m.tag,
+        "sub_path": m.sub_path,
+        "overrides": [copy_override_to_dict(o) for o in m.node_overrides]
+    }
+
+def paste_mapping_from_dict(new_m, data):
+    c_name = data.get("collection_name", "")
+    new_m.collection_ptr = bpy.data.collections.get(c_name) if c_name else None
+    new_m.use_tag = data.get("use_tag", True)
+    new_m.tag = data.get("tag", "")
+    new_m.sub_path = data.get("sub_path", "")
+    for o_data in data.get("overrides", []):
+        paste_override_from_dict(new_m.node_overrides.add(), o_data)
 
 def copy_preset_to_dict(src):
     return {
@@ -348,6 +368,7 @@ def paste_preset_from_dict(new_p, data):
 class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
     bl_idname = "batch_stl.export_presets_json"
     bl_label = "Export JSON"
+    bl_description = "Export all current batch export presets to a JSON configuration file"
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
@@ -359,6 +380,7 @@ class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
 class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     bl_idname = "batch_stl.import_presets_json"
     bl_label = "Import JSON"
+    bl_description = "Import batch export presets from a JSON configuration file"
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
@@ -394,6 +416,11 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     bl_label = "Preset Actions"
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
 
+    @classmethod
+    def description(cls, context, properties):
+        descs = {'ADD': "Create a new export preset", 'REMOVE': "Delete the selected export preset", 'UP': "Move preset up in the list", 'DOWN': "Move preset down in the list", 'COPY': "Copy preset to clipboard", 'PASTE': "Paste preset from clipboard"}
+        return descs.get(properties.action, "Modify preset list")
+
     def execute(self, context):
         lst = context.scene.batch_stl_presets
         idx = context.scene.batch_stl_preset_index
@@ -409,6 +436,11 @@ class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
     bl_idname = "batch_stl.mapping_actions"
     bl_label = "Mapping Actions"
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
+
+    @classmethod
+    def description(cls, context, properties):
+        descs = {'ADD': "Map a new collection to this preset", 'REMOVE': "Remove the selected collection mapping", 'UP': "Move mapping up", 'DOWN': "Move mapping down", 'COPY': "Copy mapping to clipboard", 'PASTE': "Paste mapping from clipboard"}
+        return descs.get(properties.action, "Modify mapping list")
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -428,6 +460,11 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", ""), ('PIN', "", ""), ('UNPIN', "", "")))
     override_index: bpy.props.IntProperty(default=-1)
     is_pinned: bpy.props.BoolProperty(default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        descs = {'ADD': "Add a new node/modifier override", 'REMOVE': "Remove this override block", 'UP': "Move override block up", 'DOWN': "Move override block down", 'COPY': "Copy override block to clipboard", 'PASTE': "Paste override block from clipboard", 'PIN': "Pin override (apply globally to all mapped collections in preset)", 'UNPIN': "Unpin override (convert to local override for this collection only)"}
+        return descs.get(properties.action, "Modify overrides")
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -463,6 +500,11 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
     input_index: bpy.props.IntProperty(default=-1)
     is_pinned: bpy.props.BoolProperty(default=False)
 
+    @classmethod
+    def description(cls, context, properties):
+        descs = {'ADD': "Add a new data input override to this block", 'REMOVE': "Remove this input override", 'UP': "Move input up", 'DOWN': "Move input down", 'COPY': "Copy input override to clipboard", 'PASTE': "Paste input override from clipboard"}
+        return descs.get(properties.action, "Modify input overrides")
+
     def execute(self, context):
         preset = get_active_preset(context.scene)
         mapping = get_active_mapping(preset)
@@ -489,8 +531,9 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
     bl_label = "Batch Export STLs"
+    bl_description = "Execute the batch export process for the active or selected preset"
     bl_options = {"REGISTER", "UNDO"}
-    preset_index: bpy.props.IntProperty(default=-1)
+    preset_index: bpy.props.IntProperty(default=-1, description="Index of the preset to export (uses active if -1)")
 
     @classmethod
     def poll(cls, context):
@@ -800,9 +843,9 @@ classes = (
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)
-    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH")
-    bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
-    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(default=0)
+    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH", description="Master directory path on disk where all batch STL exports will be saved")
+    bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset, description="List of all batch export presets")
+    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(default=0, description="Index of the currently active export preset")
 
 def unregister():
     for cls in reversed(classes): bpy.utils.unregister_class(cls)
