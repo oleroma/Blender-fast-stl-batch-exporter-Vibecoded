@@ -305,7 +305,11 @@ class BatchSTLExportPreset(bpy.types.PropertyGroup):
     preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", description="Root folder name for this preset, created inside the global export directory")
     pinned_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride, description="Global overrides applied to all mapped collections in this preset")
     mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem, description="List of collections mapped to this preset for batch export")
-    mapping_index: bpy.props.IntProperty(default=0, description="Index of the currently active collection mapping")
+    mapping_index: bpy.props.IntProperty(
+        name="Tag and export directory",
+        default=0,
+        description="Select the active collection mapping to edit its overrides"
+    )
 
 # --- JSON UTILS ---
 
@@ -530,8 +534,8 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
 
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
-    bl_label = "Batch Export STLs"
-    bl_description = "Execute the batch export process for the active or selected preset"
+    bl_label = "Export"
+    bl_description = "Batch export mapped collections objects"
     bl_options = {"REGISTER", "UNDO"}
     preset_index: bpy.props.IntProperty(default=-1, description="Index of the preset to export (uses active if -1)")
 
@@ -845,7 +849,11 @@ def register():
     for cls in classes: bpy.utils.register_class(cls)
     bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH", description="Master directory path on disk where all batch STL exports will be saved")
     bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset, description="List of all batch export presets")
-    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(default=0, description="Index of the currently active export preset")
+    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(
+        name="Active Preset",
+        default=0,
+        description="Select the active batch export preset to edit"
+    )
 
 def unregister():
     for cls in reversed(classes): bpy.utils.unregister_class(cls)
