@@ -291,6 +291,7 @@ class BatchSTLNodeOverride(bpy.types.PropertyGroup):
 
 class BatchSTLExportItem(bpy.types.PropertyGroup):
     collection_ptr: bpy.props.PointerProperty(type=bpy.types.Collection, name="Collection")
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, description="Append tag to object name")
     tag: bpy.props.StringProperty(name="Tag", default="")
     sub_path: bpy.props.StringProperty(name="Sub-folder", default="")
     node_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride)
@@ -327,7 +328,7 @@ def copy_preset_to_dict(src):
     return {
         "name": src.name, "preset_prefix": src.preset_prefix,
         "pinned_overrides": [copy_override_to_dict(o) for o in src.pinned_overrides],
-        "mappings": [{"collection_name": m.collection_ptr.name if m.collection_ptr else "", "tag": m.tag, "sub_path": m.sub_path, "overrides": [copy_override_to_dict(o) for o in m.node_overrides]} for m in src.mappings]
+        "mappings": [{"collection_name": m.collection_ptr.name if m.collection_ptr else "", "use_tag": m.use_tag, "tag": m.tag, "sub_path": m.sub_path, "overrides": [copy_override_to_dict(o) for o in m.node_overrides]} for m in src.mappings]
     }
 
 def paste_preset_from_dict(new_p, data):
@@ -338,6 +339,7 @@ def paste_preset_from_dict(new_p, data):
         new_m = new_p.mappings.add()
         c_name = m_data.get("collection_name", "")
         new_m.collection_ptr = bpy.data.collections.get(c_name) if c_name else None
+        new_m.use_tag = m_data.get("use_tag", True)
         new_m.tag = m_data.get("tag", "")
         new_m.sub_path = m_data.get("sub_path", "")
         for o_data in m_data.get("overrides", []): paste_override_from_dict(new_m.node_overrides.add(), o_data)
@@ -378,7 +380,10 @@ class BATCH_STL_UL_items(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         row.prop(item, "collection_ptr", text="")
-        row.prop(item, "tag", text="", emboss=False, icon='BOOKMARKS')
+        sub_row = row.row(align=True)
+        sub_row.prop(item, "use_tag", text="", icon='BOOKMARKS')
+        tag_row = sub_row.row(align=True)
+        tag_row.prop(item, "tag", text="")
         row.prop(item, "sub_path", text="", emboss=False, icon='FILE_FOLDER')
 
 class BATCH_STL_OT_preset_actions(bpy.types.Operator):
@@ -661,7 +666,8 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 print(f"  │         ├─ Evaluated Mesh [{obj.name}]: {time.perf_counter() - t_eval:.4f}s")
 
                 if mesh:
-                    filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{mapping.tag}.stl")
+                    tag_str = mapping.tag if mapping.use_tag and mapping.tag else ""
+                    filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{tag_str}.stl")
                     write_fast_binary_stl(filepath, mesh, obj.matrix_world)
                     obj_eval.to_mesh_clear()
 
