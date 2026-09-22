@@ -4,6 +4,10 @@ import json
 import time
 import struct
 import itertools
+import threading
+import queue
+import subprocess
+import tempfile
 import bpy
 import numpy as np
 from bpy_extras.io_utils import ExportHelper, ImportHelper
@@ -368,6 +372,7 @@ def revert_overrides(global_states, mod_states, target_objects):
     for obj in target_objects:
         try: obj.update_tag()
         except ReferenceError: pass
+
 
 def get_active_preset(scene):
     presets = scene.batch_stl_presets
@@ -791,235 +796,274 @@ class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
             else: mapping.excluded_objects.add().name = self.object_name
         return {'FINISHED'}
 
+class BATCH_STL_OT_cancel_export(bpy.types.Operator):
+    bl_idname = "batch_stl.cancel_export"
+    bl_label = "Cancel Export"
 
-# --- BATCH EXPORT OPERATOR ---
+    def execute(self, context):
+        context.scene.cancel_export = True
+        return {'FINISHED'}
+
+
+# --- BATCH EXPORT OPERATOR (HEADLESS INSTANCE MANAGER) ---
 
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
     bl_label = "Export"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER"}
     preset_index: bpy.props.IntProperty(default=-1)
+
+    _timer = None
+    process = None
 
     @classmethod
     def poll(cls, context):
-        return len(context.scene.batch_stl_presets) > 0
+        return len(context.scene.batch_stl_presets) > 0 and not context.scene.is_exporting
 
-    def execute(self, context):
-        total_time_start = time.perf_counter()
+    def invoke(self, context, event):
+        if context.scene.is_exporting: return {'CANCELLED'}
 
         scene = context.scene
-        preset = scene.batch_stl_presets[self.preset_index] if 0 <= self.preset_index < len(scene.batch_stl_presets) else get_active_preset(scene)
+        preset_idx = self.preset_index if self.preset_index >= 0 else scene.batch_stl_preset_index
+        if preset_idx < 0 or preset_idx >= len(scene.batch_stl_presets): return {"CANCELLED"}
+        preset = scene.batch_stl_presets[preset_idx]
 
-        if not preset or not scene.batch_stl_root_dir:
-            self.report({'ERROR'}, "Missing Preset or Root Directory")
+        if not scene.batch_stl_root_dir:
+            self.report({'ERROR'}, "Missing Root Directory")
             return {"CANCELLED"}
 
-        print(f"\n=== STARTING ISOLATED HASH-BATCHED EXPORT: {preset.name} ===")
+        # 1. Setup secure Temp Directory & File Copy
+        self.temp_dir = tempfile.mkdtemp(prefix="fast_batch_stl_")
+        self.temp_blend = os.path.join(self.temp_dir, "batch_stl_export_temp.blend")
 
-        root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
-        if preset.preset_prefix:
-            root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
+        # Save a protective copy of the entire current scene state
+        bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True)
 
-        master_global_states = []
-        master_mod_states = []
-        master_all_objs = set()
-        original_mod_states = {}
+        # 2. Spawn Headless Subprocess
+        cmd = [
+            bpy.app.binary_path,
+            "-b", self.temp_blend,
+            "-P", __file__,
+            "--", "--batch-stl-headless", str(preset_idx)
+        ]
 
         try:
-            print("\n  [Phase 0] Absolute Depsgraph Isolation & Safety Snapshot...")
-            t_phase0_start = time.perf_counter()
-
-            objects_to_mute = set(context.view_layer.objects)
-            for mapping in preset.mappings:
-                if mapping.collection_ptr:
-                    objects_to_mute.update(mapping.collection_ptr.all_objects)
-
-            for obj in objects_to_mute:
-                if hasattr(obj, 'modifiers'):
-                    for mod in obj.modifiers:
-                        if mod.type == 'NODES':
-                            original_mod_states[mod] = mod.show_viewport
-                            mod.show_viewport = False
-
-            print(f"    ├─ Muted {len(original_mod_states)} modifiers across scene in {time.perf_counter() - t_phase0_start:.4f}s")
-
-            def enable_modifiers(objects):
-                for obj in objects:
-                    if hasattr(obj, 'modifiers'):
-                        for mod in obj.modifiers:
-                            if mod.type == 'NODES' and mod in original_mod_states:
-                                mod.show_viewport = original_mod_states[mod]
-
-            def disable_modifiers(objects):
-                for obj in objects:
-                    if hasattr(obj, 'modifiers'):
-                        for mod in obj.modifiers:
-                            if mod.type == 'NODES' and mod in original_mod_states:
-                                mod.show_viewport = False
-
-            t_snap = time.perf_counter()
-            all_ovrs_in_preset = list(preset.pinned_overrides)
-            for m in preset.mappings:
-                all_ovrs_in_preset.extend(m.node_overrides)
-                if m.collection_ptr:
-                    master_all_objs.update(m.collection_ptr.all_objects)
-
-            master_global_states, master_mod_states = apply_overrides(all_ovrs_in_preset, master_all_objs, dry_run=True)
-            print(f"    └─ Recorded Global Master Snapshot: {time.perf_counter() - t_snap:.4f}s")
-
-            execution_batches = {}
-            sig_pinned = get_override_signature(preset.pinned_overrides)
-
-            for mapping in preset.mappings:
-                if not mapping.collection_ptr: continue
-                if is_collection_excluded(context, mapping.collection_ptr):
-                    print(f"  ├─ Skipping '{mapping.collection_ptr.name}' (Excluded from View Layer)")
-                    continue
-
-                sig_local = get_override_signature(mapping.node_overrides)
-                full_sig = sig_pinned + sig_local
-
-                if full_sig not in execution_batches:
-                    execution_batches[full_sig] = []
-                execution_batches[full_sig].append(mapping)
-
-            if not execution_batches:
-                print("  └─ No active collections to export (all mapped collections are excluded).")
-                return {"FINISHED"}
-
-            batch_counter = 1
-
-            for signature, mappings_in_batch in execution_batches.items():
-                t_batch_start = time.perf_counter()
-
-                first_mapping = mappings_in_batch[0]
-                all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
-                combinations = generate_override_combinations(all_overrides)
-
-                is_clean_batch = len(mappings_in_batch[0].node_overrides) == 0
-                batch_type = "Clean (Pinned Only)" if is_clean_batch else f"Dirty ({len(mappings_in_batch[0].node_overrides)} Local Overrides)"
-
-                collection_names = [f"{m.collection_ptr.name} [{m.tag}]" for m in mappings_in_batch]
-                print(f"  ├─ Batch {batch_counter}/{len(execution_batches)} [{batch_type}]: Processing {len(collection_names)} mapped instances with {len(combinations)} permutation(s)")
-
-                batch_objects = set()
-                for m in mappings_in_batch:
-                    batch_objects.update(m.collection_ptr.all_objects)
-
-                t_en = time.perf_counter()
-                enable_modifiers(batch_objects)
-                print(f"  │    ├─ Enabled Batch Modifiers: {time.perf_counter() - t_en:.4f}s")
-
-                for combo_idx, combo in enumerate(combinations):
-                    print(f"  │    ├─ Permutation {combo_idx + 1}/{len(combinations)}")
-                    combo_suffix = ""
-                    combo_subpath = ""
-                    processed_params = set()
-
-                    for ovr, inp in combo:
-                        param_key = (ovr.override_target, ovr.node_name, inp.input_name)
-
-                        if param_key not in processed_params:
-                            val = get_input_value(inp)
-                            val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
-
-                            if inp.tag:
-                                if inp.tag.startswith("_"): naming_str = val_str + inp.tag
-                                elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
-                                else: naming_str = inp.tag
-                            else:
-                                naming_str = val_str
-
-                            if inp.use_tag: combo_suffix += f"_{naming_str}"
-                            if inp.use_dir: combo_subpath = os.path.join(combo_subpath, naming_str)
-
-                            processed_params.add(param_key)
-
-                    t_ovr = time.perf_counter()
-                    global_states = []
-                    mod_states = []
-
-                    try:
-                        active_overrides = reconstruct_overrides_for_combo(combo)
-                        global_states, mod_states = apply_overrides(active_overrides, batch_objects)
-
-                        context.view_layer.update()
-                        depsgraph = context.evaluated_depsgraph_get()
-
-                        print(f"  │    │    ├─ Applied & Synced Graph: {time.perf_counter() - t_ovr:.4f}s")
-
-                        for mapping in mappings_in_batch:
-                            self.export_mapping_fast(context, depsgraph, mapping, root_dir, combo_suffix, combo_subpath)
-
-                    finally:
-                        t_rev = time.perf_counter()
-                        revert_overrides(global_states, mod_states, batch_objects)
-                        context.view_layer.update()
-                        print(f"  │    │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
-
-                t_dis = time.perf_counter()
-                disable_modifiers(batch_objects)
-                print(f"  │    └─ Disabled Batch Modifiers: {time.perf_counter() - t_dis:.4f}s")
-
-                print(f"  │    => Batch Total Time: {time.perf_counter() - t_batch_start:.4f}s\n")
-                batch_counter += 1
-
-        except KeyboardInterrupt:
-            print("\n[!] Export cancelled by user (Ctrl+C). Initiating emergency recovery...")
-            self.report({'WARNING'}, "Export cancelled by user. Restoring scene...")
+            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to spawn headless Blender: {e}")
+            self.cleanup()
             return {'CANCELLED'}
 
-        finally:
-            print("\n  [Phase 4] Master Safe State Restoration...")
-            t_ph4_start = time.perf_counter()
+        # 3. Non-blocking stdout queue
+        self.q = queue.Queue()
+        def enqueue_output(out, q):
+            for line in iter(out.readline, ''):
+                q.put(line)
+            out.close()
 
-            revert_overrides(master_global_states, master_mod_states, master_all_objs)
+        self.t = threading.Thread(target=enqueue_output, args=(self.process.stdout, self.q))
+        self.t.daemon = True
+        self.t.start()
 
-            for mod, original_state in original_mod_states.items():
-                try:
-                    mod.show_viewport = original_state
-                except ReferenceError:
-                    pass
-            print(f"    ├─ Restored {len(original_mod_states)} scene modifiers in {time.perf_counter() - t_ph4_start:.4f}s")
+        # Initialize Modal States
+        context.scene.is_exporting = True
+        context.scene.cancel_export = False
+        context.scene.export_progress = 0.0
+        context.scene.export_status = f"Spawning Headless Instance for '{preset.name}'..."
 
-            t_final_upd = time.perf_counter()
-            context.view_layer.update()
-            print(f"    ├─ Final Depsgraph Recovery Update in {time.perf_counter() - t_final_upd:.4f}s")
-            print(f"    └─ Phase 4 Total: {time.perf_counter() - t_ph4_start:.4f}s")
+        self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
 
-        print(f"\n=== BATCH EXPORT COMPLETE: {time.perf_counter() - total_time_start:.4f}s Total ===\n")
-        self.report({'INFO'}, f"Batch Export Complete for {preset.name}. See console for timings.")
-        return {"FINISHED"}
+    def modal(self, context, event):
+        # Esc Catch & Kill Switch
+        if context.scene.cancel_export or (event.type == 'ESC' and event.value == 'PRESS'):
+            print("\n[!] Export cancelled by user. Terminating headless instance...")
+            if self.process: self.process.terminate()
+            self.cleanup(context)
+            self.report({'WARNING'}, "Export cancelled by user.")
+            return {'CANCELLED'}
 
-    def export_mapping_fast(self, context, depsgraph, mapping, root_dir, combo_suffix="", combo_subpath=""):
-        t_start = time.perf_counter()
-        out_dir = os.path.normpath(os.path.join(root_dir, mapping.sub_path, combo_subpath))
-        os.makedirs(out_dir, exist_ok=True)
+        if event.type == 'TIMER':
+            # Drain non-blocking output queue
+            while True:
+                try: line = self.q.get_nowait()
+                except queue.Empty: break
+                else:
+                    line = line.strip()
+                    if line.startswith("BATCH_STL_PROGRESS:"):
+                        try:
+                            parts = line.split(":")[1].split("/")
+                            cur, tot = int(parts[0]), int(parts[1])
+                            context.scene.export_progress = cur / max(1, tot)
+                            context.scene.export_status = f"Exporting: Permutation {cur} / {tot} (Press ESC to Cancel)"
+                        except Exception: pass
+                    elif line:
+                        # Stream headless logs seamlessly into the main console
+                        print(f"[Headless] {line}")
 
-        print(f"  │    │    ├─ Exporting: {mapping.collection_ptr.name}{' ['+mapping.tag+']' if mapping.tag else ''}")
+            # Check if subprocess finished
+            if self.process.poll() is not None:
+                self.cleanup(context)
+                if self.process.returncode == 0:
+                    self.report({'INFO'}, "Batch Export Complete.")
+                else:
+                    self.report({'ERROR'}, f"Headless export failed with return code {self.process.returncode}")
+                return {'FINISHED'}
 
-        excluded_names = {e.name for e in mapping.excluded_objects} if mapping.use_filter else set()
+        return {'PASS_THROUGH'}
 
-        for obj in mapping.collection_ptr.all_objects:
-            if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
-                if obj.name in excluded_names:
-                    continue
+    def cleanup(self, context=None):
+        if context and self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        if context: context.scene.is_exporting = False
 
-                t_eval = time.perf_counter()
-                obj_eval = obj.evaluated_get(depsgraph)
-                try:
-                    mesh = obj_eval.to_mesh()
-                except RuntimeError:
-                    mesh = None
+        try:
+            if os.path.exists(self.temp_blend): os.remove(self.temp_blend)
+            os.rmdir(self.temp_dir)
+        except Exception as e:
+            print(f"Cleanup Error: {e}")
 
-                print(f"  │         ├─ Evaluated Mesh [{obj.name}]: {time.perf_counter() - t_eval:.4f}s")
 
-                if mesh:
-                    base_tag = mapping.tag if mapping.use_tag and mapping.tag else ""
-                    final_tag = base_tag + combo_suffix
-                    filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{final_tag}.stl")
-                    write_fast_binary_stl(filepath, mesh, obj.matrix_world)
-                    obj_eval.to_mesh_clear()
+# --- HEADLESS EXPORT EXECUTION ROUTINE ---
+
+def run_headless_export(preset_index):
+    import sys
+
+    scene = bpy.context.scene
+    if preset_index < 0 or preset_index >= len(scene.batch_stl_presets):
+        print("ERROR: Invalid preset index")
+        sys.exit(1)
+
+    preset = scene.batch_stl_presets[preset_index]
+    root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
+    if preset.preset_prefix:
+        root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
+
+    print(f"\n=== HEADLESS EXPORT INITIATED: {preset.name} ===")
+
+    objects_to_mute = set(bpy.context.view_layer.objects)
+    for mapping in preset.mappings:
+        if mapping.collection_ptr:
+            objects_to_mute.update(mapping.collection_ptr.all_objects)
+
+    original_mod_states = {}
+    for obj in objects_to_mute:
+        if hasattr(obj, 'modifiers'):
+            for mod in obj.modifiers:
+                if mod.type == 'NODES':
+                    original_mod_states[mod] = mod.show_viewport
+                    mod.show_viewport = False
+
+    def enable_modifiers(objects):
+        for obj in objects:
+            for mod in getattr(obj, 'modifiers', []):
+                if mod.type == 'NODES' and mod in original_mod_states:
+                    mod.show_viewport = original_mod_states[mod]
+
+    def disable_modifiers(objects):
+        for obj in objects:
+            for mod in getattr(obj, 'modifiers', []):
+                if mod.type == 'NODES' and mod in original_mod_states:
+                    mod.show_viewport = False
+
+    execution_batches = {}
+    sig_pinned = get_override_signature(preset.pinned_overrides)
+
+    for mapping in preset.mappings:
+        if not mapping.collection_ptr: continue
+        if is_collection_excluded(bpy.context, mapping.collection_ptr): continue
+
+        sig_local = get_override_signature(mapping.node_overrides)
+        full_sig = sig_pinned + sig_local
+
+        if full_sig not in execution_batches: execution_batches[full_sig] = []
+        execution_batches[full_sig].append(mapping)
+
+    total_combos = 0
+    for signature, mappings_in_batch in execution_batches.items():
+        first_mapping = mappings_in_batch[0]
+        all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
+        combinations = generate_override_combinations(all_overrides)
+        total_combos += len(combinations)
+
+    current_combo_step = 0
+
+    for signature, mappings_in_batch in execution_batches.items():
+        first_mapping = mappings_in_batch[0]
+        all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
+        combinations = generate_override_combinations(all_overrides)
+
+        batch_objects = set()
+        for m in mappings_in_batch: batch_objects.update(m.collection_ptr.all_objects)
+
+        enable_modifiers(batch_objects)
+
+        for combo in combinations:
+            combo_suffix = ""
+            combo_subpath = ""
+            processed_params = set()
+
+            for ovr, inp in combo:
+                param_key = (ovr.override_target, ovr.node_name, inp.input_name)
+                if param_key not in processed_params:
+                    val = get_input_value(inp)
+                    val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
+
+                    if inp.tag:
+                        if inp.tag.startswith("_"): naming_str = val_str + inp.tag
+                        elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
+                        else: naming_str = inp.tag
+                    else: naming_str = val_str
+
+                    if inp.use_tag: combo_suffix += f"_{naming_str}"
+                    if inp.use_dir: combo_subpath = os.path.join(combo_subpath, naming_str)
+                    processed_params.add(param_key)
+
+            global_states = []
+            mod_states = []
+
+            try:
+                active_overrides = reconstruct_overrides_for_combo(combo)
+                global_states, mod_states = apply_overrides(active_overrides, batch_objects)
+
+                bpy.context.view_layer.update()
+                depsgraph = bpy.context.evaluated_depsgraph_get()
+
+                for mapping in mappings_in_batch:
+                    out_dir = os.path.normpath(os.path.join(root_dir, mapping.sub_path, combo_subpath))
+                    os.makedirs(out_dir, exist_ok=True)
+
+                    excluded_names = {e.name for e in mapping.excluded_objects} if mapping.use_filter else set()
+
+                    for obj in mapping.collection_ptr.all_objects:
+                        if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+                            if obj.name in excluded_names: continue
+
+                            obj_eval = obj.evaluated_get(depsgraph)
+                            try: mesh = obj_eval.to_mesh()
+                            except RuntimeError: mesh = None
+
+                            if mesh:
+                                base_tag = mapping.tag if mapping.use_tag and mapping.tag else ""
+                                final_tag = base_tag + combo_suffix
+                                filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{final_tag}.stl")
+                                write_fast_binary_stl(filepath, mesh, obj.matrix_world)
+                                obj_eval.to_mesh_clear()
+            finally:
+                # Essential to revert so cross-polluted states are flushed for the next combination
+                revert_overrides(global_states, mod_states, batch_objects)
+                bpy.context.view_layer.update()
+
+            current_combo_step += 1
+            print(f"BATCH_STL_PROGRESS:{current_combo_step}/{total_combos}", flush=True)
+
+        disable_modifiers(batch_objects)
+
+    print("=== HEADLESS EXPORT FINISHED ===")
+    sys.exit(0)
+
 
 # --- UI PANELS ---
 
@@ -1111,6 +1155,14 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
 
+        if scene.is_exporting:
+            prog_box = layout.box()
+            prog_box.label(text=scene.export_status, icon='INFO')
+            prog_box.prop(scene, "export_progress", slider=True, text="")
+            prog_box.operator("batch_stl.cancel_export", icon='CANCEL', text="Cancel Export (or ESC)")
+            layout = layout.column()
+            layout.enabled = False
+
         layout.prop(scene, "batch_stl_root_dir")
         layout.separator()
 
@@ -1143,7 +1195,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         active_item = get_active_mapping(active_preset)
         if active_item:
 
-            # --- Object Filter Box UI ---
             if active_item.collection_ptr:
                 layout.separator()
                 if active_item.use_filter:
@@ -1157,7 +1208,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                         icon = 'CHECKBOX_DEHLT' if is_excl else 'CHECKBOX_HLT'
                         op = col.operator("batch_stl.toggle_exclusion", text=obj.name, icon=icon, depress=not is_excl)
                         op.object_name = obj.name
-            # ---------------------------
 
             layout.separator()
             c_name = active_item.collection_ptr.name if active_item.collection_ptr else "Unassigned"
@@ -1220,21 +1270,40 @@ classes = (
     BATCH_STL_UL_items, BATCH_STL_UL_presets,
     BATCH_STL_OT_preset_actions, BATCH_STL_OT_mapping_actions, BATCH_STL_OT_override_actions,
     BATCH_STL_OT_input_actions, BATCH_STL_OT_toggle_sweep, BATCH_STL_OT_toggle_exclusion,
-    BATCH_STL_OT_export_presets_json, BATCH_STL_OT_import_presets_json,
+    BATCH_STL_OT_cancel_export, BATCH_STL_OT_export_presets_json, BATCH_STL_OT_import_presets_json,
     EXPORT_OT_batch_stl_multi, VIEW3D_PT_batch_export_stl_multi,
 )
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)
+
     bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH")
     bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
     bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0)
+
+    bpy.types.Scene.is_exporting = bpy.props.BoolProperty(default=False)
+    bpy.types.Scene.cancel_export = bpy.props.BoolProperty(default=False)
+    bpy.types.Scene.export_progress = bpy.props.FloatProperty(name="Progress", default=0.0, min=0.0, max=1.0)
+    bpy.types.Scene.export_status = bpy.props.StringProperty(default="")
 
 def unregister():
     for cls in reversed(classes): bpy.utils.unregister_class(cls)
     del bpy.types.Scene.batch_stl_root_dir
     del bpy.types.Scene.batch_stl_presets
     del bpy.types.Scene.batch_stl_preset_index
+    del bpy.types.Scene.is_exporting
+    del bpy.types.Scene.cancel_export
+    del bpy.types.Scene.export_progress
+    del bpy.types.Scene.export_status
 
 if __name__ == "__main__":
-    register()
+    import sys
+    if "--batch-stl-headless" in sys.argv:
+        # Crucial: Register classes first so Blender can deserialize the .blend data
+        # before we read it inside the headless script
+        register()
+        idx = sys.argv.index("--batch-stl-headless")
+        p_index = int(sys.argv[idx + 1])
+        run_headless_export(p_index)
+    else:
+        register()
