@@ -3,6 +3,7 @@ import os
 import json
 import time
 import struct
+import itertools
 import bpy
 import numpy as np
 from bpy_extras.io_utils import ExportHelper, ImportHelper
@@ -64,7 +65,7 @@ def write_fast_binary_stl(filepath, mesh, matrix_world):
         f.write(data.tobytes())
 
     t_write = time.perf_counter()
-    print(f"  │         ├─ STL Write: Triangulate/Format: {t_format-t_start:.4f}s | Disk Write: {t_write-t_format:.4f}s")
+    print(f"  │         │    ├─ STL Write: Triangulate/Format: {t_format-t_start:.4f}s | Disk Write: {t_write-t_format:.4f}s")
 
 
 # --- STATE-HASH & OVERRIDE LOGIC ---
@@ -81,7 +82,7 @@ def is_collection_excluded(context, target_collection):
         return None
 
     result = traverse(context.view_layer.layer_collection)
-    return result if result is not None else True # Treat as excluded if missing from view layer entirely
+    return result if result is not None else True
 
 def get_modifier_socket_identifier(node_group, socket_name):
     if hasattr(node_group, "interface"):
@@ -155,13 +156,95 @@ def get_override_signature(overrides):
         sig.append((target, pg_name, node_name, tuple(inputs_sig)))
     return tuple(sig)
 
-def apply_overrides(overrides, target_objects):
+# --- PERMUTATION ENGINE ---
+
+class MockOverride:
+    def __init__(self, override_target, parent_group_ptr, node_name, inputs):
+        self.override_target = override_target
+        self.parent_group_ptr = parent_group_ptr
+        self.node_name = node_name
+        self.inputs = inputs
+
+def generate_override_combinations(overrides):
+    grouped_inputs = {}
+
+    for ovr in overrides:
+        for inp in ovr.inputs:
+            param_key = (ovr.override_target, ovr.node_name, inp.input_name)
+            if param_key not in grouped_inputs:
+                grouped_inputs[param_key] = []
+            grouped_inputs[param_key].append((ovr, inp))
+
+    pools = []
+    for param_key, pairs in grouped_inputs.items():
+        value_groups = {}
+        for ovr, inp in pairs:
+            val = get_input_value(inp)
+            if val not in value_groups:
+                value_groups[val] = []
+            value_groups[val].append((ovr, inp))
+
+        pools.append(list(value_groups.values()))
+
+    if not pools:
+        return [[]]
+
+    combinations = list(itertools.product(*pools))
+
+    flattened = []
+    for combo in combinations:
+        flat_combo = []
+        for variation in combo:
+            flat_combo.extend(variation)
+        flattened.append(flat_combo)
+
+    return flattened
+
+def reconstruct_overrides_for_combo(combo):
+    grouped = {}
+    for ovr, inp in combo:
+        target_key = (ovr.override_target, ovr.parent_group_ptr, ovr.node_name)
+        if target_key not in grouped:
+            grouped[target_key] = []
+        grouped[target_key].append(inp)
+
+    active_overrides = []
+    for (target, group_ptr, node_name), inputs in grouped.items():
+        active_overrides.append(MockOverride(target, group_ptr, node_name, inputs))
+
+    return active_overrides
+
+def apply_overrides(overrides, target_objects, dry_run=False):
     global_states = []
     mod_states = []
+    trees_to_update = set()
 
     for override in overrides:
-        if override.override_target == 'NODE' and override.parent_group_ptr and override.node_name:
+        if override.override_target == 'NODE' and override.parent_group_ptr:
             parent_tree = override.parent_group_ptr
+
+            # --- Interface Targeting (Sever Mode Default) ---
+            if not override.node_name:
+                for inp in override.inputs:
+                    val = get_input_value(inp)
+                    if val is None: continue
+
+                    for node in parent_tree.nodes:
+                        if node.type == 'GROUP_INPUT':
+                            socket = node.outputs.get(inp.input_name)
+                            if socket:
+                                for link in list(socket.links):
+                                    to_socket = link.to_socket
+                                    from_socket = link.from_socket
+                                    global_states.append(('SOCKET', to_socket, to_socket.default_value, from_socket, parent_tree))
+                                    if not dry_run:
+                                        parent_tree.links.remove(link)
+                                        to_socket.default_value = val
+                if not dry_run: trees_to_update.add(parent_tree)
+                continue
+            # ------------------------------------
+
+            # Standard Internal Node Override
             for n_name in [n.strip() for n in override.node_name.split(',') if n.strip()]:
                 target_node = parent_tree.nodes.get(n_name)
                 if not target_node: continue
@@ -173,48 +256,65 @@ def apply_overrides(overrides, target_objects):
                     link_from = socket.links[0].from_socket if socket.is_linked else None
                     global_states.append(('SOCKET', socket, socket.default_value, link_from, parent_tree))
 
-                    if socket.is_linked: parent_tree.links.remove(socket.links[0])
+                    if not dry_run:
+                        if socket.is_linked: parent_tree.links.remove(socket.links[0])
+                        val = get_input_value(inp)
+                        if val is not None: socket.default_value = val
 
-                    val = get_input_value(inp)
-                    if val is not None: socket.default_value = val
-
-            parent_tree.update_tag()
+            if not dry_run: trees_to_update.add(parent_tree)
 
         elif override.override_target == 'MODIFIER' and override.parent_group_ptr:
-            for obj in target_objects:
-                obj_changed = False
-                for mod in obj.modifiers:
-                    if mod.type == 'NODES' and mod.node_group == override.parent_group_ptr:
-                        for inp in override.inputs:
-                            ident = get_modifier_socket_identifier(mod.node_group, inp.input_name)
-                            if ident:
-                                orig_val, is_set = get_modifier_input(mod, ident)
-                                default_val = get_modifier_socket_default(mod.node_group, inp.input_name)
-                                mod_states.append((mod, ident, is_set, orig_val, default_val))
+            for inp in override.inputs:
+                ident = get_modifier_socket_identifier(override.parent_group_ptr, inp.input_name)
+                if not ident: continue
 
-                                val = get_input_value(inp)
-                                if val is not None:
-                                    set_modifier_input(mod, ident, val)
-                                    obj_changed = True
-                if obj_changed:
-                    obj.update_tag()
+                default_val = get_modifier_socket_default(override.parent_group_ptr, inp.input_name)
+                val = get_input_value(inp)
+                if val is None: continue
+
+                for obj in target_objects:
+                    for mod in obj.modifiers:
+                        if mod.type == 'NODES' and mod.node_group == override.parent_group_ptr:
+                            orig_val, is_set = get_modifier_input(mod, ident)
+                            mod_states.append((mod, ident, is_set, orig_val, default_val))
+                            if not dry_run: set_modifier_input(mod, ident, val)
+
+    if not dry_run:
+        for tree in trees_to_update:
+            tree.update_tag()
+        for obj in target_objects:
+            obj.update_tag()
 
     return global_states, mod_states
 
-def revert_overrides(global_states, mod_states):
+def revert_overrides(global_states, mod_states, target_objects):
     for mod, ident, is_set, orig_val, default_val in mod_states:
-        if is_set and orig_val is not None: set_modifier_input(mod, ident, orig_val)
-        else: unset_modifier_input(mod, ident, default_val)
-        mod.id_data.update_tag()
+        try:
+            if is_set and orig_val is not None: set_modifier_input(mod, ident, orig_val)
+            else: unset_modifier_input(mod, ident, default_val)
+        except ReferenceError: pass
 
+    trees_to_update = set()
     for state in global_states:
         if state[0] == 'SOCKET':
             _, socket, original_val, link_from, parent_tree = state
             try:
                 socket.default_value = original_val
-                if link_from: parent_tree.links.new(link_from, socket)
-                parent_tree.update_tag()
+                if link_from:
+                    # Smart verification to prevent duplicate link errors during master-restoration
+                    already_linked = any(l.from_socket == link_from for l in socket.links)
+                    if not already_linked:
+                        parent_tree.links.new(link_from, socket)
+                trees_to_update.add(parent_tree)
             except Exception: pass
+
+    for tree in trees_to_update:
+        try: tree.update_tag()
+        except ReferenceError: pass
+
+    for obj in target_objects:
+        try: obj.update_tag()
+        except ReferenceError: pass
 
 
 def get_active_preset(scene):
@@ -249,15 +349,26 @@ def on_input_name_update(self, context):
             if ovr: break
 
         if ovr and ovr.parent_group_ptr:
-            if ovr.override_target == 'NODE' and ovr.node_name:
-                node = ovr.parent_group_ptr.nodes.get(ovr.node_name)
-                if node and self.input_name in node.inputs:
-                    s_type = node.inputs[self.input_name].type
-                    if s_type in ['VALUE', 'FLOAT']: self.override_type = 'FLOAT'
-                    elif s_type == 'INT': self.override_type = 'INT'
-                    elif s_type == 'BOOLEAN': self.override_type = 'BOOLEAN'
-                    elif s_type == 'STRING': self.override_type = 'STRING'
-                    elif s_type == 'MENU': self.override_type = 'MENU'
+            if ovr.override_target == 'NODE':
+                if ovr.node_name:
+                    node = ovr.parent_group_ptr.nodes.get(ovr.node_name)
+                    if node and self.input_name in node.inputs:
+                        s_type = node.inputs[self.input_name].type
+                        if s_type in ['VALUE', 'FLOAT']: self.override_type = 'FLOAT'
+                        elif s_type == 'INT': self.override_type = 'INT'
+                        elif s_type == 'BOOLEAN': self.override_type = 'BOOLEAN'
+                        elif s_type == 'STRING': self.override_type = 'STRING'
+                        elif s_type == 'MENU': self.override_type = 'MENU'
+                else:
+                    if hasattr(ovr.parent_group_ptr, "interface"):
+                        item = ovr.parent_group_ptr.interface.items_tree.get(self.input_name)
+                        if item:
+                            s_type = getattr(item, "socket_type", "")
+                            if 'Float' in s_type: self.override_type = 'FLOAT'
+                            elif 'Int' in s_type: self.override_type = 'INT'
+                            elif 'Bool' in s_type: self.override_type = 'BOOLEAN'
+                            elif 'String' in s_type: self.override_type = 'STRING'
+                            elif 'Menu' in s_type: self.override_type = 'MENU'
     except Exception:
         pass
 
@@ -280,6 +391,10 @@ class BatchSTLNodeInput(bpy.types.PropertyGroup):
     value_float: bpy.props.FloatProperty(name="Value", default=0.0, description="Float override value to apply")
     value_string: bpy.props.StringProperty(name="Value", default="", description="String override value to apply")
     value_menu: bpy.props.StringProperty(name="Value", default="", description="Menu or Enum override value to apply")
+
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, description="Append tag to filename for this permutation. If tag is empty, appends the value.")
+    tag: bpy.props.StringProperty(name="Tag", default="", description="Custom string for naming or folder creation")
+    use_dir: bpy.props.BoolProperty(name="Use Dir", default=False, description="Create a sub-directory for this specific input permutation")
 
 class BatchSTLNodeOverride(bpy.types.PropertyGroup):
     override_target: bpy.props.EnumProperty(
@@ -318,7 +433,18 @@ def copy_override_to_dict(o):
         "override_target": o.override_target,
         "parent_group": o.parent_group_ptr.name if o.parent_group_ptr else "",
         "node_name": o.node_name,
-        "inputs": [{"input_name": i.input_name, "override_type": i.override_type, "value_bool": i.value_bool, "value_int": i.value_int, "value_float": i.value_float, "value_string": i.value_string, "value_menu": i.value_menu} for i in o.inputs]
+        "inputs": [{
+            "input_name": i.input_name,
+            "override_type": i.override_type,
+            "value_bool": i.value_bool,
+            "value_int": i.value_int,
+            "value_float": i.value_float,
+            "value_string": i.value_string,
+            "value_menu": i.value_menu,
+            "use_tag": i.use_tag,
+            "tag": i.tag,
+            "use_dir": i.use_dir
+        } for i in o.inputs]
     }
     return o_data
 
@@ -400,6 +526,7 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         row.prop(item, "name", text="", emboss=False, icon='PRESET')
+        row.prop(item, "preset_prefix", text="", emboss=False, icon='FILE_FOLDER')
         op = row.operator("export_scene.batch_stl_multi", text="", icon='EXPORT')
         op.preset_index = index
 
@@ -475,19 +602,20 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
         mapping = get_active_mapping(preset)
         if not preset: return {'CANCELLED'}
         lst = preset.pinned_overrides if self.is_pinned else (mapping.node_overrides if mapping else None)
-        if lst is None and self.action not in {'ADD', 'PASTE'}: return {'CANCELLED'}
+
+        # Prevent crash if user tries to paste local overrides without an active mapping
+        if lst is None: return {'CANCELLED'}
+
         idx = self.override_index
 
-        if self.action == 'ADD' and mapping: mapping.node_overrides.add()
+        if self.action == 'ADD': lst.add()
         elif self.action == 'REMOVE' and 0 <= idx < len(lst): lst.remove(idx)
         elif self.action == 'UP' and idx > 0: lst.move(idx, idx - 1)
         elif self.action == 'DOWN' and 0 <= idx < len(lst) - 1: lst.move(idx, idx + 1)
         elif self.action == 'COPY' and 0 <= idx < len(lst): _clipboard["override"] = copy_override_to_dict(lst[idx])
         elif self.action == 'PASTE' and _clipboard.get("override"):
-            target_lst = preset.pinned_overrides if self.is_pinned else (mapping.node_overrides if mapping else None)
-            if target_lst is not None:
-                paste_override_from_dict(target_lst.add(), _clipboard["override"])
-                if 0 <= idx < len(target_lst): target_lst.move(len(target_lst) - 1, idx + 1)
+            paste_override_from_dict(lst.add(), _clipboard["override"])
+            if 0 <= idx < len(lst): lst.move(len(lst) - 1, idx + 1)
         elif self.action == 'PIN' and not self.is_pinned and 0 <= idx < len(lst):
             paste_override_from_dict(preset.pinned_overrides.add(), copy_override_to_dict(lst[idx]))
             lst.remove(idx)
@@ -522,7 +650,12 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
         elif self.action == 'DOWN' and 0 <= idx < len(lst) - 1: lst.move(idx, idx + 1)
         elif self.action == 'COPY' and 0 <= idx < len(lst):
             i = lst[idx]
-            _clipboard["input"] = {"input_name": i.input_name, "override_type": i.override_type, "value_bool": i.value_bool, "value_int": i.value_int, "value_float": i.value_float, "value_string": i.value_string, "value_menu": i.value_menu}
+            _clipboard["input"] = {
+                "input_name": i.input_name, "override_type": i.override_type,
+                "value_bool": i.value_bool, "value_int": i.value_int, "value_float": i.value_float,
+                "value_string": i.value_string, "value_menu": i.value_menu,
+                "use_tag": i.use_tag, "tag": i.tag, "use_dir": i.use_dir
+            }
         elif self.action == 'PASTE' and _clipboard.get("input"):
             new_i = lst.add()
             for k, v in _clipboard["input"].items(): setattr(new_i, k, v)
@@ -559,52 +692,65 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         if preset.preset_prefix:
             root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
 
-        # =========================================================
-        # PHASE 0: Absolute Depsgraph Isolation
-        # =========================================================
-        print("\n  [Phase 0] Absolute Depsgraph Isolation...")
-        t_phase0_start = time.perf_counter()
-
-        # Combine visible objects AND all mapped objects to guarantee we capture
-        # the states of anything we might touch, even if excluded from view layer.
-        objects_to_mute = set(context.view_layer.objects)
-        for mapping in preset.mappings:
-            if mapping.collection_ptr:
-                objects_to_mute.update(mapping.collection_ptr.all_objects)
-
+        # Core state arrays for the ultimate fail-safe (Strategy 2)
+        master_global_states = []
+        master_mod_states = []
+        master_all_objs = set()
         original_mod_states = {}
-        for obj in objects_to_mute:
-            if hasattr(obj, 'modifiers'):
-                for mod in obj.modifiers:
-                    if mod.type == 'NODES':
-                        original_mod_states[mod] = mod.show_viewport
-                        mod.show_viewport = False
-
-        print(f"    └─ Muted {len(original_mod_states)} modifiers across scene in {time.perf_counter() - t_phase0_start:.4f}s")
-
-        def enable_modifiers(objects):
-            for obj in objects:
-                if hasattr(obj, 'modifiers'):
-                    for mod in obj.modifiers:
-                        if mod.type == 'NODES' and mod in original_mod_states:
-                            mod.show_viewport = original_mod_states[mod]
-
-        def disable_modifiers(objects):
-            for obj in objects:
-                if hasattr(obj, 'modifiers'):
-                    for mod in obj.modifiers:
-                        if mod.type == 'NODES' and mod in original_mod_states:
-                            mod.show_viewport = False
 
         try:
+            # =========================================================
+            # PHASE 0: Absolute Depsgraph Isolation & Snapshot
+            # =========================================================
+            print("\n  [Phase 0] Absolute Depsgraph Isolation & Safety Snapshot...")
+            t_phase0_start = time.perf_counter()
+
+            objects_to_mute = set(context.view_layer.objects)
+            for mapping in preset.mappings:
+                if mapping.collection_ptr:
+                    objects_to_mute.update(mapping.collection_ptr.all_objects)
+
+            for obj in objects_to_mute:
+                if hasattr(obj, 'modifiers'):
+                    for mod in obj.modifiers:
+                        if mod.type == 'NODES':
+                            original_mod_states[mod] = mod.show_viewport
+                            mod.show_viewport = False
+
+            print(f"    ├─ Muted {len(original_mod_states)} modifiers across scene in {time.perf_counter() - t_phase0_start:.4f}s")
+
+            def enable_modifiers(objects):
+                for obj in objects:
+                    if hasattr(obj, 'modifiers'):
+                        for mod in obj.modifiers:
+                            if mod.type == 'NODES' and mod in original_mod_states:
+                                mod.show_viewport = original_mod_states[mod]
+
+            def disable_modifiers(objects):
+                for obj in objects:
+                    if hasattr(obj, 'modifiers'):
+                        for mod in obj.modifiers:
+                            if mod.type == 'NODES' and mod in original_mod_states:
+                                mod.show_viewport = False
+
+            # --- STRATEGY 2: MASTER SAFE SNAPSHOT ---
+            t_snap = time.perf_counter()
+            all_ovrs_in_preset = list(preset.pinned_overrides)
+            for m in preset.mappings:
+                all_ovrs_in_preset.extend(m.node_overrides)
+                if m.collection_ptr:
+                    master_all_objs.update(m.collection_ptr.all_objects)
+
+            # Dry-run records pristine state of everything we might possibly touch
+            master_global_states, master_mod_states = apply_overrides(all_ovrs_in_preset, master_all_objs, dry_run=True)
+            print(f"    └─ Recorded Global Master Snapshot: {time.perf_counter() - t_snap:.4f}s")
+
             # 1. Compile execution batches by identical override signatures
             execution_batches = {}
             sig_pinned = get_override_signature(preset.pinned_overrides)
 
             for mapping in preset.mappings:
                 if not mapping.collection_ptr: continue
-
-                # Check View Layer visibility: Skip excluded collections
                 if is_collection_excluded(context, mapping.collection_ptr):
                     print(f"  ├─ Skipping '{mapping.collection_ptr.name}' (Excluded from View Layer)")
                     continue
@@ -626,44 +772,87 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             for signature, mappings_in_batch in execution_batches.items():
                 t_batch_start = time.perf_counter()
 
+                first_mapping = mappings_in_batch[0]
+                all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
+
+                # Generate Combinations for this execution batch
+                combinations = generate_override_combinations(all_overrides)
+
                 is_clean_batch = len(mappings_in_batch[0].node_overrides) == 0
                 batch_type = "Clean (Pinned Only)" if is_clean_batch else f"Dirty ({len(mappings_in_batch[0].node_overrides)} Local Overrides)"
 
                 collection_names = [f"{m.collection_ptr.name} [{m.tag}]" for m in mappings_in_batch]
-                print(f"  ├─ Batch {batch_counter}/{len(execution_batches)} [{batch_type}]: Processing {len(collection_names)} mapped instances -> {', '.join(collection_names)}")
+                print(f"  ├─ Batch {batch_counter}/{len(execution_batches)} [{batch_type}]: Processing {len(collection_names)} mapped instances with {len(combinations)} permutation(s)")
 
                 batch_objects = set()
                 for m in mappings_in_batch:
                     batch_objects.update(m.collection_ptr.all_objects)
 
-                first_mapping = mappings_in_batch[0]
-                all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
-
                 t_en = time.perf_counter()
                 enable_modifiers(batch_objects)
                 print(f"  │    ├─ Enabled Batch Modifiers: {time.perf_counter() - t_en:.4f}s")
 
-                t_ovr = time.perf_counter()
+                for combo_idx, combo in enumerate(combinations):
+                    print(f"  │    ├─ Permutation {combo_idx + 1}/{len(combinations)}")
+                    combo_suffix = ""
+                    combo_subpath = ""
+                    processed_params = set()
 
-                # Apply Direct Mutation (safely severing links)
-                global_states, mod_states = apply_overrides(all_overrides, batch_objects)
+                    # Resolve tags and sub-paths securely by Logical Parameter identity
+                    for ovr, inp in combo:
+                        param_key = (ovr.override_target, ovr.node_name, inp.input_name)
 
-                # Push the global Depsgraph update for the active view layer
-                context.view_layer.update()
-                depsgraph = context.evaluated_depsgraph_get()
+                        # Only apply the folder/tag string once per synchronized parameter set
+                        if param_key not in processed_params:
+                            val = get_input_value(inp)
+                            val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
 
-                print(f"  │    ├─ Applied & Synced Graph: {time.perf_counter() - t_ovr:.4f}s")
+                            # Prefix/Suffix parse logic
+                            if inp.tag:
+                                if inp.tag.startswith("_"):
+                                    naming_str = val_str + inp.tag
+                                elif inp.tag.endswith("_"):
+                                    naming_str = inp.tag + val_str
+                                else:
+                                    naming_str = inp.tag
+                            else:
+                                naming_str = val_str
 
-                # 3. Export all mappings that share this evaluated state
-                for mapping in mappings_in_batch:
-                    self.export_mapping_fast(context, depsgraph, mapping, root_dir)
+                            if inp.use_tag:
+                                combo_suffix += f"_{naming_str}"
+                            if inp.use_dir:
+                                combo_subpath = os.path.join(combo_subpath, naming_str)
 
-                t_rev = time.perf_counter()
+                            processed_params.add(param_key)
 
-                # Revert mutations, reconnect links, and re-sync
-                revert_overrides(global_states, mod_states)
-                context.view_layer.update()
-                print(f"  │    ├─ Reverted batch overrides: {time.perf_counter() - t_rev:.4f}s")
+                    t_ovr = time.perf_counter()
+
+                    global_states = []
+                    mod_states = []
+
+                    # --- STRATEGY 1: MICRO TRY-FINALLY WRAPPER ---
+                    try:
+                        # Reconstruct the permutation into formal override blocks and apply them
+                        active_overrides = reconstruct_overrides_for_combo(combo)
+                        global_states, mod_states = apply_overrides(active_overrides, batch_objects)
+
+                        # Push the global Depsgraph update for the active view layer
+                        context.view_layer.update()
+                        depsgraph = context.evaluated_depsgraph_get()
+
+                        print(f"  │    │    ├─ Applied & Synced Graph: {time.perf_counter() - t_ovr:.4f}s")
+
+                        # 3. Export all mappings that share this evaluated state
+                        for mapping in mappings_in_batch:
+                            self.export_mapping_fast(context, depsgraph, mapping, root_dir, combo_suffix, combo_subpath)
+
+                    finally:
+                        t_rev = time.perf_counter()
+                        # Revert mutations, reconnect links, and aggressively re-sync target objects
+                        revert_overrides(global_states, mod_states, batch_objects)
+                        context.view_layer.update()
+                        print(f"  │    │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
+                    # ---------------------------------------------
 
                 t_dis = time.perf_counter()
                 disable_modifiers(batch_objects)
@@ -672,13 +861,23 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 print(f"  │    => Batch Total Time: {time.perf_counter() - t_batch_start:.4f}s\n")
                 batch_counter += 1
 
+        except KeyboardInterrupt:
+            # Elegant Console Catch for Ctrl+C
+            print("\n[!] Export cancelled by user (Ctrl+C). Initiating emergency recovery...")
+            self.report({'WARNING'}, "Export cancelled by user. Restoring scene...")
+            return {'CANCELLED'}
+
         finally:
             # =========================================================
-            # PHASE 4: Safe Restoration
+            # PHASE 4: Safe Restoration (Master Safety Net)
             # =========================================================
-            print("\n  [Phase 4] Safe State Restoration...")
+            print("\n  [Phase 4] Master Safe State Restoration...")
             t_ph4_start = time.perf_counter()
 
+            # 1. Restore the Master Snapshot first (Handles catastrophic Ctrl+C interrupts)
+            revert_overrides(master_global_states, master_mod_states, master_all_objs)
+
+            # 2. Unmute modifiers
             for mod, original_state in original_mod_states.items():
                 try:
                     mod.show_viewport = original_state
@@ -695,12 +894,14 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         self.report({'INFO'}, f"Batch Export Complete for {preset.name}. See console for timings.")
         return {"FINISHED"}
 
-    def export_mapping_fast(self, context, depsgraph, mapping, root_dir):
+    def export_mapping_fast(self, context, depsgraph, mapping, root_dir, combo_suffix="", combo_subpath=""):
         t_start = time.perf_counter()
-        out_dir = os.path.normpath(os.path.join(root_dir, mapping.sub_path))
+
+        # Merge mapping sub_path with dynamic combo_subpath
+        out_dir = os.path.normpath(os.path.join(root_dir, mapping.sub_path, combo_subpath))
         os.makedirs(out_dir, exist_ok=True)
 
-        print(f"  │    ├─ Exporting: {mapping.collection_ptr.name}{' ['+mapping.tag+']' if mapping.tag else ''}")
+        print(f"  │    │    ├─ Exporting: {mapping.collection_ptr.name}{' ['+mapping.tag+']' if mapping.tag else ''}")
 
         for obj in mapping.collection_ptr.all_objects:
             if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
@@ -716,8 +917,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 print(f"  │         ├─ Evaluated Mesh [{obj.name}]: {time.perf_counter() - t_eval:.4f}s")
 
                 if mesh:
-                    tag_str = mapping.tag if mapping.use_tag and mapping.tag else ""
-                    filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{tag_str}.stl")
+                    base_tag = mapping.tag if mapping.use_tag and mapping.tag else ""
+                    final_tag = base_tag + combo_suffix
+
+                    filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{final_tag}.stl")
                     write_fast_binary_stl(filepath, mesh, obj.matrix_world)
                     obj_eval.to_mesh_clear()
 
@@ -734,7 +937,9 @@ def draw_inline_controls(layout, operator_id, use_clipboard=False):
         row.operator(operator_id, icon='COPYDOWN', text="").action = 'COPY'
         row.operator(operator_id, icon='PASTEDOWN', text="").action = 'PASTE'
 
-def draw_override_block(layout, ovr, o_idx, is_pinned):
+def draw_override_block(layout, ovr, o_idx, is_pinned, freq_dict=None):
+    if freq_dict is None: freq_dict = {}
+
     ovr_box = layout.box()
     header_box = ovr_box.box()
     row = header_box.row(align=True)
@@ -753,7 +958,17 @@ def draw_override_block(layout, ovr, o_idx, is_pinned):
     for i_idx, inp in enumerate(ovr.inputs):
         irow = inputs_box.row(align=True)
         irow.label(icon='FORWARD')
-        if target_node: irow.prop_search(inp, "input_name", target_node, "inputs", text="")
+
+        # UI Search Fallback logic
+        if ovr.override_target == 'NODE' and ovr.parent_group_ptr:
+            if ovr.node_name:
+                if target_node: irow.prop_search(inp, "input_name", target_node, "inputs", text="")
+                else: irow.prop(inp, "input_name", text="")
+            else:
+                if hasattr(ovr.parent_group_ptr, "interface"):
+                    irow.prop_search(inp, "input_name", ovr.parent_group_ptr.interface, "items_tree", text="")
+                else:
+                    irow.prop_search(inp, "input_name", ovr.parent_group_ptr, "inputs", text="")
         elif ovr.override_target == 'MODIFIER' and ovr.parent_group_ptr:
             if hasattr(ovr.parent_group_ptr, "interface"): irow.prop_search(inp, "input_name", ovr.parent_group_ptr.interface, "items_tree", text="")
             else: irow.prop_search(inp, "input_name", ovr.parent_group_ptr, "inputs", text="")
@@ -766,6 +981,14 @@ def draw_override_block(layout, ovr, o_idx, is_pinned):
         elif inp.override_type == 'MENU': irow.prop(inp, "value_menu", text="")
 
         irow.prop(inp, "override_type", text="")
+
+        # Conditionally display Tag & Dir permutations controls
+        key = (ovr.override_target, ovr.node_name, inp.input_name)
+        if freq_dict.get(key, 0) > 1:
+            irow.prop(inp, "use_tag", text="", icon='BOOKMARKS')
+            irow.prop(inp, "tag", text="")
+            irow.prop(inp, "use_dir", text="", icon='FILE_FOLDER')
+
         for action, icon in [('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'TRASH')]:
             op = irow.operator("batch_stl.input_actions", text="", icon=icon)
             op.action, op.override_index, op.input_index, op.is_pinned = action, o_idx, i_idx, is_pinned
@@ -802,10 +1025,16 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         active_preset = get_active_preset(scene)
         if not active_preset: return
 
-        layout.prop(active_preset, "preset_prefix", icon='FILE_FOLDER')
+        # Metric 1: Preset-level Mapping Combinations
+        total_mappings = len(active_preset.mappings)
+        total_preset_combos = sum(
+            len(generate_override_combinations(list(active_preset.pinned_overrides) + list(m.node_overrides)))
+            for m in active_preset.mappings
+        )
+
         box = layout.box()
         m_header = box.row()
-        m_header.label(text=f"Collections Mapping for: {active_preset.preset_prefix}", icon='OUTLINER_COLLECTION')
+        m_header.label(text=f"Mappings ({total_mappings} items, {total_preset_combos} combos total):", icon='OUTLINER_COLLECTION')
         draw_inline_controls(m_header, "batch_stl.mapping_actions", use_clipboard=True)
         box.template_list("BATCH_STL_UL_items", "", active_preset, "mappings", active_preset, "mapping_index", rows=5)
 
@@ -815,24 +1044,55 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             c_name = active_item.collection_ptr.name if active_item.collection_ptr else "Unassigned"
             if active_item.tag: c_name += f" [{active_item.tag}]"
 
+            # Metric 2: Item-level Overrides Diagnostics
+            all_ovrs = list(active_preset.pinned_overrides) + list(active_item.node_overrides)
+            freq_dict = {}
+            unique_targets = set()
+            total_inputs = 0
+
+            for o in all_ovrs:
+                total_inputs += len(o.inputs)
+                for i in o.inputs:
+                    key = (o.override_target, o.node_name, i.input_name)
+                    freq_dict[key] = freq_dict.get(key, 0) + 1
+                    unique_targets.add(key)
+
+            num_targets = len(unique_targets)
+            num_combos = len(generate_override_combinations(all_ovrs))
+
+            metric_str = f"{c_name}"
+            if num_combos > 1:
+                metric_str += f" | {num_combos} combos"
+            metric_str += f" | {num_targets} targets | {total_inputs} inputs"
+
             header = layout.row()
-            header.label(text=f"Overrides for: {c_name}", icon='MODIFIER')
-            h_actions = header.row(align=True)
-            for action, icon in [('ADD', 'ADD'), ('PASTE', 'PASTEDOWN')]:
-                op = h_actions.operator("batch_stl.override_actions", text="", icon=icon)
-                op.action, op.override_index, op.is_pinned = action, -1, False
+            header.label(text=metric_str, icon='MODIFIER')
 
-            if len(active_preset.pinned_overrides) > 0:
-                layout.separator()
-                pinned_box = layout.box()
-                pinned_box.label(text="Global Pinned Overrides:", icon='PINNED')
-                for o_idx, ovr in enumerate(active_preset.pinned_overrides): draw_override_block(pinned_box, ovr, o_idx, True)
+            layout.separator()
+            pinned_box = layout.box()
+            p_header = pinned_box.row()
+            p_header.label(text="Global Pinned Overrides:", icon='PINNED')
+            p_actions = p_header.row(align=True)
+            op = p_actions.operator("batch_stl.override_actions", text="", icon='ADD')
+            op.action, op.override_index, op.is_pinned = 'ADD', -1, True
+            op = p_actions.operator("batch_stl.override_actions", text="", icon='PASTEDOWN')
+            op.action, op.override_index, op.is_pinned = 'PASTE', -1, True
 
-            if len(active_item.node_overrides) > 0:
-                layout.separator()
-                local_box = layout.box()
-                local_box.label(text="Local Overrides:", icon='UNPINNED')
-                for o_idx, ovr in enumerate(active_item.node_overrides): draw_override_block(local_box, ovr, o_idx, False)
+            for o_idx, ovr in enumerate(active_preset.pinned_overrides):
+                draw_override_block(pinned_box, ovr, o_idx, True, freq_dict)
+
+            layout.separator()
+            local_box = layout.box()
+            l_header = local_box.row()
+            l_header.label(text="Local Overrides:", icon='UNPINNED')
+            l_actions = l_header.row(align=True)
+            op = l_actions.operator("batch_stl.override_actions", text="", icon='ADD')
+            op.action, op.override_index, op.is_pinned = 'ADD', -1, False
+            op = l_actions.operator("batch_stl.override_actions", text="", icon='PASTEDOWN')
+            op.action, op.override_index, op.is_pinned = 'PASTE', -1, False
+
+            for o_idx, ovr in enumerate(active_item.node_overrides):
+                draw_override_block(local_box, ovr, o_idx, False, freq_dict)
 
 
 # --- REGISTRATION ---
