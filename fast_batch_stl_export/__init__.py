@@ -1,15 +1,12 @@
-from math import factorial
 import os
 import json
 import time
-import struct
 import itertools
 import threading
 import queue
 import subprocess
 import tempfile
 import bpy
-import numpy as np
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 # --- SESSION CLIPBOARD ---
@@ -19,58 +16,6 @@ _clipboard = {
     "override": None,
     "input": None
 }
-
-# --- FAST EXPORT FUNCTION ---
-
-def write_fast_binary_stl(filepath, mesh, matrix_world):
-    t_start = time.perf_counter()
-
-    mesh.calc_loop_triangles()
-    num_tris = len(mesh.loop_triangles)
-    if num_tris == 0:
-        return
-
-    verts = np.empty((len(mesh.vertices), 3), dtype=np.float32)
-    mesh.vertices.foreach_get("co", verts.ravel())
-    mat = np.array(matrix_world, dtype=np.float32)
-    verts_vec4 = np.c_[verts, np.ones(len(verts), dtype=np.float32)]
-    verts = np.dot(verts_vec4, mat.T)[:, :3]
-
-    tri_verts = np.empty((num_tris, 3), dtype=np.int32)
-    mesh.loop_triangles.foreach_get("vertices", tri_verts.ravel())
-
-    tri_normals = np.empty((num_tris, 3), dtype=np.float32)
-    mesh.loop_triangles.foreach_get("normal", tri_normals.ravel())
-
-    mat_norm = np.array(matrix_world.to_3x3().inverted_safe().transposed(), dtype=np.float32)
-    tri_normals = np.dot(tri_normals, mat_norm.T)
-    norms = np.linalg.norm(tri_normals, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    tri_normals /= norms
-
-    stl_dtype = np.dtype([
-        ('normals', np.float32, (3,)),
-        ('v0', np.float32, (3,)),
-        ('v1', np.float32, (3,)),
-        ('v2', np.float32, (3,)),
-        ('attr', np.uint16)
-    ])
-    data = np.zeros(num_tris, dtype=stl_dtype)
-    data['normals'] = tri_normals
-    data['v0'] = verts[tri_verts[:, 0]]
-    data['v1'] = verts[tri_verts[:, 1]]
-    data['v2'] = verts[tri_verts[:, 2]]
-
-    t_format = time.perf_counter()
-
-    with open(filepath, 'wb') as f:
-        f.write(b'Batch STL Fast Export' + b'\x00' * 59)
-        f.write(struct.pack('<I', num_tris))
-        f.write(data.tobytes())
-
-    t_write = time.perf_counter()
-    print(f"  │         │    ├─ STL Write: Triangulate/Format: {t_format-t_start:.4f}s | Disk Write: {t_write-t_format:.4f}s")
-
 
 # --- STATE-HASH & OVERRIDE LOGIC ---
 
@@ -373,7 +318,6 @@ def revert_overrides(global_states, mod_states, target_objects):
         try: obj.update_tag()
         except ReferenceError: pass
 
-
 def get_active_preset(scene):
     presets = scene.batch_stl_presets
     index = scene.batch_stl_preset_index
@@ -427,50 +371,65 @@ def on_input_name_update(self, context):
     except Exception: pass
 
 class BatchSTLNodeInput(bpy.types.PropertyGroup):
-    input_name: bpy.props.StringProperty(name="Input", default="", update=on_input_name_update, description="Name of the socket to override")
+    input_name: bpy.props.StringProperty(name="Input", default="", update=on_input_name_update, description="Name of the node group input socket or modifier property to override")
     override_type: bpy.props.EnumProperty(
         name="Type",
-        items=(('BOOLEAN', "Bool", ""), ('INT', "Int", ""), ('FLOAT', "Float", ""), ('STRING', "Str", ""), ('MENU', "Menu", "")),
-        default='BOOLEAN'
+        items=(
+            ('BOOLEAN', "Bool", "Boolean data type"),
+            ('INT', "Int", "Integer data type"),
+            ('FLOAT', "Float", "Floating-point data type"),
+            ('STRING', "Str", "String text data type"),
+            ('MENU', "Menu", "Menu or Enum data type")
+        ),
+        default='BOOLEAN',
+        description="Data type of the override value"
     )
-    value_bool: bpy.props.BoolProperty(name="Value", default=True)
-    value_int: bpy.props.IntProperty(name="Value", default=0)
-    value_float: bpy.props.FloatProperty(name="Value", default=0.0)
-    value_string: bpy.props.StringProperty(name="Value", default="")
-    value_menu: bpy.props.StringProperty(name="Value", default="")
+    value_bool: bpy.props.BoolProperty(name="Value", default=True, description="Boolean override value to apply")
+    value_int: bpy.props.IntProperty(name="Value", default=0, description="Integer override value to apply")
+    value_float: bpy.props.FloatProperty(name="Value", default=0.0, description="Float override value to apply")
+    value_string: bpy.props.StringProperty(name="Value", default="", description="String override value to apply")
+    value_menu: bpy.props.StringProperty(name="Value", default="", description="Menu or Enum override value to apply")
 
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False)
-    tag: bpy.props.StringProperty(name="Tag", default="")
-    use_dir: bpy.props.BoolProperty(name="Use Dir", default=False)
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, description="Append tag to filename for this permutation. If tag is empty, appends the value.")
+    tag: bpy.props.StringProperty(name="Tag", default="", description="Custom string for naming or folder creation")
+    use_dir: bpy.props.BoolProperty(name="Use Dir", default=False, description="Create a sub-directory for this specific input permutation")
 
-    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False)
-    sweep_range: bpy.props.StringProperty(name="Sweep Range", default="")
+    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, description="Enable automatic parameter sweeping across multiple states")
+    sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", description="For Int/Float: 'start step count' (e.g. '1.0 0.5 5') | For String: 'item1, item2'")
 
 class BatchSTLNodeOverride(bpy.types.PropertyGroup):
-    override_target: bpy.props.EnumProperty(items=(('NODE', "Node", ""), ('MODIFIER', "Modifier", "")), default='NODE')
-    parent_group_ptr: bpy.props.PointerProperty(type=bpy.types.NodeTree, name="Group")
-    node_name: bpy.props.StringProperty(name="Node", default="")
-    inputs: bpy.props.CollectionProperty(type=BatchSTLNodeInput)
+    override_target: bpy.props.EnumProperty(
+        name="Target",
+        items=(
+            ('NODE', "Node", "Target an internal node within a Geometry Nodes group"),
+            ('MODIFIER', "Modifier", "Target a socket directly on the Modifier interface")
+        ),
+        default='NODE',
+        description="Target type to override"
+    )
+    parent_group_ptr: bpy.props.PointerProperty(type=bpy.types.NodeTree, name="Group", description="The parent node tree/group containing the target node or modifier interface")
+    node_name: bpy.props.StringProperty(name="Node", default="", description="Exact name of the internal node to override")
+    inputs: bpy.props.CollectionProperty(type=BatchSTLNodeInput, description="List of specific input sockets to override")
 
 class BatchSTLExcludedObject(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty()
+    name: bpy.props.StringProperty(description="Name of the object to exclude from export")
 
 class BatchSTLExportItem(bpy.types.PropertyGroup):
-    collection_ptr: bpy.props.PointerProperty(type=bpy.types.Collection, name="Collection")
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True)
-    tag: bpy.props.StringProperty(name="Tag", default="")
-    sub_path: bpy.props.StringProperty(name="Sub-folder", default="")
-    node_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride)
+    collection_ptr: bpy.props.PointerProperty(type=bpy.types.Collection, name="Collection", description="Target collection containing the objects to be exported")
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, description="Append the specified tag suffix to the exported STL filenames")
+    tag: bpy.props.StringProperty(name="Tag", default="", description="Suffix tag string to append to the filename (e.g., '_v2')")
+    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", description="Sub-directory path where these STLs will be saved, relative to the preset root")
+    node_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride, description="Collection of local overrides applied specifically to this mapped collection")
 
-    use_filter: bpy.props.BoolProperty(name="Filter Objects", default=False)
-    excluded_objects: bpy.props.CollectionProperty(type=BatchSTLExcludedObject)
+    use_filter: bpy.props.BoolProperty(name="Filter Objects", default=False, description="Enable to manually exclude specific objects from this collection during export")
+    excluded_objects: bpy.props.CollectionProperty(type=BatchSTLExcludedObject, description="List of objects to skip during export")
 
 class BatchSTLExportPreset(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Preset Name", default="New Preset")
-    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="")
-    pinned_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride)
-    mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem)
-    mapping_index: bpy.props.IntProperty(default=0)
+    name: bpy.props.StringProperty(name="Preset Name", default="New Preset", description="Name of the batch export preset")
+    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", description="Root folder name for this preset, created inside the global export directory")
+    pinned_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride, description="Global overrides applied to all mapped collections in this preset")
+    mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem, description="List of collections mapped to this preset for batch export")
+    mapping_index: bpy.props.IntProperty(name="Mapping Index", default=0, description="Select the active collection mapping to edit its overrides")
 
 
 # --- JSON UTILS ---
@@ -535,6 +494,7 @@ def paste_preset_from_dict(new_p, data):
 class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
     bl_idname = "batch_stl.export_presets_json"
     bl_label = "Export JSON"
+    bl_description = "Export all current batch export presets to a JSON configuration file"
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
@@ -545,6 +505,7 @@ class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
 class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     bl_idname = "batch_stl.import_presets_json"
     bl_label = "Import JSON"
+    bl_description = "Import batch export presets from a JSON configuration file"
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
@@ -581,6 +542,7 @@ class BATCH_STL_UL_items(bpy.types.UIList):
 class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     bl_idname = "batch_stl.preset_actions"
     bl_label = "Preset Actions"
+    bl_description = "Add, remove, move, or copy export presets. Hold SHIFT with arrows to move to top/bottom."
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
 
@@ -606,6 +568,7 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
 class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
     bl_idname = "batch_stl.mapping_actions"
     bl_label = "Mapping Actions"
+    bl_description = "Add, remove, move, or copy collection mappings. Hold SHIFT with arrows to move to top/bottom."
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
 
@@ -632,6 +595,7 @@ class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
 class BATCH_STL_OT_override_actions(bpy.types.Operator):
     bl_idname = "batch_stl.override_actions"
     bl_label = "Override Actions"
+    bl_description = "Manage node/modifier overrides. Hold SHIFT with arrows to move to top/bottom."
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", ""), ('PIN', "", ""), ('UNPIN', "", "")))
     override_index: bpy.props.IntProperty(default=-1)
     is_pinned: bpy.props.BoolProperty(default=False)
@@ -668,6 +632,7 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
 class BATCH_STL_OT_input_actions(bpy.types.Operator):
     bl_idname = "batch_stl.input_actions"
     bl_label = "Input Actions"
+    bl_description = "Manage data input overrides. Hold SHIFT with ADD to auto-populate all node sockets."
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     override_index: bpy.props.IntProperty(default=-1)
     input_index: bpy.props.IntProperty(default=-1)
@@ -738,6 +703,7 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
 class BATCH_STL_OT_toggle_sweep(bpy.types.Operator):
     bl_idname = "batch_stl.toggle_sweep"
     bl_label = "Toggle Sweep"
+    bl_description = "Enable automatic parameter sweeping. Shift-Click while enabled to expand sweep into individual inputs."
     bl_options = {'UNDO', 'INTERNAL'}
 
     override_index: bpy.props.IntProperty(default=-1)
@@ -781,6 +747,7 @@ class BATCH_STL_OT_toggle_sweep(bpy.types.Operator):
 class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
     bl_idname = "batch_stl.toggle_exclusion"
     bl_label = "Toggle Object Exclusion"
+    bl_description = "Toggle this object's inclusion in the batch export"
     bl_options = {'UNDO', 'INTERNAL'}
     object_name: bpy.props.StringProperty()
 
@@ -799,6 +766,7 @@ class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
 class BATCH_STL_OT_cancel_export(bpy.types.Operator):
     bl_idname = "batch_stl.cancel_export"
     bl_label = "Cancel Export"
+    bl_description = "Abort the current batch export process"
 
     def execute(self, context):
         context.scene.cancel_export = True
@@ -810,11 +778,13 @@ class BATCH_STL_OT_cancel_export(bpy.types.Operator):
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
     bl_label = "Export"
+    bl_description = "Launch a headless background instance to safely evaluate and batch export the mapped collections"
     bl_options = {"REGISTER"}
     preset_index: bpy.props.IntProperty(default=-1)
 
     _timer = None
     process = None
+    total_combos = 1
 
     @classmethod
     def poll(cls, context):
@@ -836,8 +806,8 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         self.temp_dir = tempfile.mkdtemp(prefix="fast_batch_stl_")
         self.temp_blend = os.path.join(self.temp_dir, "batch_stl_export_temp.blend")
 
-        # Save a protective copy of the entire current scene state
-        bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True)
+        # Save an uncompressed copy for hyper-fast background handoff
+        bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True, compress=False)
 
         # 2. Spawn Headless Subprocess
         cmd = [
@@ -851,7 +821,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         except Exception as e:
             self.report({'ERROR'}, f"Failed to spawn headless Blender: {e}")
-            self.cleanup()
+            self.cleanup(context)
             return {'CANCELLED'}
 
         # 3. Non-blocking stdout queue
@@ -891,12 +861,14 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 except queue.Empty: break
                 else:
                     line = line.strip()
-                    if line.startswith("BATCH_STL_PROGRESS:"):
+                    if line.startswith("BATCH_STL_TOTAL:"):
+                        try: self.total_combos = int(line.split(":")[1])
+                        except Exception: pass
+                    elif line.startswith("BATCH_STL_PROGRESS:"):
                         try:
-                            parts = line.split(":")[1].split("/")
-                            cur, tot = int(parts[0]), int(parts[1])
-                            context.scene.export_progress = cur / max(1, tot)
-                            context.scene.export_status = f"Exporting: Permutation {cur} / {tot} (Press ESC to Cancel)"
+                            cur = int(line.split(":")[1])
+                            context.scene.export_progress = cur / max(1, self.total_combos)
+                            context.scene.export_status = f"Exporting: Permutation {cur} / {self.total_combos} (Press ESC to Cancel)"
                         except Exception: pass
                     elif line:
                         # Stream headless logs seamlessly into the main console
@@ -924,145 +896,6 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             os.rmdir(self.temp_dir)
         except Exception as e:
             print(f"Cleanup Error: {e}")
-
-
-# --- HEADLESS EXPORT EXECUTION ROUTINE ---
-
-def run_headless_export(preset_index):
-    import sys
-
-    scene = bpy.context.scene
-    if preset_index < 0 or preset_index >= len(scene.batch_stl_presets):
-        print("ERROR: Invalid preset index")
-        sys.exit(1)
-
-    preset = scene.batch_stl_presets[preset_index]
-    root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
-    if preset.preset_prefix:
-        root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
-
-    print(f"\n=== HEADLESS EXPORT INITIATED: {preset.name} ===")
-
-    objects_to_mute = set(bpy.context.view_layer.objects)
-    for mapping in preset.mappings:
-        if mapping.collection_ptr:
-            objects_to_mute.update(mapping.collection_ptr.all_objects)
-
-    original_mod_states = {}
-    for obj in objects_to_mute:
-        if hasattr(obj, 'modifiers'):
-            for mod in obj.modifiers:
-                if mod.type == 'NODES':
-                    original_mod_states[mod] = mod.show_viewport
-                    mod.show_viewport = False
-
-    def enable_modifiers(objects):
-        for obj in objects:
-            for mod in getattr(obj, 'modifiers', []):
-                if mod.type == 'NODES' and mod in original_mod_states:
-                    mod.show_viewport = original_mod_states[mod]
-
-    def disable_modifiers(objects):
-        for obj in objects:
-            for mod in getattr(obj, 'modifiers', []):
-                if mod.type == 'NODES' and mod in original_mod_states:
-                    mod.show_viewport = False
-
-    execution_batches = {}
-    sig_pinned = get_override_signature(preset.pinned_overrides)
-
-    for mapping in preset.mappings:
-        if not mapping.collection_ptr: continue
-        if is_collection_excluded(bpy.context, mapping.collection_ptr): continue
-
-        sig_local = get_override_signature(mapping.node_overrides)
-        full_sig = sig_pinned + sig_local
-
-        if full_sig not in execution_batches: execution_batches[full_sig] = []
-        execution_batches[full_sig].append(mapping)
-
-    total_combos = 0
-    for signature, mappings_in_batch in execution_batches.items():
-        first_mapping = mappings_in_batch[0]
-        all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
-        combinations = generate_override_combinations(all_overrides)
-        total_combos += len(combinations)
-
-    current_combo_step = 0
-
-    for signature, mappings_in_batch in execution_batches.items():
-        first_mapping = mappings_in_batch[0]
-        all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
-        combinations = generate_override_combinations(all_overrides)
-
-        batch_objects = set()
-        for m in mappings_in_batch: batch_objects.update(m.collection_ptr.all_objects)
-
-        enable_modifiers(batch_objects)
-
-        for combo in combinations:
-            combo_suffix = ""
-            combo_subpath = ""
-            processed_params = set()
-
-            for ovr, inp in combo:
-                param_key = (ovr.override_target, ovr.node_name, inp.input_name)
-                if param_key not in processed_params:
-                    val = get_input_value(inp)
-                    val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
-
-                    if inp.tag:
-                        if inp.tag.startswith("_"): naming_str = val_str + inp.tag
-                        elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
-                        else: naming_str = inp.tag
-                    else: naming_str = val_str
-
-                    if inp.use_tag: combo_suffix += f"_{naming_str}"
-                    if inp.use_dir: combo_subpath = os.path.join(combo_subpath, naming_str)
-                    processed_params.add(param_key)
-
-            global_states = []
-            mod_states = []
-
-            try:
-                active_overrides = reconstruct_overrides_for_combo(combo)
-                global_states, mod_states = apply_overrides(active_overrides, batch_objects)
-
-                bpy.context.view_layer.update()
-                depsgraph = bpy.context.evaluated_depsgraph_get()
-
-                for mapping in mappings_in_batch:
-                    out_dir = os.path.normpath(os.path.join(root_dir, mapping.sub_path, combo_subpath))
-                    os.makedirs(out_dir, exist_ok=True)
-
-                    excluded_names = {e.name for e in mapping.excluded_objects} if mapping.use_filter else set()
-
-                    for obj in mapping.collection_ptr.all_objects:
-                        if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
-                            if obj.name in excluded_names: continue
-
-                            obj_eval = obj.evaluated_get(depsgraph)
-                            try: mesh = obj_eval.to_mesh()
-                            except RuntimeError: mesh = None
-
-                            if mesh:
-                                base_tag = mapping.tag if mapping.use_tag and mapping.tag else ""
-                                final_tag = base_tag + combo_suffix
-                                filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{final_tag}.stl")
-                                write_fast_binary_stl(filepath, mesh, obj.matrix_world)
-                                obj_eval.to_mesh_clear()
-            finally:
-                # Essential to revert so cross-polluted states are flushed for the next combination
-                revert_overrides(global_states, mod_states, batch_objects)
-                bpy.context.view_layer.update()
-
-            current_combo_step += 1
-            print(f"BATCH_STL_PROGRESS:{current_combo_step}/{total_combos}", flush=True)
-
-        disable_modifiers(batch_objects)
-
-    print("=== HEADLESS EXPORT FINISHED ===")
-    sys.exit(0)
 
 
 # --- UI PANELS ---
@@ -1277,9 +1110,9 @@ classes = (
 def register():
     for cls in classes: bpy.utils.register_class(cls)
 
-    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH")
-    bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
-    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0)
+    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH", description="Master directory path on disk where all batch STL exports will be saved")
+    bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset, description="List of all batch export presets")
+    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0, description="Select the active batch export preset to edit")
 
     bpy.types.Scene.is_exporting = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.cancel_export = bpy.props.BoolProperty(default=False)
@@ -1287,20 +1120,243 @@ def register():
     bpy.types.Scene.export_status = bpy.props.StringProperty(default="")
 
 def unregister():
-    for cls in reversed(classes): bpy.utils.unregister_class(cls)
-    del bpy.types.Scene.batch_stl_root_dir
-    del bpy.types.Scene.batch_stl_presets
-    del bpy.types.Scene.batch_stl_preset_index
-    del bpy.types.Scene.is_exporting
-    del bpy.types.Scene.cancel_export
-    del bpy.types.Scene.export_progress
-    del bpy.types.Scene.export_status
+    # Safely unregister classes, ignoring those already cleared by Blender's shutdown
+    for cls in reversed(classes):
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
+
+    # Safely delete scene properties if they still exist
+    properties_to_remove = [
+        "batch_stl_root_dir",
+        "batch_stl_presets",
+        "batch_stl_preset_index",
+        "is_exporting",
+        "cancel_export",
+        "export_progress",
+        "export_status"
+    ]
+
+    for prop in properties_to_remove:
+        if hasattr(bpy.types.Scene, prop):
+            delattr(bpy.types.Scene, prop)
+
+# =========================================================================================
+# --- HEADLESS EXPORT EXECUTION ROUTINE ---
+# =========================================================================================
+
+def run_headless_export(preset_index):
+    import sys
+    import struct
+    import numpy as np
+
+    # Internal definition of the writer avoids loading numpy/struct in the UI thread
+    def write_fast_binary_stl(filepath, mesh, matrix_world):
+        t_start = time.perf_counter()
+
+        mesh.calc_loop_triangles()
+        num_tris = len(mesh.loop_triangles)
+        if num_tris == 0: return
+
+        verts = np.empty((len(mesh.vertices), 3), dtype=np.float32)
+        mesh.vertices.foreach_get("co", verts.ravel())
+        mat = np.array(matrix_world, dtype=np.float32)
+        verts_vec4 = np.c_[verts, np.ones(len(verts), dtype=np.float32)]
+        verts = np.dot(verts_vec4, mat.T)[:, :3]
+
+        tri_verts = np.empty((num_tris, 3), dtype=np.int32)
+        mesh.loop_triangles.foreach_get("vertices", tri_verts.ravel())
+
+        tri_normals = np.empty((num_tris, 3), dtype=np.float32)
+        mesh.loop_triangles.foreach_get("normal", tri_normals.ravel())
+
+        mat_norm = np.array(matrix_world.to_3x3().inverted_safe().transposed(), dtype=np.float32)
+        tri_normals = np.dot(tri_normals, mat_norm.T)
+        norms = np.linalg.norm(tri_normals, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        tri_normals /= norms
+
+        stl_dtype = np.dtype([
+            ('normals', np.float32, (3,)), ('v0', np.float32, (3,)),
+            ('v1', np.float32, (3,)), ('v2', np.float32, (3,)),
+            ('attr', np.uint16)
+        ])
+        data = np.zeros(num_tris, dtype=stl_dtype)
+        data['normals'] = tri_normals
+        data['v0'] = verts[tri_verts[:, 0]]
+        data['v1'] = verts[tri_verts[:, 1]]
+        data['v2'] = verts[tri_verts[:, 2]]
+
+        t_format = time.perf_counter()
+        with open(filepath, 'wb') as f:
+            f.write(b'Batch STL Fast Export' + b'\x00' * 59)
+            f.write(struct.pack('<I', num_tris))
+            f.write(data.tobytes())
+
+        t_write = time.perf_counter()
+        print(f"  │         │    ├─ STL Write: Triangulate/Format: {t_format-t_start:.4f}s | Disk Write: {t_write-t_format:.4f}s")
+
+
+    total_time_start = time.perf_counter()
+    scene = bpy.context.scene
+
+    if preset_index < 0 or preset_index >= len(scene.batch_stl_presets):
+        print("ERROR: Invalid preset index")
+        sys.exit(1)
+
+    preset = scene.batch_stl_presets[preset_index]
+    root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
+    if preset.preset_prefix:
+        root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
+
+    print(f"\n=== STARTING HEADLESS ISOLATED EXPORT: {preset.name} ===")
+    print("\n  [Phase 0] Aggressive Global Depsgraph Culling...")
+    t_phase0_start = time.perf_counter()
+
+    # Identify all potentially active objects across the entire preset
+    active_export_objects = set()
+    for mapping in preset.mappings:
+        if mapping.collection_ptr and not is_collection_excluded(bpy.context, mapping.collection_ptr):
+            active_export_objects.update(mapping.collection_ptr.all_objects)
+
+    # Permanently mute modifiers on any object not involved in this export run
+    muted_count = 0
+    for obj in bpy.context.view_layer.objects:
+        if obj not in active_export_objects:
+            for mod in getattr(obj, 'modifiers', []):
+                if mod.type == 'NODES' and mod.show_viewport:
+                    mod.show_viewport = False
+                    muted_count += 1
+
+    print(f"    ├─ Permanently Muted {muted_count} unused GN modifiers to accelerate Graph evaluation in {time.perf_counter() - t_phase0_start:.4f}s")
+
+    execution_batches = {}
+    sig_pinned = get_override_signature(preset.pinned_overrides)
+
+    for mapping in preset.mappings:
+        if not mapping.collection_ptr: continue
+        if is_collection_excluded(bpy.context, mapping.collection_ptr):
+            print(f"  ├─ Skipping '{mapping.collection_ptr.name}' (Excluded from View Layer)")
+            continue
+
+        sig_local = get_override_signature(mapping.node_overrides)
+        full_sig = sig_pinned + sig_local
+
+        if full_sig not in execution_batches: execution_batches[full_sig] = []
+        execution_batches[full_sig].append(mapping)
+
+    if not execution_batches:
+        print("  └─ No active collections to export.")
+        sys.exit(0)
+
+    # Pre-calculate totals for UI IPC updates
+    total_combos = sum(len(generate_override_combinations(list(preset.pinned_overrides) + list(batch[0].node_overrides))) for batch in execution_batches.values())
+    print(f"BATCH_STL_TOTAL:{total_combos}", flush=True)
+
+    current_combo_step = 0
+    batch_counter = 1
+
+    for signature, mappings_in_batch in execution_batches.items():
+        t_batch_start = time.perf_counter()
+        first_mapping = mappings_in_batch[0]
+        all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
+        combinations = generate_override_combinations(all_overrides)
+
+        is_clean_batch = len(first_mapping.node_overrides) == 0
+        batch_type = "Clean (Pinned Only)" if is_clean_batch else f"Dirty ({len(first_mapping.node_overrides)} Local Overrides)"
+        collection_names = [f"{m.collection_ptr.name} [{m.tag}]" for m in mappings_in_batch]
+
+        print(f"  ├─ Batch {batch_counter}/{len(execution_batches)} [{batch_type}]: Processing {len(collection_names)} mapped instances with {len(combinations)} permutation(s)")
+
+        batch_objects = set()
+        for m in mappings_in_batch: batch_objects.update(m.collection_ptr.all_objects)
+
+        for combo_idx, combo in enumerate(combinations):
+            print(f"  │    ├─ Permutation {combo_idx + 1}/{len(combinations)}")
+            combo_suffix = ""
+            combo_subpath = ""
+            processed_params = set()
+
+            for ovr, inp in combo:
+                param_key = (ovr.override_target, ovr.node_name, inp.input_name)
+                if param_key not in processed_params:
+                    val = get_input_value(inp)
+                    val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
+
+                    if inp.tag:
+                        if inp.tag.startswith("_"): naming_str = val_str + inp.tag
+                        elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
+                        else: naming_str = inp.tag
+                    else: naming_str = val_str
+
+                    if inp.use_tag: combo_suffix += f"_{naming_str}"
+                    if inp.use_dir: combo_subpath = os.path.join(combo_subpath, naming_str)
+                    processed_params.add(param_key)
+
+            t_ovr = time.perf_counter()
+            global_states = []
+            mod_states = []
+
+            try:
+                active_overrides = reconstruct_overrides_for_combo(combo)
+                global_states, mod_states = apply_overrides(active_overrides, batch_objects)
+
+                bpy.context.view_layer.update()
+                depsgraph = bpy.context.evaluated_depsgraph_get()
+
+                print(f"  │    │    ├─ Applied & Synced Graph: {time.perf_counter() - t_ovr:.4f}s")
+
+                for mapping in mappings_in_batch:
+                    out_dir = os.path.normpath(os.path.join(root_dir, mapping.sub_path, combo_subpath))
+                    os.makedirs(out_dir, exist_ok=True)
+
+                    print(f"  │    │    ├─ Exporting: {mapping.collection_ptr.name}{' ['+mapping.tag+']' if mapping.tag else ''}")
+
+                    excluded_names = {e.name for e in mapping.excluded_objects} if mapping.use_filter else set()
+
+                    for obj in mapping.collection_ptr.all_objects:
+                        if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+                            if obj.name in excluded_names: continue
+
+                            t_eval = time.perf_counter()
+                            obj_eval = obj.evaluated_get(depsgraph)
+                            try: mesh = obj_eval.to_mesh()
+                            except RuntimeError: mesh = None
+
+                            print(f"  │         ├─ Evaluated Mesh [{obj.name}]: {time.perf_counter() - t_eval:.4f}s")
+
+                            if mesh:
+                                base_tag = mapping.tag if mapping.use_tag and mapping.tag else ""
+                                final_tag = base_tag + combo_suffix
+                                filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{final_tag}.stl")
+                                write_fast_binary_stl(filepath, mesh, obj.matrix_world)
+                                obj_eval.to_mesh_clear()
+            finally:
+                t_rev = time.perf_counter()
+                revert_overrides(global_states, mod_states, batch_objects)
+                bpy.context.view_layer.update()
+                print(f"  │    │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
+
+            # Crucial garbage collection for headless loop
+            t_purge = time.perf_counter()
+            bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+            print(f"  │    │    ├─ RAM Purge: {time.perf_counter() - t_purge:.4f}s")
+
+            current_combo_step += 1
+            print(f"BATCH_STL_PROGRESS:{current_combo_step}", flush=True)
+
+        print(f"  │    => Batch Total Time: {time.perf_counter() - t_batch_start:.4f}s\n")
+        batch_counter += 1
+
+    print(f"\n=== HEADLESS EXPORT COMPLETE: {time.perf_counter() - total_time_start:.4f}s Total ===\n")
+    sys.exit(0)
+
 
 if __name__ == "__main__":
     import sys
     if "--batch-stl-headless" in sys.argv:
-        # Crucial: Register classes first so Blender can deserialize the .blend data
-        # before we read it inside the headless script
+        # We must register the classes so Blender can deserialize our saved temp properties
         register()
         idx = sys.argv.index("--batch-stl-headless")
         p_index = int(sys.argv[idx + 1])

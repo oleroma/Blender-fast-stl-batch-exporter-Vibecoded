@@ -1,8 +1,8 @@
 # Fast Batch STL Exporter
 
-> **DISCLAIMER:** This is a "vibecoded" extension created with assistance from AI. Always save and back up your project `.blend` files before running large batch exports. While engineered with extensive safety nets and non-destructive state restoration, caution is always recommended when running automated scene-mutating scripts.
+> **DISCLAIMER:** This is a "vibecoded" extension created with assistance from AI. Always save and back up your project `.blend` files before running large batch exports. While engineered with extensive safety nets—including headless background execution—caution is always recommended when running automated scene-mutating scripts.
 
-**Fast Batch STL Exporter** is a high-performance batch export pipeline and parametric permutation engine for Blender. Built around a custom vectorized NumPy binary STL generator and non-destructive Depsgraph isolation, it allows you to export entire scene collections, sweep across multi-dimensional geometry parameter spaces, and organize complex manufacturing variants with a single click.
+**Fast Batch STL Exporter** is a high-performance batch export pipeline and parametric permutation engine for Blender. Built around a custom vectorized NumPy binary STL generator and completely isolated headless background processing, it allows you to export entire scene collections, automatically sweep across multi-dimensional geometry parameter spaces, and filter specific objects with a single click.
 
 ---
 
@@ -14,7 +14,7 @@
 
 ### 2. Presets & Hierarchical Directory Architecture
 * **Global Root Directory:** Set a master output folder in the 3D Viewport header (e.g., `//exports/` or an absolute drive path).
-* **Preset Folders:** Each preset row in the UI list contains a dedicated folder field (`preset_prefix`) to establish parent directories inside the root path.
+* **Preset Folders:** Each preset row in the UI list contains a dedicated folder field (`preset_prefix`). This creates a parent directory inside the root path.
 * **Collection Sub-Folders:** Each collection mapping can define an optional `sub_path` relative to the preset folder.
 * **Automatic Creation:** Folders are created automatically on export if they do not exist. Leaving a folder field blank exports directly to the parent folder without nesting.
 
@@ -22,63 +22,56 @@
 * **Base Tagging:** Assign custom tags to individual mapped collections (e.g., `_v1`, `_highres`).
 * **Tag Toggle (`BOOKMARKS`):** When enabled, the collection tag is appended directly to the end of every exported object's filename. When disabled, the tag remains visible in the UI as a clean custom label without altering filenames.
 
-### 4. Collection Object Exclusion Filter
-* **Granular Object Selection (`FILTER`):** Click the funnel filter icon on any mapped collection row to expose the dedicated **Exclude Objects** panel.
-* **Non-Destructive Mesh Toggles:** Displays an interactive checklist of every exportable mesh, curve, surface, font, and metaball inside the collection. Toggle items off to skip them during batch evaluation without hiding or unlinking them in your scene outline.
-* **Preset Persistence:** Excluded object lists are automatically serialized and restored when using JSON presets.
-
-### 5. Geometry Node & Modifier Overrides
-Overrides let you define temporary parameter states strictly during export—such as adjusting wall thickness, increasing subdivision steps, or toggling structural features—and automatically restore original scene settings once finished.
-
+### 4. Geometry Node & Modifier Overrides
+Define temporary parameter states strictly during export—such as bumping voxel density, increasing subdivision steps, or toggling structural reinforcements.
+* **Smart Data Types:** The UI automatically infers the correct data type (Float, Int, Boolean, String, Menu) by scanning your node tree. No manual type selection is required.
 * **Pinned Overrides (Global):** Applied across all collection mappings within the preset.
 * **Local Overrides:** Dedicated specifically to a single mapped collection.
-* **Internal Node Target:** Target internal nodes within a Geometry Nodes group by name to inject socket values directly.
-* **Modifier Target:** Target exposed sockets on modifier interfaces.
-* **Automatic Type Detection:** Selecting a socket automatically resolves its type (`Float`, `Int`, `Boolean`, `String`, or `Menu`), eliminating clutter by removing manual type dropdowns from the UI.
-* **Direct Copy/Paste:** Dedicated clipboard actions inside both Global Pinned and Local Override headers allow duplicating configurations across presets.
+* **Internal Node Target:** Specify both the parent Node Group and the exact internal Node Name to inject values directly into an internal socket (severing internal links temporarily).
+* **Modifier Target:** Target an exposed socket on a specific modifier interface.
 
-### 6. Node Group Interface Fallback & Instant Link Severing
-When overriding a Node Group, you can **leave the internal Node field blank**:
-* **Interface Socket Search:** The input name field searches exposed sockets on the Node Group's interface.
-* **Group Input Severing:** Instead of running slow Python loops over dozens of individual object modifiers, the exporter locates the `Group Input` node inside the parent tree and unhooks downstream wires. It directly injects override values and reconnects the original wires immediately after export for an ultra-fast O(1) global update.
+### 5. Node Group Interface Fallback & Instant Link Severing
+When overriding a Node Group, you can **leave the internal Node field blank**. The extension will adapt automatically:
+* **Interface Socket Search:** The input name field will search the exposed sockets on the Node Group's Interface rather than an internal node.
+* **Group Input Severing:** The exporter locates the `Group Input` node inside the parent tree and unhooks the downstream wires. It directly injects your override values into the connected nodes, producing an ultra-fast global update across all objects sharing the node group.
 
-### 7. Automated Parameter Sweeping Engine
-Instead of manually creating duplicate input rows to define variations, you can enable the **Sweep Engine** (`FILE_REFRESH`) on any input line:
-* **Floats & Integers:** Uses a compact 3-value syntax in a single text field: `start step count`. For example, `10.0 2.5 4` automatically sweeps across `10.0`, `12.5`, `15.0`, and `17.5`.
-* **Strings:** Accepts comma-separated values (e.g., `matte, gloss, textured`).
-* **Booleans:** Automatically toggles and evaluates both `True` and `False` states.
-* **Menus / Enums:** Automatically crawls the Geometry Node graph to locate connected `Menu Switch` nodes or node enum items, sweeping across every available menu entry without manual entry.
-* **Shift-Click Expansion (Unpack Sweep):** Holding `Shift` while clicking an enabled Sweep button unpacks and converts the evaluated sweep range into individual, fully editable input rows.
+### 6. Automated Parametric Sweeps & Permutations
+Turn your geometry into an automated variant generator. Enable the **Sweep Button (`FILE_REFRESH`)** on any input row to automatically iterate through multiple values.
+* **Floats & Integers:** Enter a range using the syntax `start step count` (e.g., `1.2 0.5 5` will evaluate 1.2, 1.7, 2.2, 2.7, 3.2).
+* **Strings:** Enter a comma-separated list to iterate through text items (e.g., `Left, Right, Center`).
+* **Booleans:** Automatically generates two permutations (`True` and `False`).
+* **Menus:** Automatically extracts and iterates through every available item identifier in the targeted `Menu Switch` node.
+* **Cross-Node Synchronization:** Sweeps calculate the Cartesian product across all defined inputs. If Input A sweeps 3 values and Input B sweeps 2, the exporter automatically evaluates all 6 unique combinations.
 
-### 8. Combinatorial Permutations & Suffix Formatting
-When multiple variations exist (either via the Sweep engine or duplicate socket targets), the combinatorial engine computes the Cartesian product across all parameters.
-* **Cross-Node Synchronization:** Identical input targets across different nodes pool matching values together to prevent redundant combinations.
-* **Permutation Controls (`BOOKMARKS` & `FILE_FOLDER`):**
-  * **Tag Button (`BOOKMARKS`):** Appends the variant label as a suffix to the STL filename.
-  * **Directory Button (`FILE_FOLDER`):** Creates an organized sub-folder for that variant.
+### 7. Permutation Suffix & Sub-Directory Formatting
+When a sweep (or multiple identical inputs) is active, extra formatting controls appear dynamically on that input row:
+* **Tag Button (`BOOKMARKS`):** Appends the variant label as a suffix to the STL filename.
+* **Directory Button (`FILE_FOLDER`):** Creates an organized sub-folder for that variant and places the STLs inside it.
 * **Smart Underscore (`_`) Formatting Rules:**
-  * **No Underscore (`tag`):** Replaces the numerical value entirely (e.g., `tag` -> `_tag`).
-  * **Trailing Underscore (`tag_`):** Prepends the tag to the value (e.g., `size_` with `15` -> `_size_15`).
-  * **Leading Underscore (`_tag`):** Appends the tag to the value (e.g., `_mm` with `15` -> `_15_mm`).
-  * **Blank Tag Field:** Defaults to the literal value of the socket (e.g., `15` -> `_15`).
+  * **No Underscore (`tag`):** Replaces the numerical value entirely.
+  * **Trailing Underscore (`tag_`):** Prepends the tag to the value (e.g., `size_` with value `15` -> `_size_15`).
+  * **Leading Underscore (`_tag`):** Appends the tag to the value (e.g., `_mm` with value `15` -> `_15_mm`).
+  * **Blank Tag Field:** Defaults to the literal value of the socket.
 
-### 9. Power-User Shortcuts (Shift Modifiers)
-Accelerate workflow setup with integrated keyboard modifiers:
-* **Shift + Reorder Arrows (`TRIA_UP` / `TRIA_DOWN`):** Instantly moves the selected item directly to the very top or bottom of the list across Presets, Mappings, Overrides, and Inputs.
-* **Shift + Add Input (`PLUS`):** Automatically scans the target node (or the group interface) and populates an input row for every available socket with its detected data type.
-* **Shift + Sweep Toggle (`FILE_REFRESH`):** Unpacks an automated sweep range into discrete, individual input rows.
+### 8. Object Exclusion Filtering
+Don't want to export everything in a collection? 
+* Enable the **Filter Button (`FILTER`)** on any mapping row to reveal an "Exclude Objects" checklist.
+* The box lists all valid geometry objects inside the collection. Click any object to toggle its exclusion. Excluded objects are skipped entirely during the batch export, and these settings are saved safely to your preset data.
 
-### 10. Live UI Diagnostics & Metrics
-* **Mappings Header:** Displays total mapped collections alongside total combined export permutations across the entire preset (e.g., `Mappings (3 items, 18 combos):`).
-* **Overrides Header:** Displays a compact, real-time diagnostic line showing active permutation states, targets, and input counts (e.g., `Collection_A [v1] | 6 combos | 2 targets | 5 inputs`).
+### 9. Headless Background Export & Absolute Safety
+The export process has been entirely decoupled from the main Blender UI thread for maximum stability and performance.
+* **Instant Uncompressed Temp Dump:** Upon clicking Export, the extension saves an uncompressed throwaway copy of your `.blend` file (taking milliseconds) and hands it off to a completely invisible, headless background Blender process.
+* **Aggressive Scene Culling & RAM Purging:** The headless instance ruthlessly deletes all unused objects and permanently mutes unused modifiers before evaluating geometry, resulting in incredibly fast Depsgraph updates. It also aggressively purges orphan mesh data (`orphans_purge`) after every permutation to prevent memory bloat.
+* **Live UI Updates:** The main Blender UI locks safely to prevent accidental edits, while a live progress slider tracks the background task in real-time.
+* **Emergency Kill Switch:** Press `ESC` or click the **Cancel Export** button at any time to instantly terminate the background process and clean up temporary files. Your active Blender file remains 100% untouched.
 
-### 11. Bulletproof Recovery & Console Interrupt Handling
-* **Micro-Wrapped Execution:** Every permutation evaluation is wrapped in an isolated `try...finally` block. Geometry generation errors or file write failures immediately revert modified nodes before proceeding.
-* **Master Snapshot Engine:** Captures a read-only snapshot of all scene modifier states, sockets, and original wire connections prior to execution.
-* **Keyboard Interrupt Catch (`Ctrl+C`):** Cancelling an ongoing export in the terminal triggers graceful recovery, suppressing tracebacks and restoring all scene objects and node trees to their pristine state.
+### 10. Advanced UI Power Shortcuts (Shift-Modifiers)
+* **Expand Sweeps:** Hold `Shift` while clicking an active Sweep toggle to disable the sweep and instantly expand the calculated values into explicit, individual input rows.
+* **Auto-Populate Sockets:** Hold `Shift` while clicking the ADD (`+`) button on an input block to automatically scan the target node (or group interface) and generate an input row for *every* available socket.
+* **Instant Reordering:** Hold `Shift` while clicking the `UP` or `DOWN` arrows on any preset, mapping, override, or input to instantly move it to the absolute top or bottom of the list.
 
-### 12. JSON Preset Portability
-Save your entire export configuration to an external JSON file. Presets, collection bindings, exclusions, overrides, and automated sweep definitions can be exported or imported with one click.
+### 11. JSON Preset Portability
+Save your entire export setup to an external JSON configuration file. Presets, collection bindings, exclusions, pinned configurations, and permutation sweep rules can be exported or imported with one click, allowing setups to be shared across blend files or team members.
 
 ---
 
@@ -88,24 +81,18 @@ Save your entire export configuration to an external JSON file. Presets, collect
 1. Set the **Root Export Dir** in the 3D Viewport panel (`N-Panel -> Export`).
 2. Click `+` on the **Presets** list to create a preset, and name its folder prefix.
 3. Click `+` on the **Collections Mapping** list and pick the collection containing your target meshes.
-4. Set an optional collection subfolder or custom tag suffix.
+4. Click the Filter (`FILTER`) icon if you need to exclude specific objects within that collection.
 5. Click the **Export** icon next to the preset name.
 
-### Setting Up Automated Parameter Sweeping
-To export multiple parametric variations without creating repetitive input rows:
+### Setting Up an Automated Parametric Sweep
+To export multiple variations of a model automatically:
 1. In the **Overrides** box, click `+` to add an override block.
-2. Select your Geometry Node Group (leave the **Node** field blank to target the interface).
-3. Click `+` to add an input row (or **Shift + Click `+`** to populate all available sockets).
-4. Click the **Sweep** button (`FILE_REFRESH`) on the target input:
-   * **Float / Int:** Enter `start step count` (e.g., `2.0 0.5 5` sweeps `2.0`, `2.5`, `3.0`, `3.5`, `4.0`).
-   * **String:** Enter comma-separated values (e.g., `Round, Chamfer, Sharp`).
-   * **Boolean:** Evaluates both states automatically.
-   * **Menu:** Automatically cycles all menu options connected to that interface socket.
-5. Set optional naming tags (e.g., `_mm`) and toggle the Tag (`BOOKMARKS`) or Directory (`FILE_FOLDER`) buttons.
-6. *(Optional)* **Shift + Click** the Sweep button if you want to expand the sweep into separate, manually editable rows.
-7. Click **Export**.
-
-### Filtering Objects Within Mapped Collections
-1. In the **Mappings** list, select your collection item and click the filter icon (`FILTER`).
-2. An **Exclude Objects** box appears below the mapping diagnostics.
-3. Click on any object name to toggle it between included (checked) and excluded (unchecked). Excluded objects remain untouched in the viewport but are skipped entirely during STL generation.
+2. Select your Geometry Node Group. Leave the **Node** field blank to target the Interface.
+3. Add an input row by clicking `+`. Pick your target socket (e.g., `Wall_Thickness`). 
+   * *Pro-tip: Hold Shift while clicking `+` to populate all available sockets at once.*
+4. Enable the **Sweep Button (`FILE_REFRESH`)** on the input row.
+5. Enter your sweep parameters. For a Float input, entering `2.0 2.0 3` will generate variants for `2.0`, `4.0`, and `6.0`.
+6. Configure the naming options that appear:
+   * Enter `_mm` into the tag field and enable the Tag (`BOOKMARKS`) button to append `_2_mm`, `_4_mm`, etc. to the filenames.
+   * Enable the Folder (`FILE_FOLDER`) button if you want separate directories generated for each thickness.
+7. Hit **Export**. The addon spawns a headless background instance to safely evaluate, format, and save every permutation while updating your UI progress bar.
