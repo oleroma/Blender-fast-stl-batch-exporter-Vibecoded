@@ -2,20 +2,23 @@
 
 This document outlines the internal architecture, data structures, and execution flow of the **Fast Batch STL Exporter** extension for Blender. 
 
-The extension is designed around a **bifurcated execution model**: a lightweight, responsive UI thread that manages user data and state, and an isolated, headless background process that handles destructive scene mutations and heavy geometry evaluations.
+The extension is designed around a **bifurcated execution model**: a lightweight, responsive UI thread that manages user data and state, and an isolated, headless background process that handles destructive scene mutations and heavy geometry evaluations. It fully complies with the modern Blender 4.2+ extension standard.
 
 ---
 
-## 1. High-Level System Overview
+## 1. High-Level System Overview & File Structure
 
-The extension is contained within a single `__init__.py` file, logically segmented into several core sub-systems:
-1. **Data Model:** Hierarchical `PropertyGroup` classes storing preset configurations.
-2. **UI & Operators:** Panels, UILists, and action operators to mutate the data model.
-3. **Headless Orchestrator:** A Modal operator that snapshots the scene, spawns the background process, and reads standard output (stdout) for progress tracking.
-4. **Permutation Engine:** Logic to calculate the Cartesian product of parametric sweeps.
-5. **Injection System:** Functions to non-destructively apply values to modifier properties or internally sever/reconnect Geometry Node inputs.
-6. **Headless Execution Routine:** The bulldozer script run by the background process that evaluates the Depsgraph, purges RAM, and triggers the export.
-7. **Binary STL Writer:** A custom NumPy/Struct writer bypassing Blender's native export API for maximum speed.
+The extension has been modularized into a clean, multi-file structure to prevent circular dependencies and isolate background logic from the UI thread:
+
+*   **`blender_manifest.toml`**: Replaces the legacy `bl_info` dictionary. Defines extension ID, version, permissions, and dependencies.
+*   **`__init__.py`**: Serves purely as the Blender entry point. Handles the global aggregation and registration of classes from submodules.
+*   **`properties.py`**: The RNA Data Model containing the nested `PropertyGroup` hierarchy.
+*   **`core_engine.py`**: The mathematical permutation engine, state-hashing, and non-destructive graph injection logic. 
+*   **`json_io.py`**: Dictionary parsing and JSON serialization operators.
+*   **`operators.py`**: UI interaction operators (add, remove, sweep, pin, move) and clipboard memory.
+*   **`ui.py`**: Viewport drawing logic, UILists, and Panels.
+*   **`modal_orchestrator.py`**: The UI-thread orchestrator that saves the temp file, spawns the subprocess, and polls the non-blocking stdout queue.
+*   **`headless_runner.py`**: The background execution routine and custom vectorized NumPy binary STL writer. Includes the hidden internal operator that triggers the background batch logic.
 
 ---
 
@@ -48,7 +51,7 @@ The addon relies on a strict, deeply nested hierarchy of Blender `PropertyGroup`
 
 ## 3. The Permutation Engine (`generate_override_combinations`)
 
-Before exporting, the system calculates every possible geometric variant.
+Before exporting, the system calculates every possible geometric variant inside `core_engine.py`:
 1. **Input Pooling:** It groups all inputs by their explicit target `(override_target, node_name, input_name)`. If a user repeats the same input target 3 times, those 3 values are pooled together.
 2. **Sweep Expansion (`parse_sweep_values`):** If an input has `use_sweep` enabled, it intercepts the `sweep_range` string (e.g., `1.0 0.5 3`), splits comma-separated strings, or extracts Enum identifiers from target nodes, dynamically injecting `MockInput` objects into the pool.
 3. **Cartesian Product:** It uses `itertools.product(*pools)` to calculate every unique combination of values across all targeted parameters.
@@ -64,12 +67,11 @@ Instead of relying on slow Python loops over individual object modifiers, the ex
 Finds the specific exposed socket on the modifier's interface and uses standard `mod[identifier] = value`.
 
 ### Node Targets (Link Severing)
-1. Locates the `Group Input` node within the target `NodeTree`.
-2. Locates the targeted output socket.
-3. **Records state:** Saves the original `default_value` and any incoming `from_socket` connections to a temporary `global_states` list.
+1. Locates the targeted input/output socket within the `NodeTree`.
+2. **Safe Caching:** Captures `link.to_socket` and `link.from_socket` into local variables *before* any links are deleted. This prevents `StructRNA` memory reference errors from occurring when Python attempts to read a severed wire.
+3. **Records state:** Saves the original `default_value` and incoming `from_socket` connections to a temporary `global_states` list.
 4. **Severs links:** Removes the connection wire inside the NodeTree.
-5. **Injects:** Sets the `default_value` of the downstream socket to the permutation value.
-*(Note: Because the UI relies on a temporary headless copy of the file, the extension no longer executes the complex `revert_overrides` step at the end of the batch, drastically improving final completion speed).*
+5. **Injects:** Sets the `default_value` of the securely cached downstream socket to the permutation value.
 
 ---
 
@@ -78,7 +80,7 @@ Finds the specific exposed socket on the modifier's interface and uses standard 
 ### Phase A: UI Thread (The Modal Orchestrator)
 When the user clicks **Export** (`EXPORT_OT_batch_stl_multi`):
 1. **File Dump:** Saves the active `.blend` state to a temporary OS directory using `bpy.ops.wm.save_as_mainfile(copy=True, compress=False)`. Uncompressed dumping prevents UI lock-up.
-2. **Subprocess Spawn:** Launches a secondary, headless background Blender process pointing to the temp file, using the `-P __file__` argument to re-execute the addon script, passing `--batch-stl-headless <preset_idx>`.
+2. **Native Subprocess Spawn:** Launches a secondary, headless background Blender process. Instead of forcing a standalone script execution, it uses `--python-expr` to call a hidden internal operator (`bpy.ops.batch_stl.run_headless_internal`). This ensures the background instance naturally loads the extension as a package and fully initializes the scene context before attempting to mutate any graph data.
 3. **Queue Listening:** Spawns a Daemon Thread with a `queue.Queue` to non-blockingly read `stdout` from the headless instance.
 4. **Modal Timer:** Returns control to the Blender UI. Every 0.05 seconds, it checks the queue for `BATCH_STL_PROGRESS:` tags to update the UI slider, or kills the `subprocess.Popen` object instantly if the user presses `ESC`.
 
@@ -94,7 +96,7 @@ The `run_headless_export` function activates in the background:
    * Pulls the final mesh using `obj.evaluated_get(depsgraph).to_mesh()`.
    * Passes the mesh to the STL Writer.
 4. **Garbage Collection:** Calls `bpy.ops.outliner.orphans_purge()` recursively after every combination. This prevents memory leaks caused by generating thousands of orphaned mesh blocks.
-5. **Cleanup:** Once all batches complete, calls `sys.exit(0)`. The Modal orchestrator detects the clean exit, cleans up the temporary OS directory, and finalizes the UI.
+5. **Clean Exit:** Once all batches complete, it executes `bpy.ops.wm.quit_blender()` to safely shut down the background instance and prevent any lingering OS memory block warnings.
 
 ---
 
@@ -112,4 +114,4 @@ A custom, high-performance writer isolated from `bpy.ops.export_mesh.stl`.
 
 * **Shift-Modifier Action Events:** UI operators (e.g., list reordering `UP/DOWN`, `ADD` input) override the `invoke` method to detect `event.shift`. This alters their execution path (e.g., moving items to absolute Top/Bottom, or automatically parsing Node interfaces to populate all available sockets).
 * **JSON Serialization:** Two utility operators convert the deep `PropertyGroup` nested hierarchy into dictionary trees for export via `json.dump`, and perfectly reconstruct them upon import, bypassing Blender's complex internal RNA property copying limitations.
-* **Graceful Exit:** The `unregister` function utilizes `try...except RuntimeError:` to silently bypass classes already cleared from memory, preventing harmless tracebacks when the headless process executes its hard `sys.exit(0)`.
+* **Safe Unregistration:** The `unregister` function utilizes `try...except RuntimeError:` to silently bypass classes already cleared from memory during shutdown.
