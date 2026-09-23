@@ -1,115 +1,82 @@
-# Fast Batch STL Exporter: Architecture Documentation
+# Architecture & Structure: Fast Batch STL Exporter
 
-This document outlines the internal architecture, data structures, and execution flow of the **Fast Batch STL Exporter** extension for Blender. 
+This document outlines the software architecture, data structures, and execution flow of the Fast Batch STL Exporter for Blender. The extension utilizes an adaptive, dual-path execution model to ensure maximum export speed for simple operations, while deploying a headless background process to protect the master project file during intensive combinatorial geometry generation.
 
-The extension is designed around a **bifurcated execution model**: a lightweight, responsive UI thread that manages user data and state, and an isolated, headless background process that handles destructive scene mutations and heavy geometry evaluations.
+## 1. High-Level Architecture Overview
 
----
+The extension evaluates the export parameters and dynamically routes the execution through one of two distinct paths:
 
-## 1. High-Level System Overview
+1. **The Synchronous Bypass (Main Thread):** If no overrides or permutations are requested, the exporter directly iterates through the evaluated Depsgraph and writes the STLs inline. This skips the overhead of spawning a subprocess for simple 1:1 exports.
+2. **The Headless Worker (Background Subprocess):** If state-mutating overrides are detected, it spawns a background Blender instance. This worker receives a throwaway copy of the project file, executes the permutation matrices, and streams progress back to the main thread via standard output (stdout). 
 
-The extension is contained within a single `__init__.py` file, logically segmented into several core sub-systems:
-1. **Data Model:** Hierarchical `PropertyGroup` classes storing preset configurations.
-2. **UI & Operators:** Panels, UILists, and action operators to mutate the data model.
-3. **Headless Orchestrator:** A Modal operator that snapshots the scene, spawns the background process, and reads standard output (stdout) for progress tracking.
-4. **Permutation Engine:** Logic to calculate the Cartesian product of parametric sweeps.
-5. **Injection System:** Functions to non-destructively apply values to modifier properties or internally sever/reconnect Geometry Node inputs.
-6. **Headless Execution Routine:** The bulldozer script run by the background process that evaluates the Depsgraph, purges RAM, and triggers the export.
-7. **Binary STL Writer:** A custom NumPy/Struct writer bypassing Blender's native export API for maximum speed.
+This adaptive separation ensures that heavy permutations cannot corrupt the user's active `.blend` file or freeze their UI, while maintaining instantaneous exports for basic tasks.
 
 ---
 
-## 2. Data Model Hierarchy (RNA Properties)
+## 2. Core Modules & Component Structure
 
-The addon relies on a strict, deeply nested hierarchy of Blender `PropertyGroup` classes attached to `bpy.types.Scene`.
+### A. The Data Model (PropertyGroups)
+The state of the exporter is stored directly in Blender's Scene data (`bpy.types.Scene.batch_stl_presets`), structured hierarchically:
+* **`BatchSTLExportPreset`**: The root configuration object. Contains a global preset name, root directory prefix, a list of mapped collections, and global (pinned) overrides.
+* **`BatchSTLExportItem`**: Represents a single mapped collection. Contains the pointer to the target collection, local naming tags, sub-path routes, object exclusion lists (`BatchSTLExcludedObject`), and a list of local overrides.
+* **`BatchSTLNodeOverride`**: Represents a targeted parameter injection point (either an internal Geometry Node or a Modifier Interface).
+* **`BatchSTLNodeInput`**: Represents a specific input socket and its target value, data type, and permutation rules.
 
-* `Scene.batch_stl_presets` (Collection of `BatchSTLExportPreset`)
-  * **`BatchSTLExportPreset`**: The root of an export profile.
-    * `preset_prefix`: The parent folder name.
-    * `pinned_overrides`: Collection of global `BatchSTLNodeOverride` blocks applied to *all* mappings.
-    * `mappings`: Collection of `BatchSTLExportItem` objects.
-    * **`BatchSTLExportItem`**: Binds a Blender Collection to the export pipeline.
-      * `collection_ptr`: Target geometry collection.
-      * `tag` / `sub_path`: File and folder formatting rules.
-      * `use_filter` / `excluded_objects`: Boolean toggle and list of `BatchSTLExcludedObject` to skip during export.
-      * `node_overrides`: Collection of local `BatchSTLNodeOverride` blocks applied *only* to this collection.
-      * **`BatchSTLNodeOverride`**: A block targeting a specific Geometry Node group or Modifier.
-        * `override_target`: Enum (`NODE` or `MODIFIER`).
-        * `parent_group_ptr`: The NodeTree being targeted.
-        * `node_name`: The specific internal node (if blank, targets the group interface).
-        * `inputs`: Collection of `BatchSTLNodeInput` objects.
-        * **`BatchSTLNodeInput`**: A specific socket/parameter to modify.
-          * `input_name`, `override_type` (Float, Int, Bool, String, Menu).
-          * Standard value fields (`value_float`, `value_bool`, etc.).
-          * Formatting rules (`use_tag`, `tag`, `use_dir`).
-          * **Sweep Mechanics:** `use_sweep` (bool) and `sweep_range` (string) for automated permutations.
+### B. The Permutation Engine
+This functional block computes the parameter matrix before export:
+* **`parse_sweep_values`**: Dynamically interprets `Sweep` ranges based on type (e.g., parsing float steps `1.0 0.5 5`, splitting comma-separated strings, or querying enum arrays).
+* **`generate_override_combinations`**: Groups identical input targets and computes the Cartesian product (`itertools.product`) of all input states to generate a flat list of discrete permutation configurations.
+* **`reconstruct_overrides_for_combo`**: Packages a raw permutation array back into a structured `MockOverride` format that the injection logic can process.
 
----
+### C. The Orchestrator (`EXPORT_OT_batch_stl_multi`)
+Acts as the traffic controller for the export process:
+* Evaluates the presence of `pinned_overrides` or `node_overrides`.
+* **If Clean:** Locks the UI cursor, iterates the Depsgraph, writes STLs directly via the global binary writer, and updates the native cursor progress bar.
+* **If Dirty (Overrides Present):** 
+  * Saves an uncompressed temporary copy of the active `.blend` file.
+  * Uses `subprocess.Popen` with `--factory-startup` to instantly spawn a headless Blender instance.
+  * Spawns a Daemon Thread to non-blockingly read `stdout` from the subprocess using a Thread-safe `queue.Queue`.
+  * Transitions into a `modal` timer loop, reading the queue every 0.05s to update `scene.export_progress` based on granular per-object counts.
+  * Listens for the `BATCH_STL_DONE` token to instantly execute a `process.terminate()` fast-exit, bypassing slow garbage collection.
 
-## 3. The Permutation Engine (`generate_override_combinations`)
+### D. The Headless Execution Routine
+**`run_headless_export`**:
+Triggered only when the script is loaded with the `--batch-stl-headless` CLI argument.
+* **Phase 0 (Depsgraph Culling):** Scans the scene and permanently mutes all Geometry Node modifiers on objects not actively participating in the current batch.
+* **Phase 1 (State Injection):** Temporarily severs targeted Node Group links and injects fixed values directly, avoiding modifier duplication.
+* **Phase 2 (Evaluation & Output):** Forces a `depsgraph.update()`, evaluates the mesh, passes it to the binary writer, and prints granular `BATCH_STL_PROGRESS` per object.
+* **Phase 3 (Garbage Collection):** Calls `bpy.ops.outliner.orphans_purge()` aggressively after every permutation.
 
-Before exporting, the system calculates every possible geometric variant.
-1. **Input Pooling:** It groups all inputs by their explicit target `(override_target, node_name, input_name)`. If a user repeats the same input target 3 times, those 3 values are pooled together.
-2. **Sweep Expansion (`parse_sweep_values`):** If an input has `use_sweep` enabled, it intercepts the `sweep_range` string (e.g., `1.0 0.5 3`), splits comma-separated strings, or extracts Enum identifiers from target nodes, dynamically injecting `MockInput` objects into the pool.
-3. **Cartesian Product:** It uses `itertools.product(*pools)` to calculate every unique combination of values across all targeted parameters.
-4. **Reconstruction:** It flattens the combination tuples back into temporary `MockOverride` blocks ready for injection.
-
----
-
-## 4. Node & Modifier Injection System
-
-Instead of relying on slow Python loops over individual object modifiers, the extension uses a surgical "Graph Injection" method.
-
-### Modifier Targets
-Finds the specific exposed socket on the modifier's interface and uses standard `mod[identifier] = value`.
-
-### Node Targets (Link Severing)
-1. Locates the `Group Input` node within the target `NodeTree`.
-2. Locates the targeted output socket.
-3. **Records state:** Saves the original `default_value` and any incoming `from_socket` connections to a temporary `global_states` list.
-4. **Severs links:** Removes the connection wire inside the NodeTree.
-5. **Injects:** Sets the `default_value` of the downstream socket to the permutation value.
-*(Note: Because the UI relies on a temporary headless copy of the file, the extension no longer executes the complex `revert_overrides` step at the end of the batch, drastically improving final completion speed).*
+### E. Vectorized Binary STL Writer
+**`write_fast_binary_stl`**:
+Globally scoped to serve both execution paths, but strictly internalizes its dependencies (`numpy`, `struct`) to preserve lazy loading.
+* Maps `mesh.vertices` and `mesh.loop_triangles` directly into flat NumPy arrays.
+* Performs dot-product matrix transformations (to align with `matrix_world`) directly in C-space via NumPy.
+* Computes face normals algebraically if missing.
+* Formats the exact 80-byte header, 4-byte triangle count, and unstructured triangle arrays into a strict C-struct memory map (`stl_dtype`).
+* Flushes the binary blob directly to disk via `data.tobytes()`.
 
 ---
 
-## 5. Execution Flow (The Bifurcated Pipeline)
+## 3. Data Flow & Execution Sequence
 
-### Phase A: UI Thread (The Modal Orchestrator)
-When the user clicks **Export** (`EXPORT_OT_batch_stl_multi`):
-1. **File Dump:** Saves the active `.blend` state to a temporary OS directory using `bpy.ops.wm.save_as_mainfile(copy=True, compress=False)`. Uncompressed dumping prevents UI lock-up.
-2. **Subprocess Spawn:** Launches a secondary, headless background Blender process pointing to the temp file, using the `-P __file__` argument to re-execute the addon script, passing `--batch-stl-headless <preset_idx>`.
-3. **Queue Listening:** Spawns a Daemon Thread with a `queue.Queue` to non-blockingly read `stdout` from the headless instance.
-4. **Modal Timer:** Returns control to the Blender UI. Every 0.05 seconds, it checks the queue for `BATCH_STL_PROGRESS:` tags to update the UI slider, or kills the `subprocess.Popen` object instantly if the user presses `ESC`.
-
-### Phase B: Background Thread (Headless Execution Routine)
-The `run_headless_export` function activates in the background:
-1. **Scene Culling:** Iterates over the entire scene and aggressively mutes `show_viewport` on *every* Node modifier attached to an object not included in the active preset. This drastically accelerates `depsgraph.update()`.
-2. **Batch Iteration:** Loops through each unique `BatchSTLExportItem` signature.
-3. **Permutation Loop:**
-   * Applies the override injection for the current combo.
-   * Forces `bpy.context.view_layer.update()` to evaluate the scene geometry.
-   * Generates the dynamic folder `sub_path` and filename `_suffixes`.
-   * Filters out any objects listed in `mapping.excluded_objects`.
-   * Pulls the final mesh using `obj.evaluated_get(depsgraph).to_mesh()`.
-   * Passes the mesh to the STL Writer.
-4. **Garbage Collection:** Calls `bpy.ops.outliner.orphans_purge()` recursively after every combination. This prevents memory leaks caused by generating thousands of orphaned mesh blocks.
-5. **Cleanup:** Once all batches complete, calls `sys.exit(0)`. The Modal orchestrator detects the clean exit, cleans up the temporary OS directory, and finalizes the UI.
+1. **User Initiation:** User clicks "Export" in the `VIEW3D_PT_batch_export_stl_multi` panel.
+2. **Path Evaluation:** `EXPORT_OT_batch_stl_multi` invokes and checks for permutation overrides.
+   * **Path A (Synchronous Bypass):** No overrides. Extension evaluates the Depsgraph in the main thread, writes STLs via `numpy`, updates the cursor progress bar, and finishes instantly.
+   * **Path B (Headless Orchestration):** Overrides detected. Temp file is saved (`compress=False`). Headless subprocess boots with `--factory-startup`. Modal loop begins listening.
+3. **Headless Execution (Path B Only):** 
+    * Headless instance culls the Depsgraph and calculates the absolute `total_operations` matrix (Objects × Permutations). It prints `BATCH_STL_TOTAL:X` to stdout.
+    * Master file states are overridden, Scene Depsgraph is updated, and evaluated meshes are passed to the NumPy STL writer.
+    * Headless instance prints `BATCH_STL_PROGRESS:N` for every object written.
+    * Upon completion, it prints `BATCH_STL_DONE`.
+4. **UI Synchronization & Fast Teardown:** The main thread catches the progress tags to update the UI progress bar. When it catches `BATCH_STL_DONE`, it forcefully terminates the subprocess, cleans the temp directory, and releases the UI lock immediately.
 
 ---
 
-## 6. The Vectorized STL Writer (`write_fast_binary_stl`)
+## 4. Performance & Safety Design Patterns
 
-A custom, high-performance writer isolated from `bpy.ops.export_mesh.stl`.
-* **NumPy Pre-allocation:** Reads loop triangles, vertex coordinates, and normals using `.foreach_get()` into flattened C-contiguous NumPy arrays.
-* **Matrix Transforms:** Applies `matrix_world` transformations globally via NumPy dot products `np.dot(verts_vec4, mat.T)` instead of iterating vertex by vertex in Python.
-* **Struct Packing:** Constructs a structured `np.dtype` that perfectly matches the binary STL specification (80-byte header, 4-byte face count, and 50-byte triangle blocks).
-* **Buffer Stream:** Dumps the entire evaluated NumPy array directly to disk via `.tobytes()`.
-
----
-
-## 7. UI Interactivity & Polish
-
-* **Shift-Modifier Action Events:** UI operators (e.g., list reordering `UP/DOWN`, `ADD` input) override the `invoke` method to detect `event.shift`. This alters their execution path (e.g., moving items to absolute Top/Bottom, or automatically parsing Node interfaces to populate all available sockets).
-* **JSON Serialization:** Two utility operators convert the deep `PropertyGroup` nested hierarchy into dictionary trees for export via `json.dump`, and perfectly reconstruct them upon import, bypassing Blender's complex internal RNA property copying limitations.
-* **Graceful Exit:** The `unregister` function utilizes `try...except RuntimeError:` to silently bypass classes already cleared from memory, preventing harmless tracebacks when the headless process executes its hard `sys.exit(0)`.
+* **Adaptive Execution Path:** Dynamically skipping the headless overhead for simple 1:1 exports ensures the tool feels instantly responsive when permutations are not required.
+* **Instant Boot & Fast Teardown:** By appending `--factory-startup` to the subprocess, the headless instance skips loading user addons and UI themes. By manually terminating the subprocess upon catching `BATCH_STL_DONE`, it avoids Blender's slow C-level memory garbage collection sequence during `sys.exit()`, un-greying the UI instantaneously.
+* **Zero-Consequence Mutability:** The headless process operates on a throwaway file, performing destructive optimizations (like aggressively muting global modifiers and severing node links) without complex error-handling or state-restoration logic.
+* **Lazy Dependency Loading:** Heavy scientific libraries (`numpy`) and low-level memory modules (`struct`) are kept strictly scoped inside `write_fast_binary_stl`. This prevents the main UI thread from allocating unnecessary memory during standard viewport modeling.
+* **UX & Undo State Management:** UI operators decouple from Blender's default generic Undo logging by omitting the `'UNDO'` flag from `bl_options` and injecting context-aware, highly readable messages via manual `bpy.ops.ed.undo_push()` (e.g., "Auto-Populate Sockets" or "Expand Sweep Permutations"). Tooltips dynamically adapt to the requested property action using `@classmethod def description`.

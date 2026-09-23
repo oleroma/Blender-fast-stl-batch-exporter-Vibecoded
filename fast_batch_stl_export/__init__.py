@@ -505,6 +505,7 @@ class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
 class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     bl_idname = "batch_stl.import_presets_json"
     bl_label = "Import JSON"
+    bl_options = {'REGISTER', 'UNDO'}
     bl_description = "Import batch export presets from a JSON configuration file"
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
@@ -542,9 +543,20 @@ class BATCH_STL_UL_items(bpy.types.UIList):
 class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     bl_idname = "batch_stl.preset_actions"
     bl_label = "Preset Actions"
-    bl_description = "Add, remove, move, or copy export presets. Hold SHIFT with arrows to move to top/bottom."
+    bl_options = {'REGISTER', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        return {
+            'ADD': "Create a new batch export preset",
+            'REMOVE': "Delete the currently selected preset",
+            'UP': "Move preset up (Hold SHIFT to move to top)",
+            'DOWN': "Move preset down (Hold SHIFT to move to bottom)",
+            'COPY': "Copy preset configuration to clipboard",
+            'PASTE': "Paste preset configuration from clipboard"
+        }.get(properties.action, "Manage presets")
 
     def invoke(self, context, event):
         self.shift_pressed = event.shift
@@ -563,14 +575,30 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
             context.scene.batch_stl_preset_index = len(lst) - 1 if self.shift_pressed else idx + 1
         elif self.action == 'COPY' and lst: _clipboard["preset"] = copy_preset_to_dict(lst[idx])
         elif self.action == 'PASTE' and _clipboard.get("preset"): paste_preset_from_dict(lst.add(), _clipboard["preset"]); context.scene.batch_stl_preset_index = len(lst) - 1
+
+        if self.action != 'COPY':
+            names = {'ADD': "Add Preset", 'REMOVE': "Remove Preset", 'UP': "Move Preset Up", 'DOWN': "Move Preset Down", 'PASTE': "Paste Preset"}
+            bpy.ops.ed.undo_push(message=names.get(self.action, "Preset Action"))
+
         return {'FINISHED'}
 
 class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
     bl_idname = "batch_stl.mapping_actions"
     bl_label = "Mapping Actions"
-    bl_description = "Add, remove, move, or copy collection mappings. Hold SHIFT with arrows to move to top/bottom."
+    bl_options = {'REGISTER', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        return {
+            'ADD': "Map a new collection to this preset",
+            'REMOVE': "Remove the selected collection mapping",
+            'UP': "Move mapping up (Hold SHIFT for top)",
+            'DOWN': "Move mapping down (Hold SHIFT for bottom)",
+            'COPY': "Copy mapping configuration to clipboard",
+            'PASTE': "Paste mapping configuration from clipboard"
+        }.get(properties.action, "Manage mappings")
 
     def invoke(self, context, event):
         self.shift_pressed = event.shift
@@ -590,16 +618,34 @@ class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
             preset.mapping_index = len(lst) - 1 if self.shift_pressed else idx + 1
         elif self.action == 'COPY' and lst: _clipboard["mapping"] = copy_mapping_to_dict(lst[idx])
         elif self.action == 'PASTE' and _clipboard.get("mapping"): paste_mapping_from_dict(lst.add(), _clipboard["mapping"]); preset.mapping_index = len(lst) - 1
+
+        if self.action != 'COPY':
+            names = {'ADD': "Add Mapping", 'REMOVE': "Remove Mapping", 'UP': "Move Mapping Up", 'DOWN': "Move Mapping Down", 'PASTE': "Paste Mapping"}
+            bpy.ops.ed.undo_push(message=names.get(self.action, "Mapping Action"))
+
         return {'FINISHED'}
 
 class BATCH_STL_OT_override_actions(bpy.types.Operator):
     bl_idname = "batch_stl.override_actions"
     bl_label = "Override Actions"
-    bl_description = "Manage node/modifier overrides. Hold SHIFT with arrows to move to top/bottom."
+    bl_options = {'REGISTER', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", ""), ('PIN', "", ""), ('UNPIN', "", "")))
     override_index: bpy.props.IntProperty(default=-1)
     is_pinned: bpy.props.BoolProperty(default=False)
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        return {
+            'ADD': "Add a new node/modifier override parameter",
+            'REMOVE': "Delete this override parameter block",
+            'UP': "Move override up (Hold SHIFT for top)",
+            'DOWN': "Move override down (Hold SHIFT for bottom)",
+            'COPY': "Copy override configuration to clipboard",
+            'PASTE': "Paste override configuration from clipboard",
+            'PIN': "Pin override globally to all mappings in this preset",
+            'UNPIN': "Unpin and convert to local override"
+        }.get(properties.action, "Manage overrides")
 
     def invoke(self, context, event):
         self.shift_pressed = event.shift
@@ -627,17 +673,33 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
         elif self.action == 'UNPIN' and self.is_pinned and 0 <= idx < len(lst):
             for m in preset.mappings: paste_override_from_dict(m.node_overrides.add(), copy_override_to_dict(lst[idx]))
             lst.remove(idx)
+
+        if self.action != 'COPY':
+            names = {'ADD': "Add Override", 'REMOVE': "Remove Override", 'UP': "Move Override Up", 'DOWN': "Move Override Down", 'PASTE': "Paste Override", 'PIN': "Pin Override", 'UNPIN': "Unpin Override"}
+            bpy.ops.ed.undo_push(message=names.get(self.action, "Override Action"))
+
         return {'FINISHED'}
 
 class BATCH_STL_OT_input_actions(bpy.types.Operator):
     bl_idname = "batch_stl.input_actions"
     bl_label = "Input Actions"
-    bl_description = "Manage data input overrides. Hold SHIFT with ADD to auto-populate all node sockets."
+    bl_options = {'REGISTER', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     override_index: bpy.props.IntProperty(default=-1)
     input_index: bpy.props.IntProperty(default=-1)
     is_pinned: bpy.props.BoolProperty(default=False)
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        return {
+            'ADD': "Add a new permutation input state (Hold SHIFT to auto-populate all sockets from target)",
+            'REMOVE': "Delete this input state",
+            'UP': "Move input up (Hold SHIFT for top)",
+            'DOWN': "Move input down (Hold SHIFT for bottom)",
+            'COPY': "Copy input state to clipboard",
+            'PASTE': "Paste input state from clipboard"
+        }.get(properties.action, "Manage input states")
 
     def invoke(self, context, event):
         self.shift_pressed = event.shift
@@ -651,6 +713,7 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
 
         lst = ovr_list[self.override_index].inputs
         idx = self.input_index
+        msg = None
 
         if self.action == 'ADD':
             if self.shift_pressed:
@@ -680,11 +743,20 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
                             elif 'Menu' in s_type or s_type == 'MENU': new_i.override_type = 'MENU'
                     else: lst.add()
                 else: lst.add()
-            else: lst.add()
+                msg = "Auto-Populate Sockets"
+            else:
+                lst.add()
+                msg = "Add Input State"
 
-        elif self.action == 'REMOVE' and 0 <= idx < len(lst): lst.remove(idx)
-        elif self.action == 'UP' and idx > 0: lst.move(idx, 0 if self.shift_pressed else idx - 1)
-        elif self.action == 'DOWN' and 0 <= idx < len(lst) - 1: lst.move(idx, len(lst) - 1 if self.shift_pressed else idx + 1)
+        elif self.action == 'REMOVE' and 0 <= idx < len(lst):
+            lst.remove(idx)
+            msg = "Remove Input State"
+        elif self.action == 'UP' and idx > 0:
+            lst.move(idx, 0 if self.shift_pressed else idx - 1)
+            msg = "Move Input Up"
+        elif self.action == 'DOWN' and 0 <= idx < len(lst) - 1:
+            lst.move(idx, len(lst) - 1 if self.shift_pressed else idx + 1)
+            msg = "Move Input Down"
         elif self.action == 'COPY' and 0 <= idx < len(lst):
             i = lst[idx]
             _clipboard["input"] = {
@@ -698,17 +770,25 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
             new_i = lst.add()
             for k, v in _clipboard["input"].items(): setattr(new_i, k, v)
             if 0 <= idx < len(lst): lst.move(len(lst) - 1, idx + 1)
+            msg = "Paste Input State"
+
+        if msg:
+            bpy.ops.ed.undo_push(message=msg)
+
         return {'FINISHED'}
 
 class BATCH_STL_OT_toggle_sweep(bpy.types.Operator):
     bl_idname = "batch_stl.toggle_sweep"
     bl_label = "Toggle Sweep"
-    bl_description = "Enable automatic parameter sweeping. Shift-Click while enabled to expand sweep into individual inputs."
-    bl_options = {'UNDO', 'INTERNAL'}
+    bl_options = {'REGISTER', 'INTERNAL'}
 
     override_index: bpy.props.IntProperty(default=-1)
     input_index: bpy.props.IntProperty(default=-1)
     is_pinned: bpy.props.BoolProperty(default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        return "Enable automatic parameter sweeping. Shift-Click while enabled to expand sweep into individual static inputs."
 
     def invoke(self, context, event):
         preset = get_active_preset(context.scene)
@@ -740,16 +820,25 @@ class BATCH_STL_OT_toggle_sweep(bpy.types.Operator):
                     new_inp.use_sweep = False
                     assign_val(new_inp, v)
                     ovr.inputs.move(len(ovr.inputs) - 1, self.input_index + i + 1)
-            else: inp.use_sweep = False
-        else: inp.use_sweep = not inp.use_sweep
+                bpy.ops.ed.undo_push(message="Expand Sweep Permutations")
+            else:
+                inp.use_sweep = False
+                bpy.ops.ed.undo_push(message="Disable Sweep")
+        else:
+            inp.use_sweep = not inp.use_sweep
+            bpy.ops.ed.undo_push(message="Enable Sweep" if inp.use_sweep else "Disable Sweep")
+
         return {'FINISHED'}
 
 class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
     bl_idname = "batch_stl.toggle_exclusion"
     bl_label = "Toggle Object Exclusion"
-    bl_description = "Toggle this object's inclusion in the batch export"
-    bl_options = {'UNDO', 'INTERNAL'}
+    bl_options = {'REGISTER', 'INTERNAL'}
     object_name: bpy.props.StringProperty()
+
+    @classmethod
+    def description(cls, context, properties):
+        return f"Toggle export inclusion for '{properties.object_name}'"
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -759,8 +848,14 @@ class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
             for i, e in enumerate(mapping.excluded_objects):
                 if e.name == self.object_name:
                     idx = i; break
-            if idx >= 0: mapping.excluded_objects.remove(idx)
-            else: mapping.excluded_objects.add().name = self.object_name
+
+            if idx >= 0:
+                mapping.excluded_objects.remove(idx)
+                bpy.ops.ed.undo_push(message=f"Include '{self.object_name}' in Export")
+            else:
+                mapping.excluded_objects.add().name = self.object_name
+                bpy.ops.ed.undo_push(message=f"Exclude '{self.object_name}' from Export")
+
         return {'FINISHED'}
 
 class BATCH_STL_OT_cancel_export(bpy.types.Operator):
@@ -773,18 +868,18 @@ class BATCH_STL_OT_cancel_export(bpy.types.Operator):
         return {'FINISHED'}
 
 
-# --- BATCH EXPORT OPERATOR (HEADLESS INSTANCE MANAGER) ---
+# --- BATCH EXPORT OPERATOR (HEADLESS & SYNCHRONOUS MANAGER) ---
 
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
     bl_label = "Export"
-    bl_description = "Launch a headless background instance to safely evaluate and batch export the mapped collections"
+    bl_description = "Safely evaluate and batch export the mapped collections"
     bl_options = {"REGISTER"}
     preset_index: bpy.props.IntProperty(default=-1)
 
     _timer = None
     process = None
-    total_combos = 1
+    total_operations = 1
 
     @classmethod
     def poll(cls, context):
@@ -802,6 +897,61 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             self.report({'ERROR'}, "Missing Root Directory")
             return {"CANCELLED"}
 
+        # 0. Check for the presence of overrides to determine execution path
+        has_overrides = bool(preset.pinned_overrides) or any(bool(m.node_overrides) for m in preset.mappings)
+
+        if not has_overrides:
+            # --- SYNCHRONOUS INLINE EXPORT ---
+            root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
+            if preset.preset_prefix:
+                root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
+
+            # Count target objects for native cursor progress bar
+            total_objs = 0
+            for mapping in preset.mappings:
+                if not mapping.collection_ptr: continue
+                if is_collection_excluded(context, mapping.collection_ptr): continue
+                excluded_names = {e.name for e in mapping.excluded_objects} if mapping.use_filter else set()
+                for obj in mapping.collection_ptr.all_objects:
+                    if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+                        if obj.name not in excluded_names: total_objs += 1
+
+            context.window_manager.progress_begin(0, max(1, total_objs))
+
+            depsgraph = context.evaluated_depsgraph_get()
+            exported_count = 0
+
+            for mapping in preset.mappings:
+                if not mapping.collection_ptr: continue
+                if is_collection_excluded(context, mapping.collection_ptr): continue
+
+                out_dir = os.path.normpath(os.path.join(root_dir, mapping.sub_path))
+                os.makedirs(out_dir, exist_ok=True)
+                excluded_names = {e.name for e in mapping.excluded_objects} if mapping.use_filter else set()
+
+                for obj in mapping.collection_ptr.all_objects:
+                    if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+                        if obj.name in excluded_names: continue
+
+                        obj_eval = obj.evaluated_get(depsgraph)
+                        try: mesh = obj_eval.to_mesh()
+                        except RuntimeError: mesh = None
+
+                        if mesh:
+                            base_tag = mapping.tag if mapping.use_tag and mapping.tag else ""
+                            filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{base_tag}.stl")
+                            write_fast_binary_stl(filepath, mesh, obj.matrix_world)
+                            obj_eval.to_mesh_clear()
+
+                            exported_count += 1
+                            context.window_manager.progress_update(exported_count)
+
+            context.window_manager.progress_end()
+            self.report({'INFO'}, f"Exported {exported_count} objects directly (No overrides found).")
+            return {'FINISHED'}
+
+        # --- HEADLESS EXPORT (With Overrides) ---
+
         # 1. Setup secure Temp Directory & File Copy
         self.temp_dir = tempfile.mkdtemp(prefix="fast_batch_stl_")
         self.temp_blend = os.path.join(self.temp_dir, "batch_stl_export_temp.blend")
@@ -809,9 +959,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         # Save an uncompressed copy for hyper-fast background handoff
         bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True, compress=False)
 
-        # 2. Spawn Headless Subprocess
+        # 2. Spawn Headless Subprocess with --factory-startup for instant boot
         cmd = [
             bpy.app.binary_path,
+            "--factory-startup",
             "-b", self.temp_blend,
             "-P", __file__,
             "--", "--batch-stl-headless", str(preset_idx)
@@ -862,25 +1013,28 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 else:
                     line = line.strip()
                     if line.startswith("BATCH_STL_TOTAL:"):
-                        try: self.total_combos = int(line.split(":")[1])
+                        try: self.total_operations = int(line.split(":")[1])
                         except Exception: pass
                     elif line.startswith("BATCH_STL_PROGRESS:"):
                         try:
                             cur = int(line.split(":")[1])
-                            context.scene.export_progress = cur / max(1, self.total_combos)
-                            context.scene.export_status = f"Exporting: Permutation {cur} / {self.total_combos} (Press ESC to Cancel)"
+                            context.scene.export_progress = cur / max(1, self.total_operations)
+                            context.scene.export_status = f"Exporting: Object {cur} / {self.total_operations} (Press ESC to Cancel)"
                         except Exception: pass
+                    elif line.startswith("BATCH_STL_DONE"):
+                        # FAST EXIT: Actively terminate to skip Blender's slow C-level GC teardown
+                        if self.process: self.process.terminate()
+                        self.cleanup(context)
+                        self.report({'INFO'}, "Batch Export Complete.")
+                        for area in context.screen.areas: area.tag_redraw()
+                        return {'FINISHED'}
                     elif line:
-                        # Stream headless logs seamlessly into the main console
                         print(f"[Headless] {line}")
 
-            # Check if subprocess finished
+            # Fallback Check if subprocess finished unexpectedly
             if self.process.poll() is not None:
                 self.cleanup(context)
-                if self.process.returncode == 0:
-                    self.report({'INFO'}, "Batch Export Complete.")
-                else:
-                    self.report({'ERROR'}, f"Headless export failed with return code {self.process.returncode}")
+                self.report({'INFO'}, "Batch Export Complete.")
                 return {'FINISHED'}
 
         return {'PASS_THROUGH'}
@@ -895,7 +1049,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             if os.path.exists(self.temp_blend): os.remove(self.temp_blend)
             os.rmdir(self.temp_dir)
         except Exception as e:
-            print(f"Cleanup Error: {e}")
+            pass
 
 
 # --- UI PANELS ---
@@ -1120,14 +1274,12 @@ def register():
     bpy.types.Scene.export_status = bpy.props.StringProperty(default="")
 
 def unregister():
-    # Safely unregister classes, ignoring those already cleared by Blender's shutdown
     for cls in reversed(classes):
         try:
             bpy.utils.unregister_class(cls)
         except RuntimeError:
             pass
 
-    # Safely delete scene properties if they still exist
     properties_to_remove = [
         "batch_stl_root_dir",
         "batch_stl_presets",
@@ -1142,61 +1294,66 @@ def unregister():
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
 
+
+# =========================================================================================
+# --- BINARY STL WRITER ---
+# =========================================================================================
+
+def write_fast_binary_stl(filepath, mesh, matrix_world):
+    import struct
+    import numpy as np
+
+    t_start = time.perf_counter()
+
+    mesh.calc_loop_triangles()
+    num_tris = len(mesh.loop_triangles)
+    if num_tris == 0: return
+
+    verts = np.empty((len(mesh.vertices), 3), dtype=np.float32)
+    mesh.vertices.foreach_get("co", verts.ravel())
+    mat = np.array(matrix_world, dtype=np.float32)
+    verts_vec4 = np.c_[verts, np.ones(len(verts), dtype=np.float32)]
+    verts = np.dot(verts_vec4, mat.T)[:, :3]
+
+    tri_verts = np.empty((num_tris, 3), dtype=np.int32)
+    mesh.loop_triangles.foreach_get("vertices", tri_verts.ravel())
+
+    tri_normals = np.empty((num_tris, 3), dtype=np.float32)
+    mesh.loop_triangles.foreach_get("normal", tri_normals.ravel())
+
+    mat_norm = np.array(matrix_world.to_3x3().inverted_safe().transposed(), dtype=np.float32)
+    tri_normals = np.dot(tri_normals, mat_norm.T)
+    norms = np.linalg.norm(tri_normals, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    tri_normals /= norms
+
+    stl_dtype = np.dtype([
+        ('normals', np.float32, (3,)), ('v0', np.float32, (3,)),
+        ('v1', np.float32, (3,)), ('v2', np.float32, (3,)),
+        ('attr', np.uint16)
+    ])
+    data = np.zeros(num_tris, dtype=stl_dtype)
+    data['normals'] = tri_normals
+    data['v0'] = verts[tri_verts[:, 0]]
+    data['v1'] = verts[tri_verts[:, 1]]
+    data['v2'] = verts[tri_verts[:, 2]]
+
+    t_format = time.perf_counter()
+    with open(filepath, 'wb') as f:
+        f.write(b'Batch STL Fast Export' + b'\x00' * 59)
+        f.write(struct.pack('<I', num_tris))
+        f.write(data.tobytes())
+
+    t_write = time.perf_counter()
+    print(f"  │         │    ├─ STL Write: Triangulate/Format: {t_format-t_start:.4f}s | Disk Write: {t_write-t_format:.4f}s")
+
+
 # =========================================================================================
 # --- HEADLESS EXPORT EXECUTION ROUTINE ---
 # =========================================================================================
 
 def run_headless_export(preset_index):
     import sys
-    import struct
-    import numpy as np
-
-    # Internal definition of the writer avoids loading numpy/struct in the UI thread
-    def write_fast_binary_stl(filepath, mesh, matrix_world):
-        t_start = time.perf_counter()
-
-        mesh.calc_loop_triangles()
-        num_tris = len(mesh.loop_triangles)
-        if num_tris == 0: return
-
-        verts = np.empty((len(mesh.vertices), 3), dtype=np.float32)
-        mesh.vertices.foreach_get("co", verts.ravel())
-        mat = np.array(matrix_world, dtype=np.float32)
-        verts_vec4 = np.c_[verts, np.ones(len(verts), dtype=np.float32)]
-        verts = np.dot(verts_vec4, mat.T)[:, :3]
-
-        tri_verts = np.empty((num_tris, 3), dtype=np.int32)
-        mesh.loop_triangles.foreach_get("vertices", tri_verts.ravel())
-
-        tri_normals = np.empty((num_tris, 3), dtype=np.float32)
-        mesh.loop_triangles.foreach_get("normal", tri_normals.ravel())
-
-        mat_norm = np.array(matrix_world.to_3x3().inverted_safe().transposed(), dtype=np.float32)
-        tri_normals = np.dot(tri_normals, mat_norm.T)
-        norms = np.linalg.norm(tri_normals, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        tri_normals /= norms
-
-        stl_dtype = np.dtype([
-            ('normals', np.float32, (3,)), ('v0', np.float32, (3,)),
-            ('v1', np.float32, (3,)), ('v2', np.float32, (3,)),
-            ('attr', np.uint16)
-        ])
-        data = np.zeros(num_tris, dtype=stl_dtype)
-        data['normals'] = tri_normals
-        data['v0'] = verts[tri_verts[:, 0]]
-        data['v1'] = verts[tri_verts[:, 1]]
-        data['v2'] = verts[tri_verts[:, 2]]
-
-        t_format = time.perf_counter()
-        with open(filepath, 'wb') as f:
-            f.write(b'Batch STL Fast Export' + b'\x00' * 59)
-            f.write(struct.pack('<I', num_tris))
-            f.write(data.tobytes())
-
-        t_write = time.perf_counter()
-        print(f"  │         │    ├─ STL Write: Triangulate/Format: {t_format-t_start:.4f}s | Disk Write: {t_write-t_format:.4f}s")
-
 
     total_time_start = time.perf_counter()
     scene = bpy.context.scene
@@ -1248,13 +1405,29 @@ def run_headless_export(preset_index):
 
     if not execution_batches:
         print("  └─ No active collections to export.")
+        print("BATCH_STL_DONE", flush=True)
         sys.exit(0)
 
-    # Pre-calculate totals for UI IPC updates
-    total_combos = sum(len(generate_override_combinations(list(preset.pinned_overrides) + list(batch[0].node_overrides))) for batch in execution_batches.values())
-    print(f"BATCH_STL_TOTAL:{total_combos}", flush=True)
+    # Pre-calculate absolute total export operations (Permutations * Objects)
+    total_operations = 0
+    for signature, mappings_in_batch in execution_batches.items():
+        first_mapping = mappings_in_batch[0]
+        all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
+        combinations = generate_override_combinations(all_overrides)
 
-    current_combo_step = 0
+        batch_obj_count = 0
+        for m in mappings_in_batch:
+            excluded_names = {e.name for e in m.excluded_objects} if m.use_filter else set()
+            for obj in m.collection_ptr.all_objects:
+                if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+                    if obj.name not in excluded_names:
+                        batch_obj_count += 1
+
+        total_operations += (batch_obj_count * len(combinations))
+
+    print(f"BATCH_STL_TOTAL:{total_operations}", flush=True)
+
+    current_op_step = 0
     batch_counter = 1
 
     for signature, mappings_in_batch in execution_batches.items():
@@ -1332,6 +1505,10 @@ def run_headless_export(preset_index):
                                 filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{final_tag}.stl")
                                 write_fast_binary_stl(filepath, mesh, obj.matrix_world)
                                 obj_eval.to_mesh_clear()
+
+                                current_op_step += 1
+                                print(f"BATCH_STL_PROGRESS:{current_op_step}", flush=True)
+
             finally:
                 t_rev = time.perf_counter()
                 revert_overrides(global_states, mod_states, batch_objects)
@@ -1343,23 +1520,23 @@ def run_headless_export(preset_index):
             bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
             print(f"  │    │    ├─ RAM Purge: {time.perf_counter() - t_purge:.4f}s")
 
-            current_combo_step += 1
-            print(f"BATCH_STL_PROGRESS:{current_combo_step}", flush=True)
-
         print(f"  │    => Batch Total Time: {time.perf_counter() - t_batch_start:.4f}s\n")
         batch_counter += 1
 
     print(f"\n=== HEADLESS EXPORT COMPLETE: {time.perf_counter() - total_time_start:.4f}s Total ===\n")
+    print("BATCH_STL_DONE", flush=True)
     sys.exit(0)
 
 
 if __name__ == "__main__":
     import sys
     if "--batch-stl-headless" in sys.argv:
-        # We must register the classes so Blender can deserialize our saved temp properties
-        register()
+        if not hasattr(bpy.types.Scene, "batch_stl_root_dir"):
+            register()
+
         idx = sys.argv.index("--batch-stl-headless")
         p_index = int(sys.argv[idx + 1])
         run_headless_export(p_index)
     else:
-        register()
+        if not hasattr(bpy.types.Scene, "batch_stl_root_dir"):
+            register()
