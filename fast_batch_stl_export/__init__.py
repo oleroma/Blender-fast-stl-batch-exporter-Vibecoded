@@ -427,6 +427,7 @@ class BatchSTLExportItem(bpy.types.PropertyGroup):
 class BatchSTLExportPreset(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Preset Name", default="New Preset", description="Name of the batch export preset")
     preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", description="Root folder name for this preset, created inside the global export directory")
+    last_export_time: bpy.props.FloatProperty(name="Last Export Time", default=0.0, description="Total execution time of the last export for this preset")
     pinned_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride, description="Global overrides applied to all mapped collections in this preset")
     mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem, description="List of collections mapped to this preset for batch export")
     mapping_index: bpy.props.IntProperty(name="Mapping Index", default=0, description="Select the active collection mapping to edit its overrides")
@@ -521,7 +522,7 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
 class BATCH_STL_UL_presets(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
-        row.prop(item, "name", text="", emboss=False, icon='PRESET')
+        row.prop(item, "name", text="", emboss=False)
         row.prop(item, "preset_prefix", text="", emboss=False, icon='FILE_FOLDER')
         op = row.operator("export_scene.batch_stl_multi", text="", icon='EXPORT')
         op.preset_index = index
@@ -529,11 +530,11 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
 class BATCH_STL_UL_items(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
+        row.prop(item, "use_filter", text="", icon='FILTER')
         row.prop(item, "collection_ptr", text="")
         row.separator(factor=0.5)
         sub_row = row.row(align=True)
         sub_row.prop(item, "use_tag", text="", icon='BOOKMARKS')
-        sub_row.prop(item, "use_filter", text="", icon='FILTER')
         sub_row.separator(factor=0.5)
         tag_row = sub_row.row(align=True)
         tag_row.prop(item, "tag", text="", emboss=False)
@@ -865,6 +866,8 @@ class BATCH_STL_OT_cancel_export(bpy.types.Operator):
 
     def execute(self, context):
         context.scene.cancel_export = True
+        if context.scene.batch_stl_verbose_console:
+            print("\n[!] Cancel request received. Terminating process...")
         return {'FINISHED'}
 
 
@@ -888,17 +891,20 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     def invoke(self, context, event):
         if context.scene.is_exporting: return {'CANCELLED'}
 
+        self.export_start_time = time.perf_counter()
+        self.current_op = 0
         scene = context.scene
-        preset_idx = self.preset_index if self.preset_index >= 0 else scene.batch_stl_preset_index
-        if preset_idx < 0 or preset_idx >= len(scene.batch_stl_presets): return {"CANCELLED"}
-        preset = scene.batch_stl_presets[preset_idx]
+
+        self.preset_idx = self.preset_index if self.preset_index >= 0 else scene.batch_stl_preset_index
+        if self.preset_idx < 0 or self.preset_idx >= len(scene.batch_stl_presets): return {"CANCELLED"}
+        preset = scene.batch_stl_presets[self.preset_idx]
 
         if not scene.batch_stl_root_dir:
             self.report({'ERROR'}, "Missing Root Directory")
             return {"CANCELLED"}
 
-        # 0. Check for the presence of overrides to determine execution path
         has_overrides = bool(preset.pinned_overrides) or any(bool(m.node_overrides) for m in preset.mappings)
+        verbose = scene.batch_stl_verbose_console
 
         if not has_overrides:
             # --- SYNCHRONOUS INLINE EXPORT ---
@@ -906,7 +912,6 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             if preset.preset_prefix:
                 root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
 
-            # Count target objects for native cursor progress bar
             total_objs = 0
             for mapping in preset.mappings:
                 if not mapping.collection_ptr: continue
@@ -917,9 +922,11 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                         if obj.name not in excluded_names: total_objs += 1
 
             context.window_manager.progress_begin(0, max(1, total_objs))
-
             depsgraph = context.evaluated_depsgraph_get()
             exported_count = 0
+
+            if verbose:
+                print(f"\n=== STARTING SYNCHRONOUS BATCH EXPORT: {preset.name} ===")
 
             for mapping in preset.mappings:
                 if not mapping.collection_ptr: continue
@@ -933,39 +940,49 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                     if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
                         if obj.name in excluded_names: continue
 
+                        t_eval_start = time.perf_counter()
                         obj_eval = obj.evaluated_get(depsgraph)
                         try: mesh = obj_eval.to_mesh()
                         except RuntimeError: mesh = None
 
+                        if verbose:
+                            print(f"  ├─ Evaluated {obj.name} in {time.perf_counter()-t_eval_start:.4f}s")
+
                         if mesh:
                             base_tag = mapping.tag if mapping.use_tag and mapping.tag else ""
                             filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{base_tag}.stl")
-                            write_fast_binary_stl(filepath, mesh, obj.matrix_world)
+                            write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=verbose)
                             obj_eval.to_mesh_clear()
 
                             exported_count += 1
                             context.window_manager.progress_update(exported_count)
 
             context.window_manager.progress_end()
-            self.report({'INFO'}, f"Exported {exported_count} objects directly (No overrides found).")
+
+            total_time = time.perf_counter() - self.export_start_time
+            preset.last_export_time = total_time
+
+            if verbose:
+                print(f"=== SYNCHRONOUS BATCH EXPORT FULLY COMPLETE ===")
+                print(f"Total Wall-Clock Time (Button Press to Finish): {total_time:.4f}s\n")
+
+            self.report({'INFO'}, f"Exported {exported_count} objects directly in {total_time:.2f}s.")
             return {'FINISHED'}
 
         # --- HEADLESS EXPORT (With Overrides) ---
+        context.scene.export_status = f"Spawning Headless Instance... (0.0s)"
+        t_spawn_start = time.perf_counter()
 
-        # 1. Setup secure Temp Directory & File Copy
         self.temp_dir = tempfile.mkdtemp(prefix="fast_batch_stl_")
         self.temp_blend = os.path.join(self.temp_dir, "batch_stl_export_temp.blend")
-
-        # Save an uncompressed copy for hyper-fast background handoff
         bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True, compress=False)
 
-        # 2. Spawn Headless Subprocess with --factory-startup for instant boot
         cmd = [
             bpy.app.binary_path,
             "--factory-startup",
             "-b", self.temp_blend,
             "-P", __file__,
-            "--", "--batch-stl-headless", str(preset_idx)
+            "--", "--batch-stl-headless", str(self.preset_idx)
         ]
 
         try:
@@ -975,7 +992,12 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             self.cleanup(context)
             return {'CANCELLED'}
 
-        # 3. Non-blocking stdout queue
+        spawn_time = time.perf_counter() - t_spawn_start
+        if verbose:
+            print(f"\n=== INITIATING HEADLESS EXPORT ===")
+            print(f"  ├─ Temp blend file saved to {self.temp_dir}")
+            print(f"  ├─ Spawned background Blender worker in {spawn_time:.4f}s")
+
         self.q = queue.Queue()
         def enqueue_output(out, q):
             for line in iter(out.readline, ''):
@@ -986,55 +1008,68 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         self.t.daemon = True
         self.t.start()
 
-        # Initialize Modal States
         context.scene.is_exporting = True
         context.scene.cancel_export = False
         context.scene.export_progress = 0.0
-        context.scene.export_status = f"Spawning Headless Instance for '{preset.name}'..."
 
         self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
-        # Esc Catch & Kill Switch
         if context.scene.cancel_export or (event.type == 'ESC' and event.value == 'PRESS'):
-            print("\n[!] Export cancelled by user. Terminating headless instance...")
+            if context.scene.batch_stl_verbose_console:
+                print("\n[!] Export cancelled by user. Terminating headless instance...")
             if self.process: self.process.terminate()
             self.cleanup(context)
             self.report({'WARNING'}, "Export cancelled by user.")
             return {'CANCELLED'}
 
         if event.type == 'TIMER':
-            # Drain non-blocking output queue
+            elapsed = time.perf_counter() - self.export_start_time
+
             while True:
                 try: line = self.q.get_nowait()
                 except queue.Empty: break
                 else:
-                    line = line.strip()
+                    line = line.rstrip('\r\n')
                     if line.startswith("BATCH_STL_TOTAL:"):
                         try: self.total_operations = int(line.split(":")[1])
                         except Exception: pass
                     elif line.startswith("BATCH_STL_PROGRESS:"):
                         try:
-                            cur = int(line.split(":")[1])
-                            context.scene.export_progress = cur / max(1, self.total_operations)
-                            context.scene.export_status = f"Exporting: Object {cur} / {self.total_operations} (Press ESC to Cancel)"
+                            self.current_op = int(line.split(":")[1])
+                            context.scene.export_progress = self.current_op / max(1, self.total_operations)
                         except Exception: pass
                     elif line.startswith("BATCH_STL_DONE"):
-                        # FAST EXIT: Actively terminate to skip Blender's slow C-level GC teardown
                         if self.process: self.process.terminate()
                         self.cleanup(context)
-                        self.report({'INFO'}, "Batch Export Complete.")
+
+                        total_time = time.perf_counter() - self.export_start_time
+                        if 0 <= self.preset_idx < len(context.scene.batch_stl_presets):
+                            context.scene.batch_stl_presets[self.preset_idx].last_export_time = total_time
+
+                        if context.scene.batch_stl_verbose_console:
+                            print(f"  │    => Subprocess termination complete.")
+                            print(f"=== BATCH EXPORT FULLY COMPLETE ===")
+                            print(f"Total Wall-Clock Time (Button Press to Finish): {total_time:.4f}s\n")
+
+                        self.report({'INFO'}, f"Batch Export Complete in {total_time:.2f}s.")
                         for area in context.screen.areas: area.tag_redraw()
                         return {'FINISHED'}
                     elif line:
-                        print(f"[Headless] {line}")
+                        if context.scene.batch_stl_verbose_console:
+                            print(line)
 
-            # Fallback Check if subprocess finished unexpectedly
+            if context.scene.is_exporting:
+                if self.total_operations > 1 or self.current_op > 0:
+                    context.scene.export_status = f"Exporting: Obj {self.current_op} / {self.total_operations} | Time: {elapsed:.1f}s"
+                else:
+                    context.scene.export_status = f"Spawning Headless Worker... ({elapsed:.1f}s)"
+
             if self.process.poll() is not None:
                 self.cleanup(context)
-                self.report({'INFO'}, "Batch Export Complete.")
+                self.report({'INFO'}, "Batch Export Stopped.")
                 return {'FINISHED'}
 
         return {'PASS_THROUGH'}
@@ -1145,37 +1180,60 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         if scene.is_exporting:
             prog_box = layout.box()
             prog_box.label(text=scene.export_status, icon='INFO')
-            prog_box.prop(scene, "export_progress", slider=True, text="")
+
+            prog_row = prog_box.row()
+            prog_row.enabled = False
+            prog_row.prop(scene, "export_progress", slider=True, text="")
+
             prog_box.operator("batch_stl.cancel_export", icon='CANCEL', text="Cancel Export (or ESC)")
             layout = layout.column()
             layout.enabled = False
 
-        layout.prop(scene, "batch_stl_root_dir")
-        layout.separator()
-
-        json_row = layout.row(align=True)
-        json_row.alignment = 'LEFT'
-        json_row.operator("batch_stl.import_presets_json", text="Import JSON", icon='IMPORT')
-        json_row.operator("batch_stl.export_presets_json", text="Export JSON", icon='EXPORT')
+        dir_row = layout.row(align=True)
+        dir_row.operator("batch_stl.import_presets_json", text="", icon='IMPORT')
+        dir_row.operator("batch_stl.export_presets_json", text="", icon='EXPORT')
+        dir_row.prop(scene, "batch_stl_root_dir")
 
         layout.separator()
         p_header = layout.row()
-        p_header.label(text="Presets:", icon='PRESET')
+
+        active_preset = get_active_preset(scene)
+        p_header.label(text="Presets", icon='PRESET')
+        if active_preset:
+            p_header.label(text=f"Last: {active_preset.last_export_time:.2f}s", icon='TIME')
+
         draw_inline_controls(p_header, "batch_stl.preset_actions", use_clipboard=True)
         layout.template_list("BATCH_STL_UL_presets", "", scene, "batch_stl_presets", scene, "batch_stl_preset_index", rows=3)
 
-        active_preset = get_active_preset(scene)
-        if not active_preset: return
+        if not active_preset:
+            layout.separator()
+            layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
+            return
 
         total_mappings = len(active_preset.mappings)
-        total_preset_combos = sum(
-            len(generate_override_combinations(list(active_preset.pinned_overrides) + list(m.node_overrides)))
-            for m in active_preset.mappings
-        )
+        total_objects = 0
+        total_preset_combos = 0
+
+        for m in active_preset.mappings:
+            m_combos = len(generate_override_combinations(list(active_preset.pinned_overrides) + list(m.node_overrides)))
+            total_preset_combos += m_combos
+
+            obj_count = 0
+            if m.collection_ptr:
+                excluded_names = {e.name for e in m.excluded_objects} if m.use_filter else set()
+                for obj in m.collection_ptr.all_objects:
+                    if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+                        if obj.name not in excluded_names:
+                            obj_count += 1
+
+            total_objects += (obj_count * m_combos)
 
         box = layout.box()
         m_header = box.row()
-        m_header.label(text=f"Mappings ({total_mappings} items, {total_preset_combos} combos):", icon='OUTLINER_COLLECTION')
+
+        m_title = f"{active_preset.name} | {total_mappings} collections | {total_preset_combos} combos | {total_objects} objects total"
+        m_header.label(text=m_title, icon='PRESET')
+
         draw_inline_controls(m_header, "batch_stl.mapping_actions", use_clipboard=True)
         box.template_list("BATCH_STL_UL_items", "", active_preset, "mappings", active_preset, "mapping_index", rows=5)
 
@@ -1197,8 +1255,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                         op.object_name = obj.name
 
             layout.separator()
-            c_name = active_item.collection_ptr.name if active_item.collection_ptr else "Unassigned"
-            if active_item.tag: c_name += f" [{active_item.tag}]"
 
             all_ovrs = list(active_preset.pinned_overrides) + list(active_item.node_overrides)
             freq_dict = {}
@@ -1216,12 +1272,23 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             num_targets = len(unique_targets)
             num_combos = len(generate_override_combinations(all_ovrs))
 
-            metric_str = f"{c_name}"
-            if num_combos > 1: metric_str += f" | {num_combos} combos"
-            metric_str += f" | {num_targets} targets | {total_inputs} inputs"
+            active_obj_count = 0
+            if active_item.collection_ptr:
+                excluded_names = {e.name for e in active_item.excluded_objects} if active_item.use_filter else set()
+                for obj in active_item.collection_ptr.all_objects:
+                    if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+                        if obj.name not in excluded_names:
+                            active_obj_count += 1
+
+            mapping_total_objects = active_obj_count * num_combos
+
+            c_name = active_item.collection_ptr.name if active_item.collection_ptr else "Unassigned"
+            if active_item.tag: c_name += f" [{active_item.tag}]"
+
+            metric_str = f"{c_name} | {num_targets} targets | {total_inputs} inputs | {num_combos} combos | {mapping_total_objects} objects"
 
             header = layout.row()
-            header.label(text=metric_str, icon='MODIFIER')
+            header.label(text=metric_str, icon='OUTLINER_COLLECTION')
 
             layout.separator()
             pinned_box = layout.box()
@@ -1249,6 +1316,9 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             for o_idx, ovr in enumerate(active_item.node_overrides):
                 draw_override_block(local_box, ovr, o_idx, False, freq_dict)
 
+        layout.separator()
+        layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
+
 
 # --- REGISTRATION ---
 
@@ -1273,6 +1343,12 @@ def register():
     bpy.types.Scene.export_progress = bpy.props.FloatProperty(name="Progress", default=0.0, min=0.0, max=1.0)
     bpy.types.Scene.export_status = bpy.props.StringProperty(default="")
 
+    bpy.types.Scene.batch_stl_verbose_console = bpy.props.BoolProperty(
+        name="Verbose Console Output",
+        default=False,
+        description="Print granular timing statistics and evaluation logs to the system console during export"
+    )
+
 def unregister():
     for cls in reversed(classes):
         try:
@@ -1287,7 +1363,8 @@ def unregister():
         "is_exporting",
         "cancel_export",
         "export_progress",
-        "export_status"
+        "export_status",
+        "batch_stl_verbose_console"
     ]
 
     for prop in properties_to_remove:
@@ -1299,7 +1376,7 @@ def unregister():
 # --- BINARY STL WRITER ---
 # =========================================================================================
 
-def write_fast_binary_stl(filepath, mesh, matrix_world):
+def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
     import struct
     import numpy as np
 
@@ -1339,13 +1416,18 @@ def write_fast_binary_stl(filepath, mesh, matrix_world):
     data['v2'] = verts[tri_verts[:, 2]]
 
     t_format = time.perf_counter()
+    if verbose:
+        mb_size = (84 + (num_tris * 50)) / (1024 * 1024)
+        print(f"  │         │    ├─ STL Memory Map: {num_tris} Tris | {mb_size:.2f} MB | Matrix T-Form: {t_format-t_start:.4f}s")
+
     with open(filepath, 'wb') as f:
         f.write(b'Batch STL Fast Export' + b'\x00' * 59)
         f.write(struct.pack('<I', num_tris))
         f.write(data.tobytes())
 
     t_write = time.perf_counter()
-    print(f"  │         │    ├─ STL Write: Triangulate/Format: {t_format-t_start:.4f}s | Disk Write: {t_write-t_format:.4f}s")
+    if verbose:
+        print(f"  │         │    ├─ Disk I/O Write: {t_write-t_format:.4f}s | Path: {os.path.basename(filepath)}")
 
 
 # =========================================================================================
@@ -1371,13 +1453,11 @@ def run_headless_export(preset_index):
     print("\n  [Phase 0] Aggressive Global Depsgraph Culling...")
     t_phase0_start = time.perf_counter()
 
-    # Identify all potentially active objects across the entire preset
     active_export_objects = set()
     for mapping in preset.mappings:
         if mapping.collection_ptr and not is_collection_excluded(bpy.context, mapping.collection_ptr):
             active_export_objects.update(mapping.collection_ptr.all_objects)
 
-    # Permanently mute modifiers on any object not involved in this export run
     muted_count = 0
     for obj in bpy.context.view_layer.objects:
         if obj not in active_export_objects:
@@ -1408,7 +1488,6 @@ def run_headless_export(preset_index):
         print("BATCH_STL_DONE", flush=True)
         sys.exit(0)
 
-    # Pre-calculate absolute total export operations (Permutations * Objects)
     total_operations = 0
     for signature, mappings_in_batch in execution_batches.items():
         first_mapping = mappings_in_batch[0]
@@ -1503,7 +1582,8 @@ def run_headless_export(preset_index):
                                 base_tag = mapping.tag if mapping.use_tag and mapping.tag else ""
                                 final_tag = base_tag + combo_suffix
                                 filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{final_tag}.stl")
-                                write_fast_binary_stl(filepath, mesh, obj.matrix_world)
+
+                                write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=True)
                                 obj_eval.to_mesh_clear()
 
                                 current_op_step += 1
@@ -1515,15 +1595,14 @@ def run_headless_export(preset_index):
                 bpy.context.view_layer.update()
                 print(f"  │    │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
 
-            # Crucial garbage collection for headless loop
             t_purge = time.perf_counter()
             bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
             print(f"  │    │    ├─ RAM Purge: {time.perf_counter() - t_purge:.4f}s")
 
-        print(f"  │    => Batch Total Time: {time.perf_counter() - t_batch_start:.4f}s\n")
+        print(f"  │    => Batch Iteration Total Time: {time.perf_counter() - t_batch_start:.4f}s\n")
         batch_counter += 1
 
-    print(f"\n=== HEADLESS EXPORT COMPLETE: {time.perf_counter() - total_time_start:.4f}s Total ===\n")
+    print(f"\n=== HEADLESS EXPORT COMPLETE: {time.perf_counter() - total_time_start:.4f}s Subprocess Execution ===\n")
     print("BATCH_STL_DONE", flush=True)
     sys.exit(0)
 
