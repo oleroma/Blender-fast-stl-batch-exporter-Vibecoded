@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import bpy
 from bpy_extras.io_utils import ExportHelper, ImportHelper
+from bpy.app.handlers import persistent
 
 # --- SESSION CLIPBOARD ---
 _clipboard = {
@@ -432,6 +433,12 @@ class BatchSTLExportPreset(bpy.types.PropertyGroup):
     mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem, description="List of collections mapped to this preset for batch export")
     mapping_index: bpy.props.IntProperty(name="Mapping Index", default=0, description="Select the active collection mapping to edit its overrides")
 
+    # --- PER-PRESET STATE TRACKING (For Parallel Background Exports) ---
+    is_exporting: bpy.props.BoolProperty(default=False)
+    cancel_export: bpy.props.BoolProperty(default=False)
+    export_progress: bpy.props.FloatProperty(name="Progress", default=0.0, min=0.0, max=1.0)
+    export_status: bpy.props.StringProperty(default="")
+
 
 # --- JSON UTILS ---
 
@@ -524,8 +531,15 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
         row = layout.row(align=True)
         row.prop(item, "name", text="", emboss=False)
         row.prop(item, "preset_prefix", text="", emboss=False, icon='FILE_FOLDER')
-        op = row.operator("export_scene.batch_stl_multi", text="", icon='EXPORT')
-        op.preset_index = index
+
+        if item.is_exporting:
+            # Replaces the export button with an inline progress slider and a dedicated cancel button per preset
+            row.prop(item, "export_progress", text=item.export_status, slider=True)
+            cancel_op = row.operator("batch_stl.cancel_export", text="", icon='CANCEL')
+            cancel_op.preset_index = index
+        else:
+            op = row.operator("export_scene.batch_stl_multi", text="", icon='EXPORT')
+            op.preset_index = index
 
 class BATCH_STL_UL_items(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
@@ -567,7 +581,11 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
         lst = context.scene.batch_stl_presets
         idx = context.scene.batch_stl_preset_index
         if self.action == 'ADD': lst.add(); context.scene.batch_stl_preset_index = len(lst) - 1
-        elif self.action == 'REMOVE' and lst: lst.remove(idx); context.scene.batch_stl_preset_index = max(0, idx - 1)
+        elif self.action == 'REMOVE' and lst:
+            if not lst[idx].is_exporting:
+                lst.remove(idx); context.scene.batch_stl_preset_index = max(0, idx - 1)
+            else:
+                self.report({'WARNING'}, "Cannot remove a preset while it is actively exporting.")
         elif self.action == 'UP' and idx > 0:
             lst.move(idx, 0 if self.shift_pressed else idx - 1)
             context.scene.batch_stl_preset_index = 0 if self.shift_pressed else idx - 1
@@ -862,12 +880,16 @@ class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
 class BATCH_STL_OT_cancel_export(bpy.types.Operator):
     bl_idname = "batch_stl.cancel_export"
     bl_label = "Cancel Export"
-    bl_description = "Abort the current batch export process"
+    bl_description = "Abort the batch export process for this preset"
+
+    preset_index: bpy.props.IntProperty(default=-1)
 
     def execute(self, context):
-        context.scene.cancel_export = True
-        if context.scene.batch_stl_verbose_console:
-            print("\n[!] Cancel request received. Terminating process...")
+        if 0 <= self.preset_index < len(context.scene.batch_stl_presets):
+            preset = context.scene.batch_stl_presets[self.preset_index]
+            preset.cancel_export = True
+            if context.scene.batch_stl_verbose_console:
+                print(f"\n[!] Cancel request received for preset '{preset.name}'. Terminating background worker...")
         return {'FINISHED'}
 
 
@@ -880,40 +902,40 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_options = {"REGISTER"}
     preset_index: bpy.props.IntProperty(default=-1)
 
-    _timer = None
-    process = None
-    total_operations = 1
-
     @classmethod
     def poll(cls, context):
-        return len(context.scene.batch_stl_presets) > 0 and not context.scene.is_exporting
+        return len(context.scene.batch_stl_presets) > 0
 
     def invoke(self, context, event):
-        if context.scene.is_exporting: return {'CANCELLED'}
-
+        # Localize variables to the instance to allow parallel concurrent execution
+        self._timer = None
+        self.process = None
+        self.total_operations = 1
         self.export_start_time = time.perf_counter()
         self.current_op = 0
         scene = context.scene
 
         self.preset_idx = self.preset_index if self.preset_index >= 0 else scene.batch_stl_preset_index
         if self.preset_idx < 0 or self.preset_idx >= len(scene.batch_stl_presets): return {"CANCELLED"}
-        preset = scene.batch_stl_presets[self.preset_idx]
+        self.preset = scene.batch_stl_presets[self.preset_idx]
+
+        if self.preset.is_exporting: return {'CANCELLED'}
 
         if not scene.batch_stl_root_dir:
             self.report({'ERROR'}, "Missing Root Directory")
             return {"CANCELLED"}
 
-        has_overrides = bool(preset.pinned_overrides) or any(bool(m.node_overrides) for m in preset.mappings)
+        has_overrides = bool(self.preset.pinned_overrides) or any(bool(m.node_overrides) for m in self.preset.mappings)
         verbose = scene.batch_stl_verbose_console
 
         if not has_overrides:
             # --- SYNCHRONOUS INLINE EXPORT ---
             root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
-            if preset.preset_prefix:
-                root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
+            if self.preset.preset_prefix:
+                root_dir = os.path.normpath(os.path.join(root_dir, self.preset.preset_prefix))
 
             total_objs = 0
-            for mapping in preset.mappings:
+            for mapping in self.preset.mappings:
                 if not mapping.collection_ptr: continue
                 if is_collection_excluded(context, mapping.collection_ptr): continue
                 excluded_names = {e.name for e in mapping.excluded_objects} if mapping.use_filter else set()
@@ -926,9 +948,9 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             exported_count = 0
 
             if verbose:
-                print(f"\n=== STARTING SYNCHRONOUS BATCH EXPORT: {preset.name} ===")
+                print(f"\n=== STARTING SYNCHRONOUS BATCH EXPORT: {self.preset.name} ===")
 
-            for mapping in preset.mappings:
+            for mapping in self.preset.mappings:
                 if not mapping.collection_ptr: continue
                 if is_collection_excluded(context, mapping.collection_ptr): continue
 
@@ -960,7 +982,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             context.window_manager.progress_end()
 
             total_time = time.perf_counter() - self.export_start_time
-            preset.last_export_time = total_time
+            self.preset.last_export_time = total_time
 
             if verbose:
                 print(f"=== SYNCHRONOUS BATCH EXPORT FULLY COMPLETE ===")
@@ -970,7 +992,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             return {'FINISHED'}
 
         # --- HEADLESS EXPORT (With Overrides) ---
-        context.scene.export_status = f"Spawning Headless Instance... (0.0s)"
+        self.preset.export_status = f"Spawning Worker... (0.0s)"
         t_spawn_start = time.perf_counter()
 
         self.temp_dir = tempfile.mkdtemp(prefix="fast_batch_stl_")
@@ -994,7 +1016,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
         spawn_time = time.perf_counter() - t_spawn_start
         if verbose:
-            print(f"\n=== INITIATING HEADLESS EXPORT ===")
+            print(f"\n=== INITIATING HEADLESS EXPORT FOR '{self.preset.name}' ===")
             print(f"  ├─ Temp blend file saved to {self.temp_dir}")
             print(f"  ├─ Spawned background Blender worker in {spawn_time:.4f}s")
 
@@ -1008,82 +1030,108 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         self.t.daemon = True
         self.t.start()
 
-        context.scene.is_exporting = True
-        context.scene.cancel_export = False
-        context.scene.export_progress = 0.0
+        self.preset.is_exporting = True
+        self.preset.cancel_export = False
+        self.preset.export_progress = 0.0
 
         self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
-        if context.scene.cancel_export or (event.type == 'ESC' and event.value == 'PRESS'):
-            if context.scene.batch_stl_verbose_console:
-                print("\n[!] Export cancelled by user. Terminating headless instance...")
-            if self.process: self.process.terminate()
-            self.cleanup(context)
-            self.report({'WARNING'}, "Export cancelled by user.")
-            return {'CANCELLED'}
-
-        if event.type == 'TIMER':
-            elapsed = time.perf_counter() - self.export_start_time
-
-            while True:
-                try: line = self.q.get_nowait()
-                except queue.Empty: break
-                else:
-                    line = line.rstrip('\r\n')
-                    if line.startswith("BATCH_STL_TOTAL:"):
-                        try: self.total_operations = int(line.split(":")[1])
-                        except Exception: pass
-                    elif line.startswith("BATCH_STL_PROGRESS:"):
-                        try:
-                            self.current_op = int(line.split(":")[1])
-                            context.scene.export_progress = self.current_op / max(1, self.total_operations)
-                        except Exception: pass
-                    elif line.startswith("BATCH_STL_DONE"):
-                        if self.process: self.process.terminate()
-                        self.cleanup(context)
-
-                        total_time = time.perf_counter() - self.export_start_time
-                        if 0 <= self.preset_idx < len(context.scene.batch_stl_presets):
-                            context.scene.batch_stl_presets[self.preset_idx].last_export_time = total_time
-
-                        if context.scene.batch_stl_verbose_console:
-                            print(f"  │    => Subprocess termination complete.")
-                            print(f"=== BATCH EXPORT FULLY COMPLETE ===")
-                            print(f"Total Wall-Clock Time (Button Press to Finish): {total_time:.4f}s\n")
-
-                        self.report({'INFO'}, f"Batch Export Complete in {total_time:.2f}s.")
-                        for area in context.screen.areas: area.tag_redraw()
-                        return {'FINISHED'}
-                    elif line:
-                        if context.scene.batch_stl_verbose_console:
-                            print(line)
-
-            if context.scene.is_exporting:
-                if self.total_operations > 1 or self.current_op > 0:
-                    context.scene.export_status = f"Exporting: Obj {self.current_op} / {self.total_operations} | Time: {elapsed:.1f}s"
-                else:
-                    context.scene.export_status = f"Spawning Headless Worker... ({elapsed:.1f}s)"
-
-            if self.process.poll() is not None:
+        try:
+            if self.preset.cancel_export:
                 self.cleanup(context)
-                self.report({'INFO'}, "Batch Export Stopped.")
-                return {'FINISHED'}
+                self.report({'WARNING'}, f"Export cancelled for {self.preset.name}.")
+                return {'CANCELLED'}
+
+            if event.type == 'TIMER':
+                elapsed = time.perf_counter() - self.export_start_time
+
+                while True:
+                    try: line = self.q.get_nowait()
+                    except queue.Empty: break
+                    else:
+                        line = line.rstrip('\r\n')
+                        if line.startswith("BATCH_STL_TOTAL:"):
+                            try: self.total_operations = int(line.split(":")[1])
+                            except Exception: pass
+                        elif line.startswith("BATCH_STL_PROGRESS:"):
+                            try:
+                                self.current_op = int(line.split(":")[1])
+                                self.preset.export_progress = self.current_op / max(1, self.total_operations)
+                            except Exception: pass
+                        elif line.startswith("BATCH_STL_DONE"):
+                            self.cleanup(context)
+
+                            total_time = time.perf_counter() - self.export_start_time
+                            self.preset.last_export_time = total_time
+
+                            if context.scene.batch_stl_verbose_console:
+                                print(f"  │    => Subprocess termination complete for {self.preset.name}.")
+                                print(f"=== BATCH EXPORT FULLY COMPLETE ===")
+                                print(f"Total Wall-Clock Time: {total_time:.4f}s\n")
+
+                            self.report({'INFO'}, f"Batch Export {self.preset.name} Complete in {total_time:.2f}s.")
+                            for area in context.screen.areas: area.tag_redraw()
+                            return {'FINISHED'}
+                        elif line:
+                            if context.scene.batch_stl_verbose_console:
+                                print(f"[{self.preset.name}] {line}")
+
+                if self.preset.is_exporting:
+                    if self.total_operations > 1 or self.current_op > 0:
+                        self.preset.export_status = f"Obj {self.current_op}/{self.total_operations} | {elapsed:.1f}s"
+                    else:
+                        self.preset.export_status = f"Spawning Worker... ({elapsed:.1f}s)"
+
+                # Detect if the headless process crashed unexpectedly (e.g., memory overflow)
+                if self.process and self.process.poll() is not None:
+                    self.cleanup(context)
+                    self.report({'ERROR'}, f"Background worker crashed for preset {self.preset.name}.")
+                    return {'CANCELLED'}
+
+        except ReferenceError:
+            # The preset was somehow deleted by another script
+            self.cleanup(context)
+            return {'CANCELLED'}
+        except Exception as e:
+            print(f"\n[!] Fast Batch STL Error ({self.preset.name if hasattr(self, 'preset') else 'Unknown'}): {e}")
+            self.cleanup(context)
+            self.report({'ERROR'}, "Unexpected error during batch export.")
+            return {'CANCELLED'}
 
         return {'PASS_THROUGH'}
 
     def cleanup(self, context=None):
-        if context and self._timer:
-            context.window_manager.event_timer_remove(self._timer)
-            self._timer = None
-        if context: context.scene.is_exporting = False
+        if context:
+            if getattr(self, '_timer', None):
+                context.window_manager.event_timer_remove(self._timer)
+                self._timer = None
 
+            try:
+                self.preset.is_exporting = False
+                self.preset.cancel_export = False
+                self.preset.export_progress = 0.0
+                self.preset.export_status = ""
+            except ReferenceError:
+                pass
+
+        # Aggressively kill process instead of just terminating it
+        if getattr(self, 'process', None):
+            try:
+                if self.process.poll() is None:
+                    self.process.kill()
+            except Exception:
+                pass
+
+        # Ensure temp directories are purged even if interrupted mid-write
         try:
-            if os.path.exists(self.temp_blend): os.remove(self.temp_blend)
-            os.rmdir(self.temp_dir)
-        except Exception as e:
+            if hasattr(self, 'temp_blend') and os.path.exists(self.temp_blend):
+                os.remove(self.temp_blend)
+            if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
+                os.rmdir(self.temp_dir)
+        except Exception:
             pass
 
 
@@ -1176,18 +1224,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
-
-        if scene.is_exporting:
-            prog_box = layout.box()
-            prog_box.label(text=scene.export_status, icon='INFO')
-
-            prog_row = prog_box.row()
-            prog_row.enabled = False
-            prog_row.prop(scene, "export_progress", slider=True, text="")
-
-            prog_box.operator("batch_stl.cancel_export", icon='CANCEL', text="Cancel Export (or ESC)")
-            layout = layout.column()
-            layout.enabled = False
 
         dir_row = layout.row(align=True)
         dir_row.operator("batch_stl.import_presets_json", text="", icon='IMPORT')
@@ -1322,6 +1358,18 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
 # --- REGISTRATION ---
 
+@persistent
+def reset_batch_stl_state(scene):
+    """Force flush export UI lock on file load or crash recovery."""
+    try:
+        for p in bpy.context.scene.batch_stl_presets:
+            p.is_exporting = False
+            p.cancel_export = False
+            p.export_progress = 0.0
+            p.export_status = ""
+    except Exception:
+        pass
+
 classes = (
     BatchSTLNodeInput, BatchSTLNodeOverride, BatchSTLExcludedObject, BatchSTLExportItem, BatchSTLExportPreset,
     BATCH_STL_UL_items, BATCH_STL_UL_presets,
@@ -1338,18 +1386,23 @@ def register():
     bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset, description="List of all batch export presets")
     bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0, description="Select the active batch export preset to edit")
 
-    bpy.types.Scene.is_exporting = bpy.props.BoolProperty(default=False)
-    bpy.types.Scene.cancel_export = bpy.props.BoolProperty(default=False)
-    bpy.types.Scene.export_progress = bpy.props.FloatProperty(name="Progress", default=0.0, min=0.0, max=1.0)
-    bpy.types.Scene.export_status = bpy.props.StringProperty(default="")
-
     bpy.types.Scene.batch_stl_verbose_console = bpy.props.BoolProperty(
         name="Verbose Console Output",
         default=False,
         description="Print granular timing statistics and evaluation logs to the system console during export"
     )
 
+    # 1. Flush state immediately upon script reload
+    reset_batch_stl_state(None)
+
+    # 2. Bind to load_post to flush state when opening a .blend file
+    if reset_batch_stl_state not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(reset_batch_stl_state)
+
 def unregister():
+    if reset_batch_stl_state in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(reset_batch_stl_state)
+
     for cls in reversed(classes):
         try:
             bpy.utils.unregister_class(cls)
@@ -1360,10 +1413,6 @@ def unregister():
         "batch_stl_root_dir",
         "batch_stl_presets",
         "batch_stl_preset_index",
-        "is_exporting",
-        "cancel_export",
-        "export_progress",
-        "export_status",
         "batch_stl_verbose_console"
     ]
 
