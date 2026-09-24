@@ -541,7 +541,6 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
         row.prop(item, "preset_prefix", text="", emboss=False, icon='FILE_FOLDER')
 
         if item.is_exporting:
-            # Replaces the export button with an inline progress slider and a dedicated cancel button per preset
             row.prop(item, "export_progress", text=item.export_status, slider=True)
             cancel_op = row.operator("batch_stl.cancel_export", text="", icon='CANCEL')
             cancel_op.preset_index = index
@@ -960,10 +959,9 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             self.report({'ERROR'}, "Missing Root Directory")
             return {"CANCELLED"}
 
-        # Clear log and switch displays automatically
+        # Clear log and auto-expand console on export start
         self.preset.console_logs.clear()
         context.scene.batch_stl_show_console = True
-        context.scene.batch_stl_show_tree = False
 
         has_overrides = bool(self.preset.pinned_overrides) or any(bool(m.node_overrides) for m in self.preset.mappings)
         verbose = scene.batch_stl_verbose_console
@@ -1366,9 +1364,9 @@ def draw_override_block(layout, ovr, o_idx, is_pinned, freq_dict=None):
 
         key = (ovr.override_target, ovr.node_name, inp.input_name)
         if freq_dict.get(key, 0) > 1:
+            irow.prop(inp, "use_dir", text="", icon='FILE_FOLDER')
             irow.prop(inp, "use_tag", text="", icon='BOOKMARKS')
             irow.prop(inp, "tag", text="")
-            irow.prop(inp, "use_dir", text="", icon='FILE_FOLDER')
 
         for action, icon in [('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'TRASH')]:
             op = irow.operator("batch_stl.input_actions", text="", icon=icon)
@@ -1393,27 +1391,21 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         dir_row = layout.row(align=True)
         dir_row.operator("batch_stl.import_presets_json", text="", icon='IMPORT')
         dir_row.operator("batch_stl.export_presets_json", text="", icon='EXPORT')
+        dir_row.prop(scene, "batch_stl_show_console", text="", icon='CONSOLE', toggle=True)
         dir_row.prop(scene, "batch_stl_root_dir")
-
-        layout.separator()
 
         active_preset = get_active_preset(scene)
 
-        # --- CONSOLE COLLAPSIBLE BOX (TOP) ---
-        c_box = layout.box()
-        c_header = c_box.row()
-        icon_c = 'TRIA_DOWN' if scene.batch_stl_show_console else 'TRIA_RIGHT'
-        c_header.prop(scene, "batch_stl_show_console", text="", icon=icon_c, emboss=False)
-        c_header.label(text="Export Console Log", icon='CONSOLE')
-
         if scene.batch_stl_show_console:
+            c_box = layout.box()
+            c_box.label(text="Global Export Console Log", icon='CONSOLE')
             if active_preset:
                 c_box.template_list("BATCH_STL_UL_console_logs", "", active_preset, "console_logs", active_preset, "console_index", rows=6)
                 c_box.operator("batch_stl.clear_console", text="Clear Log", icon='TRASH')
             else:
                 c_box.label(text="Select a preset to view logs.")
 
-        layout.separator(factor=0.5)
+        layout.separator()
 
         # --- PRESETS COLLAPSIBLE BOX ---
         p_box = layout.box()
@@ -1474,14 +1466,18 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                     if active_item.use_filter:
                         filter_box = m_box.box()
                         f_header = filter_box.row()
+                        icon_f = 'TRIA_DOWN' if scene.batch_stl_ui_exclude else 'TRIA_RIGHT'
+                        f_header.prop(scene, "batch_stl_ui_exclude", text="", icon=icon_f, emboss=False)
                         f_header.label(text="Exclude Objects:", icon='FILTER')
-                        col = filter_box.column(align=True)
-                        for obj in active_item.collection_ptr.all_objects:
-                            if obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}: continue
-                            is_excl = any(e.name == obj.name for e in active_item.excluded_objects)
-                            icon_btn = 'CHECKBOX_DEHLT' if is_excl else 'CHECKBOX_HLT'
-                            op = col.operator("batch_stl.toggle_exclusion", text=obj.name, icon=icon_btn, depress=not is_excl)
-                            op.object_name = obj.name
+
+                        if scene.batch_stl_ui_exclude:
+                            col = filter_box.column(align=True)
+                            for obj in active_item.collection_ptr.all_objects:
+                                if obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}: continue
+                                is_excl = any(e.name == obj.name for e in active_item.excluded_objects)
+                                icon_btn = 'CHECKBOX_DEHLT' if is_excl else 'CHECKBOX_HLT'
+                                op = col.operator("batch_stl.toggle_exclusion", text=obj.name, icon=icon_btn, depress=not is_excl)
+                                op.object_name = obj.name
 
         layout.separator()
 
@@ -1578,18 +1574,15 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             lines = get_tree_lines(tree_dict)
             col = t_box.column(align=True)
             for line in lines:
-                col.label(text=line)
+                row = col.row(align=True)
+                row.scale_y = 0.55  # Compresses vertical height to make tree spacing minimal
+                row.label(text=line)
 
         layout.separator()
         layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
 
 
 # --- REGISTRATION ---
-
-def on_preset_index_update(self, context):
-    """Switch display view back to Tree whenever the user switches presets."""
-    context.scene.batch_stl_show_tree = True
-    context.scene.batch_stl_show_console = False
 
 @persistent
 def reset_batch_stl_state(scene):
@@ -1620,8 +1613,7 @@ def register():
     bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(
         name="Active Preset",
         default=0,
-        description="Select the active batch export preset to edit",
-        update=on_preset_index_update
+        description="Select the active batch export preset to edit"
     )
 
     bpy.types.Scene.batch_stl_verbose_console = bpy.props.BoolProperty(
@@ -1635,6 +1627,7 @@ def register():
     bpy.types.Scene.batch_stl_ui_mappings = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_global_ovr = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_local_ovr = bpy.props.BoolProperty(default=True)
+    bpy.types.Scene.batch_stl_ui_exclude = bpy.props.BoolProperty(default=True)
 
     bpy.types.Scene.batch_stl_show_tree = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_show_console = bpy.props.BoolProperty(default=False)
@@ -1665,6 +1658,7 @@ def unregister():
         "batch_stl_ui_mappings",
         "batch_stl_ui_global_ovr",
         "batch_stl_ui_local_ovr",
+        "batch_stl_ui_exclude",
         "batch_stl_show_tree",
         "batch_stl_show_console"
     ]
