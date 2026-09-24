@@ -14,3 +14,6 @@
 - **Never Run Raw CLI:** Do not run terminal bash commands for Blender. Use the MCP tool explicitly.
 - **Standard Test Harness:** When testing, instruct the MCP server to run `test_harness.py`. 
 - If the MCP run returns an error, trace the error, apply the fix in `__init__.py`, and re-run verification before returning the response to the user.
+
+## Extension documentation
+Use 'extension_architecture.md' and 'README.md' for all necessary information. After implementing anything, update those files to reflect changes.
