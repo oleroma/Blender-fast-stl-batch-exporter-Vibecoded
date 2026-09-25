@@ -172,11 +172,7 @@ def parse_sweep_values(ovr, inp):
     elif inp.override_type == 'MENU':
         items = []
         if ovr.parent_group_ptr:
-            if ovr.override_target == 'NODE' and ovr.node_name:
-                node = ovr.parent_group_ptr.nodes.get(ovr.node_name)
-                if node and hasattr(node, 'enum_items'):
-                    items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in node.enum_items]
-            elif ovr.override_target == 'NODE' and not ovr.node_name:
+            if ovr.override_target == 'MODIFIER':
                 for node in ovr.parent_group_ptr.nodes:
                     if node.type == 'MENU_SWITCH' and hasattr(node, 'enum_items'):
                         for sock in node.inputs:
@@ -185,6 +181,23 @@ def parse_sweep_values(ovr, inp):
                                     items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in node.enum_items]
                                     break
                             if items: break
+                    if items: break
+            elif ovr.override_target == 'NODE' and ovr.node_name:
+                for n_name in [n.strip() for n in ovr.node_name.split(',') if n.strip()]:
+                    node = ovr.parent_group_ptr.nodes.get(n_name)
+                    if node:
+                        if node.type == 'MENU_SWITCH' and hasattr(node, 'enum_items'):
+                            items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in node.enum_items]
+                        elif node.type == 'GROUP' and hasattr(node, 'node_tree') and node.node_tree:
+                            for inner_node in node.node_tree.nodes:
+                                if inner_node.type == 'MENU_SWITCH' and hasattr(inner_node, 'enum_items'):
+                                    for sock in inner_node.inputs:
+                                        for link in sock.links:
+                                            if link.from_node.type == 'GROUP_INPUT' and link.from_socket.name == inp.input_name:
+                                                items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in inner_node.enum_items]
+                                                break
+                                        if items: break
+                                if items: break
                     if items: break
         return items if items else [""]
     return []
@@ -240,26 +253,8 @@ def apply_overrides(overrides, target_objects, dry_run=False):
     trees_to_update = set()
 
     for override in overrides:
-        if override.override_target == 'NODE' and override.parent_group_ptr:
+        if override.override_target == 'NODE' and override.parent_group_ptr and override.node_name:
             parent_tree = override.parent_group_ptr
-            if not override.node_name:
-                for inp in override.inputs:
-                    val = get_input_value(inp)
-                    if val is None: continue
-                    for node in parent_tree.nodes:
-                        if node.type == 'GROUP_INPUT':
-                            socket = node.outputs.get(inp.input_name)
-                            if socket:
-                                for link in list(socket.links):
-                                    to_socket = link.to_socket
-                                    from_socket = link.from_socket
-                                    global_states.append(('SOCKET', to_socket, to_socket.default_value, from_socket, parent_tree))
-                                    if not dry_run:
-                                        parent_tree.links.remove(link)
-                                        to_socket.default_value = val
-                if not dry_run: trees_to_update.add(parent_tree)
-                continue
-
             for n_name in [n.strip() for n in override.node_name.split(',') if n.strip()]:
                 target_node = parent_tree.nodes.get(n_name)
                 if not target_node: continue
@@ -723,9 +718,9 @@ def on_input_name_update(self, context):
             if ovr: break
 
         if ovr and ovr.parent_group_ptr:
-            if ovr.override_target == 'NODE':
-                if ovr.node_name:
-                    node = ovr.parent_group_ptr.nodes.get(ovr.node_name)
+            if ovr.override_target == 'NODE' and ovr.node_name:
+                for n_name in [n.strip() for n in ovr.node_name.split(',') if n.strip()]:
+                    node = ovr.parent_group_ptr.nodes.get(n_name)
                     if node and self.input_name in node.inputs:
                         s_type = node.inputs[self.input_name].type
                         if s_type in ['VALUE', 'FLOAT']: self.override_type = 'FLOAT'
@@ -733,16 +728,26 @@ def on_input_name_update(self, context):
                         elif s_type == 'BOOLEAN': self.override_type = 'BOOLEAN'
                         elif s_type == 'STRING': self.override_type = 'STRING'
                         elif s_type == 'MENU': self.override_type = 'MENU'
+                        break
+            elif ovr.override_target == 'MODIFIER':
+                if hasattr(ovr.parent_group_ptr, "interface"):
+                    item = ovr.parent_group_ptr.interface.items_tree.get(self.input_name)
+                    if item:
+                        s_type = getattr(item, "socket_type", "")
+                        if 'Float' in s_type: self.override_type = 'FLOAT'
+                        elif 'Int' in s_type: self.override_type = 'INT'
+                        elif 'Bool' in s_type: self.override_type = 'BOOLEAN'
+                        elif 'String' in s_type: self.override_type = 'STRING'
+                        elif 'Menu' in s_type: self.override_type = 'MENU'
                 else:
-                    if hasattr(ovr.parent_group_ptr, "interface"):
-                        item = ovr.parent_group_ptr.interface.items_tree.get(self.input_name)
-                        if item:
-                            s_type = getattr(item, "socket_type", "")
-                            if 'Float' in s_type: self.override_type = 'FLOAT'
-                            elif 'Int' in s_type: self.override_type = 'INT'
-                            elif 'Bool' in s_type: self.override_type = 'BOOLEAN'
-                            elif 'String' in s_type: self.override_type = 'STRING'
-                            elif 'Menu' in s_type: self.override_type = 'MENU'
+                    inp = ovr.parent_group_ptr.inputs.get(self.input_name)
+                    if inp:
+                        s_type = inp.type
+                        if s_type in ['VALUE', 'FLOAT']: self.override_type = 'FLOAT'
+                        elif s_type == 'INT': self.override_type = 'INT'
+                        elif s_type == 'BOOLEAN': self.override_type = 'BOOLEAN'
+                        elif s_type == 'STRING': self.override_type = 'STRING'
+                        elif s_type == 'MENU': self.override_type = 'MENU'
     except Exception: pass
 
 class BatchSTLLogLine(bpy.types.PropertyGroup):
@@ -977,10 +982,12 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
                 if ovr.parent_group_ptr:
                     inputs_to_add = []
                     if ovr.override_target == 'NODE' and ovr.node_name:
-                        node = ovr.parent_group_ptr.nodes.get(ovr.node_name)
-                        if node:
-                            for inp in node.inputs: inputs_to_add.append((inp.name, inp.type))
-                    else:
+                        for n_name in [n.strip() for n in ovr.node_name.split(',') if n.strip()]:
+                            node = ovr.parent_group_ptr.nodes.get(n_name)
+                            if node:
+                                for inp in node.inputs: inputs_to_add.append((inp.name, inp.type))
+                                break
+                    elif ovr.override_target == 'MODIFIER':
                         if hasattr(ovr.parent_group_ptr, "interface"):
                             for item in ovr.parent_group_ptr.interface.items_tree:
                                 if getattr(item, "item_type", "") == 'SOCKET' and item.in_out == 'INPUT':
@@ -1393,56 +1400,64 @@ def draw_override_block(layout, ovr, o_idx, is_pinned, freq_dict=None):
         op.action, op.override_index, op.is_pinned = action, o_idx, is_pinned
 
     inputs_box = ovr_box.box()
-    target_node = ovr.parent_group_ptr.nodes.get(ovr.node_name) if ovr.override_target == 'NODE' and ovr.parent_group_ptr and ovr.node_name else None
+    target_node = None
+    is_valid_target = False
 
-    for i_idx, inp in enumerate(ovr.inputs):
-        irow = inputs_box.row(align=True)
-        irow.label(icon='FORWARD')
+    if ovr.parent_group_ptr:
+        if ovr.override_target == 'MODIFIER':
+            is_valid_target = True
+        elif ovr.override_target == 'NODE' and ovr.node_name:
+            for n_name in [n.strip() for n in ovr.node_name.split(',') if n.strip()]:
+                target_node = ovr.parent_group_ptr.nodes.get(n_name)
+                if target_node:
+                    is_valid_target = True
+                    break
 
-        if ovr.override_target == 'NODE' and ovr.parent_group_ptr:
-            if ovr.node_name:
+    if is_valid_target:
+        for i_idx, inp in enumerate(ovr.inputs):
+            irow = inputs_box.row(align=True)
+            irow.label(icon='FORWARD')
+
+            if ovr.override_target == 'NODE':
                 if target_node: irow.prop_search(inp, "input_name", target_node, "inputs", text="")
                 else: irow.prop(inp, "input_name", text="")
+            elif ovr.override_target == 'MODIFIER':
+                if hasattr(ovr.parent_group_ptr, "interface"): irow.prop_search(inp, "input_name", ovr.parent_group_ptr.interface, "items_tree", text="")
+                else: irow.prop_search(inp, "input_name", ovr.parent_group_ptr, "inputs", text="")
+            else: irow.prop(inp, "input_name", text="")
+
+            op = irow.operator("batch_stl.toggle_sweep", text="", icon='FILE_REFRESH', depress=inp.use_sweep)
+            op.override_index = o_idx
+            op.input_index = i_idx
+            op.is_pinned = is_pinned
+
+            if getattr(inp, "use_sweep", False):
+                if inp.override_type in ['INT', 'FLOAT', 'STRING']: irow.prop(inp, "sweep_range", text="")
+                elif inp.override_type == 'BOOLEAN': irow.label(text="True & False")
+                elif inp.override_type == 'MENU': irow.label(text="All Menu Items")
             else:
-                if hasattr(ovr.parent_group_ptr, "interface"):
-                    irow.prop_search(inp, "input_name", ovr.parent_group_ptr.interface, "items_tree", text="")
-                else:
-                    irow.prop_search(inp, "input_name", ovr.parent_group_ptr, "inputs", text="")
-        elif ovr.override_target == 'MODIFIER' and ovr.parent_group_ptr:
-            if hasattr(ovr.parent_group_ptr, "interface"): irow.prop_search(inp, "input_name", ovr.parent_group_ptr.interface, "items_tree", text="")
-            else: irow.prop_search(inp, "input_name", ovr.parent_group_ptr, "inputs", text="")
-        else: irow.prop(inp, "input_name", text="")
+                if inp.override_type == 'BOOLEAN': irow.prop(inp, "value_bool", text="True" if inp.value_bool else "False", toggle=True)
+                elif inp.override_type == 'INT': irow.prop(inp, "value_int", text="")
+                elif inp.override_type == 'FLOAT': irow.prop(inp, "value_float", text="")
+                elif inp.override_type == 'STRING': irow.prop(inp, "value_string", text="")
+                elif inp.override_type == 'MENU': irow.prop(inp, "value_menu", text="")
 
-        op = irow.operator("batch_stl.toggle_sweep", text="", icon='FILE_REFRESH', depress=inp.use_sweep)
-        op.override_index = o_idx
-        op.input_index = i_idx
-        op.is_pinned = is_pinned
+            key = (ovr.override_target, ovr.node_name, inp.input_name)
+            if freq_dict.get(key, 0) > 1:
+                irow.prop(inp, "use_dir", text="", icon='FILE_FOLDER')
+                irow.prop(inp, "use_tag", text="", icon='BOOKMARKS')
+                irow.prop(inp, "tag", text="")
 
-        if getattr(inp, "use_sweep", False):
-            if inp.override_type in ['INT', 'FLOAT', 'STRING']: irow.prop(inp, "sweep_range", text="")
-            elif inp.override_type == 'BOOLEAN': irow.label(text="True & False")
-            elif inp.override_type == 'MENU': irow.label(text="All Menu Items")
-        else:
-            if inp.override_type == 'BOOLEAN': irow.prop(inp, "value_bool", text="True" if inp.value_bool else "False", toggle=True)
-            elif inp.override_type == 'INT': irow.prop(inp, "value_int", text="")
-            elif inp.override_type == 'FLOAT': irow.prop(inp, "value_float", text="")
-            elif inp.override_type == 'STRING': irow.prop(inp, "value_string", text="")
-            elif inp.override_type == 'MENU': irow.prop(inp, "value_menu", text="")
+            for action, icon in [('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'TRASH')]:
+                op = irow.operator("batch_stl.input_actions", text="", icon=icon)
+                op.action, op.override_index, op.input_index, op.is_pinned = action, o_idx, i_idx, is_pinned
 
-        key = (ovr.override_target, ovr.node_name, inp.input_name)
-        if freq_dict.get(key, 0) > 1:
-            irow.prop(inp, "use_dir", text="", icon='FILE_FOLDER')
-            irow.prop(inp, "use_tag", text="", icon='BOOKMARKS')
-            irow.prop(inp, "tag", text="")
-
-        for action, icon in [('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'TRASH')]:
-            op = irow.operator("batch_stl.input_actions", text="", icon=icon)
-            op.action, op.override_index, op.input_index, op.is_pinned = action, o_idx, i_idx, is_pinned
-
-    add_row = inputs_box.row(align=True)
-    for action, icon in [('ADD', 'PLUS'), ('PASTE', 'PASTEDOWN')]:
-        op = add_row.operator("batch_stl.input_actions", text="", icon=icon)
-        op.action, op.override_index, op.input_index, op.is_pinned = action, o_idx, -1, is_pinned
+        add_row = inputs_box.row(align=True)
+        for action, icon in [('ADD', 'PLUS'), ('PASTE', 'PASTEDOWN')]:
+            op = add_row.operator("batch_stl.input_actions", text="", icon=icon)
+            op.action, op.override_index, op.input_index, op.is_pinned = action, o_idx, -1, is_pinned
+    else:
+        inputs_box.label(text="Specify valid Group and Node/Modifier to add inputs.", icon='INFO')
 
 
 class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
