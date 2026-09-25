@@ -124,7 +124,6 @@ def get_override_signature(overrides):
 # --- PERMUTATION ENGINE ---
 class MockInput:
     def __init__(self, base_inp, override_val):
-        self.base_inp = base_inp
         self.input_name = base_inp.input_name
         self.override_type = base_inp.override_type
         self.use_tag = base_inp.use_tag
@@ -216,14 +215,22 @@ def generate_override_combinations(overrides):
         value_groups = {}
         for ovr, inp in pairs:
             if getattr(inp, "use_sweep", False):
-                for val in parse_sweep_values(ovr, inp):
+                sweep_vals = parse_sweep_values(ovr, inp)
+                is_repeating = len(sweep_vals) > 1
+                for val in sweep_vals:
                     mock_inp = MockInput(inp, val)
+                    if not is_repeating:
+                        mock_inp.use_tag = False
+                        mock_inp.use_dir = False
                     if val not in value_groups: value_groups[val] = []
                     value_groups[val].append((ovr, mock_inp))
             else:
                 val = get_input_value(inp)
+                mock_inp = MockInput(inp, val)
+                mock_inp.use_tag = False
+                mock_inp.use_dir = False
                 if val not in value_groups: value_groups[val] = []
-                value_groups[val].append((ovr, inp))
+                value_groups[val].append((ovr, mock_inp))
         pools.append(list(value_groups.values()))
 
     if not pools: return [[]]
@@ -442,29 +449,24 @@ def paste_preset_from_dict(new_p, data):
 # --- TREE VISUALIZER LOGIC ---
 def build_tree_dict(scene, preset):
     root_name = bpy.path.abspath(scene.batch_stl_root_dir) if scene.batch_stl_root_dir else "//"
-    tree = {"children": {}, "files": [], "text_before": root_name, "text_after": "", "ptr": scene, "prop": "batch_stl_root_dir"}
+    tree = {}
     all_filepaths = set()
     duplicates = set()
 
     current_root = tree
     if preset.preset_prefix:
-        key = preset.preset_prefix
-        if key not in current_root["children"]:
-            current_root["children"][key] = {"children": {}, "files": [], "text_before": key, "text_after": "", "ptr": preset, "prop": "preset_prefix"}
-        current_root = current_root["children"][key]
+        current_root[preset.preset_prefix] = {}
+        current_root = current_root[preset.preset_prefix]
 
     for mapping in preset.mappings:
         mapping_root = current_root
         mapping_root_path = []
         if mapping.sub_path:
             parts = mapping.sub_path.replace('\\', '/').split('/')
-            for i, part in enumerate(parts):
+            for part in parts:
                 if part:
-                    if part not in mapping_root["children"]:
-                        ptr = mapping if i == len(parts) - 1 else None
-                        prop = "sub_path" if i == len(parts) - 1 else ""
-                        mapping_root["children"][part] = {"children": {}, "files": [], "text_before": part, "text_after": "", "ptr": ptr, "prop": prop}
-                    mapping_root = mapping_root["children"][part]
+                    if part not in mapping_root: mapping_root[part] = {}
+                    mapping_root = mapping_root[part]
                     mapping_root_path.append(part)
 
         all_overrides = list(preset.pinned_overrides) + list(mapping.node_overrides)
@@ -489,34 +491,20 @@ def build_tree_dict(scene, preset):
                 if param_key not in processed_params:
                     val = get_input_value(inp)
                     val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
-                    text_before = ""
-                    text_after = ""
                     if inp.tag:
-                        if inp.tag.startswith("_"): 
-                            naming_str = val_str + inp.tag
-                            text_before = val_str
-                        elif inp.tag.endswith("_"): 
-                            naming_str = inp.tag + val_str
-                            text_after = val_str
-                        else: 
-                            naming_str = inp.tag
-                    else: 
-                        naming_str = val_str
-                        text_before = val_str
+                        if inp.tag.startswith("_"): naming_str = val_str + inp.tag
+                        elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
+                        else: naming_str = inp.tag
+                    else: naming_str = val_str
 
                     if getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
                     if getattr(inp, "use_dir", False):
-                        if naming_str not in combo_root["children"]:
-                            base_inp = getattr(inp, "base_inp", inp)
-                            combo_root["children"][naming_str] = {
-                                "children": {}, "files": [], 
-                                "text_before": text_before, "text_after": text_after, 
-                                "ptr": base_inp, "prop": "tag"
-                            }
-                        combo_root = combo_root["children"][naming_str]
+                        if naming_str not in combo_root: combo_root[naming_str] = {}
+                        combo_root = combo_root[naming_str]
                         combo_subpath.append(naming_str)
                     processed_params.add(param_key)
 
+            if '_files' not in combo_root: combo_root['_files'] = []
             base_tag = mapping.tag if getattr(mapping, "use_tag", False) and mapping.tag else ""
             final_tag = base_tag + combo_suffix
 
@@ -527,70 +515,56 @@ def build_tree_dict(scene, preset):
 
             for obj in valid_objs:
                 filename = f"{bpy.path.clean_name(obj.name)}{final_tag}.stl"
+                combo_root['_files'].append(filename)
                 full_path = os.path.join(dir_path_str, filename)
                 if full_path in all_filepaths: duplicates.add(full_path)
                 else: all_filepaths.add(full_path)
 
-                if getattr(mapping, "use_tag", False):
-                    file_node = {
-                        "text_before": bpy.path.clean_name(obj.name), 
-                        "text_after": combo_suffix + ".stl",
-                        "ptr": mapping, 
-                        "prop": "tag"
-                    }
-                else:
-                    file_node = {
-                        "text_before": filename,
-                        "text_after": "",
-                        "ptr": None,
-                        "prop": ""
-                    }
-                combo_root["files"].append(file_node)
+    return {root_name: tree}, duplicates
 
-    return {"root": tree}, duplicates
+def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None):
+    if toggled_list is None:
+        try:
+            import json
+            toggled_list = json.loads(bpy.context.scene.batch_stl_collapsed_dirs)
+        except Exception:
+            toggled_list = []
 
-def get_tree_lines(tree_dict):
-    def traverse(d_node, prefix=""):
-        lines = []
-        dirs = list(d_node.get("children", {}).values())
-        files = d_node.get("files", [])
-        total_items = len(dirs) + len(files)
-        current_item = 0
+    dirs = [k for k in tree_node.keys() if k != '_files']
+    files = tree_node.get('_files', [])
+    for k in dirs:
+        dir_path = current_path + "/" + k
         
-        for child in dirs:
-            current_item += 1
-            is_last = (current_item == total_items)
-            connector = "└── " if is_last else "├── "
+        default_expanded = (k == dirs[-1])
+        is_expanded = default_expanded
+        if dir_path in toggled_list:
+            is_expanded = not default_expanded
             
-            line_data = child.copy()
-            line_data["prefix"] = prefix + connector
-            line_data["icon"] = 'FILE_FOLDER'
-            lines.append(line_data)
-            
-            extension = "    " if is_last else "│   "
-            lines.extend(traverse(child, prefix + extension))
-            
-        for f in files:
-            current_item += 1
-            is_last = (current_item == total_items)
-            connector = "└── " if is_last else "├── "
-            
-            line_data = f.copy()
-            line_data["prefix"] = prefix + connector
-            line_data["icon"] = 'MESH_DATA'
-            lines.append(line_data)
-            
-        return lines
+        is_collapsed = not is_expanded
 
-    result_lines = []
-    root_node = tree_dict.get("root", {})
-    if root_node:
-        root_data = root_node.copy()
-        root_data["prefix"] = ""
-        root_data["icon"] = 'FILE_FOLDER'
-        result_lines.append(root_data)
-        result_lines.extend(traverse(root_node, ""))
-    return result_lines
+        split = layout.split(factor=0.005)
+        split.column() # Spacer for extra indentation
+        col = split.column()
+        
+        box = col.box()
+        row = box.row()
+        
+        icon = 'TRIA_RIGHT' if is_collapsed else 'TRIA_DOWN'
+        op = row.operator("batch_stl.toggle_dir_tree", text="", icon=icon, emboss=False)
+        op.dir_path = dir_path
+        
+        row.scale_y = 0.4
+        row.label(text=str(k))
+        if not is_collapsed and isinstance(tree_node[k], dict):
+            draw_tree_dict(box, tree_node[k], dir_path, toggled_list)
+    for f in files:
+        split = layout.split(factor=0.025)
+        split.column()
+        col = split.column()
+        
+        row = col.row()
+        row.scale_y = 0.4
+        row.label(text=str(f))
 
 # --- HEADLESS EXPORT EXECUTION ROUTINE ---
 def run_headless_export(preset_index):
@@ -1274,6 +1248,29 @@ class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
                 bpy.ops.ed.undo_push(message=f"Exclude '{self.object_name}' from Export")
         return {'FINISHED'}
 
+class BATCH_STL_OT_toggle_dir_tree(bpy.types.Operator):
+    bl_idname = "batch_stl.toggle_dir_tree"
+    bl_label = "Toggle Directory Tree"
+    bl_options = {'INTERNAL'}
+
+    dir_path: bpy.props.StringProperty()
+
+    def execute(self, context):
+        import json
+        scene = context.scene
+        try:
+            collapsed = json.loads(scene.batch_stl_collapsed_dirs)
+        except Exception:
+            collapsed = []
+            
+        if self.dir_path in collapsed:
+            collapsed.remove(self.dir_path)
+        else:
+            collapsed.append(self.dir_path)
+            
+        scene.batch_stl_collapsed_dirs = json.dumps(collapsed)
+        return {'FINISHED'}
+
 class BATCH_STL_OT_cancel_export(bpy.types.Operator):
     bl_idname = "batch_stl.cancel_export"
     bl_label = "Cancel Export"
@@ -1827,56 +1824,8 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 warn_row = warn_box.row()
                 warn_row.label(text=f"WARNING: {len(duplicates)} naming collisions detected! Files will be overwritten.", icon='ERROR')
 
-            lines = get_tree_lines(tree_dict)
             col = t_box.column(align=True)
-            for line_data in lines:
-                row = col.row(align=True)
-                row.scale_y = 0.85
-                
-                prefix = line_data.get("prefix", "")
-                text_before = line_data.get("text_before", "")
-                text_after = line_data.get("text_after", "")
-                ptr = line_data.get("ptr")
-                prop = line_data.get("prop")
-                
-                tag_val = str(getattr(ptr, prop, "")) if ptr and prop else ""
-                
-                CHAR_W = 0.035
-                cols_data = []
-                
-                combined_before = prefix + text_before
-                if combined_before: 
-                    cols_data.append((len(combined_before) * CHAR_W, combined_before, 'LABEL'))
-                    
-                if ptr and prop: 
-                    cols_data.append((max(2, len(tag_val)) * CHAR_W, "", 'PROP'))
-                    
-                if text_after: 
-                    cols_data.append((len(text_after) * CHAR_W, text_after, 'LABEL'))
-                
-                total_used = sum(c[0] for c in cols_data)
-                cols_data.append((max(0.01, 1.0 - total_used), "", 'EMPTY'))
-                
-                current = row
-                total_w = sum(c[0] for c in cols_data)
-                
-                for i, (weight, text_val, c_type) in enumerate(cols_data):
-                    if i == len(cols_data) - 1:
-                        if c_type == 'LABEL': current.label(text=text_val)
-                        elif c_type == 'PROP': current.prop(ptr, prop, text="", emboss=False)
-                        else: current.label(text="")
-                    else:
-                        factor = min(0.99, max(0.01, weight / total_w))
-                        split = current.split(factor=factor, align=True)
-                        c1 = split.column(align=True)
-                        c2 = split.column(align=True)
-                        
-                        if c_type == 'LABEL': c1.label(text=text_val)
-                        elif c_type == 'PROP': c1.prop(ptr, prop, text="", emboss=False)
-                        else: c1.label(text="")
-                        
-                        current = c2
-                        total_w -= weight
+            draw_tree_dict(col, tree_dict)
 
         layout.separator()
         layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
@@ -1921,6 +1870,7 @@ classes = (
     BATCH_STL_OT_input_actions,
     BATCH_STL_OT_toggle_sweep,
     BATCH_STL_OT_toggle_exclusion,
+    BATCH_STL_OT_toggle_dir_tree,
     BATCH_STL_OT_cancel_export,
     BATCH_STL_OT_export_presets_json,
     BATCH_STL_OT_import_presets_json,
@@ -1929,6 +1879,10 @@ classes = (
     # 4. Panels
     VIEW3D_PT_batch_export_stl_multi,
 )
+
+def update_show_tree(self, context):
+    if not self.batch_stl_show_tree:
+        self.batch_stl_collapsed_dirs = "[]"
 
 def register():
     for cls in classes:
@@ -1945,8 +1899,9 @@ def register():
     bpy.types.Scene.batch_stl_ui_global_ovr = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_local_ovr = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_exclude = bpy.props.BoolProperty(default=True)
-    bpy.types.Scene.batch_stl_show_tree = bpy.props.BoolProperty(default=True)
+    bpy.types.Scene.batch_stl_show_tree = bpy.props.BoolProperty(default=True, update=update_show_tree)
     bpy.types.Scene.batch_stl_show_console = bpy.props.BoolProperty(default=False)
+    bpy.types.Scene.batch_stl_collapsed_dirs = bpy.props.StringProperty(default="[]")
 
     reset_batch_stl_state(None)
     if reset_batch_stl_state not in bpy.app.handlers.load_post:
@@ -1964,7 +1919,7 @@ def unregister():
         "batch_stl_root_dir", "batch_stl_presets", "batch_stl_preset_index",
         "batch_stl_verbose_console", "batch_stl_ui_presets", "batch_stl_ui_mappings",
         "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr", "batch_stl_ui_exclude",
-        "batch_stl_show_tree", "batch_stl_show_console"
+        "batch_stl_show_tree", "batch_stl_show_console", "batch_stl_collapsed_dirs"
     ]
 
     for prop in properties_to_remove:
