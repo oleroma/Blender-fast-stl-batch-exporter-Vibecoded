@@ -124,6 +124,7 @@ def get_override_signature(overrides):
 # --- PERMUTATION ENGINE ---
 class MockInput:
     def __init__(self, base_inp, override_val):
+        self.base_inp = base_inp
         self.input_name = base_inp.input_name
         self.override_type = base_inp.override_type
         self.use_tag = base_inp.use_tag
@@ -441,24 +442,29 @@ def paste_preset_from_dict(new_p, data):
 # --- TREE VISUALIZER LOGIC ---
 def build_tree_dict(scene, preset):
     root_name = bpy.path.abspath(scene.batch_stl_root_dir) if scene.batch_stl_root_dir else "//"
-    tree = {}
+    tree = {"children": {}, "files": [], "text": root_name, "ptr": scene, "prop": "batch_stl_root_dir", "suffix": ""}
     all_filepaths = set()
     duplicates = set()
 
     current_root = tree
     if preset.preset_prefix:
-        current_root[preset.preset_prefix] = {}
-        current_root = current_root[preset.preset_prefix]
+        key = preset.preset_prefix
+        if key not in current_root["children"]:
+            current_root["children"][key] = {"children": {}, "files": [], "text": key, "ptr": preset, "prop": "preset_prefix", "suffix": ""}
+        current_root = current_root["children"][key]
 
     for mapping in preset.mappings:
         mapping_root = current_root
         mapping_root_path = []
         if mapping.sub_path:
             parts = mapping.sub_path.replace('\\', '/').split('/')
-            for part in parts:
+            for i, part in enumerate(parts):
                 if part:
-                    if part not in mapping_root: mapping_root[part] = {}
-                    mapping_root = mapping_root[part]
+                    if part not in mapping_root["children"]:
+                        ptr = mapping if i == len(parts) - 1 else None
+                        prop = "sub_path" if i == len(parts) - 1 else ""
+                        mapping_root["children"][part] = {"children": {}, "files": [], "text": part, "ptr": ptr, "prop": prop, "suffix": ""}
+                    mapping_root = mapping_root["children"][part]
                     mapping_root_path.append(part)
 
         all_overrides = list(preset.pinned_overrides) + list(mapping.node_overrides)
@@ -491,12 +497,16 @@ def build_tree_dict(scene, preset):
 
                     if getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
                     if getattr(inp, "use_dir", False):
-                        if naming_str not in combo_root: combo_root[naming_str] = {}
-                        combo_root = combo_root[naming_str]
+                        if naming_str not in combo_root["children"]:
+                            base_inp = getattr(inp, "base_inp", inp)
+                            combo_root["children"][naming_str] = {
+                                "children": {}, "files": [], 
+                                "text": val_str, "ptr": base_inp, "prop": "tag", "suffix": ""
+                            }
+                        combo_root = combo_root["children"][naming_str]
                         combo_subpath.append(naming_str)
                     processed_params.add(param_key)
 
-            if '_files' not in combo_root: combo_root['_files'] = []
             base_tag = mapping.tag if getattr(mapping, "use_tag", False) and mapping.tag else ""
             final_tag = base_tag + combo_suffix
 
@@ -507,39 +517,69 @@ def build_tree_dict(scene, preset):
 
             for obj in valid_objs:
                 filename = f"{bpy.path.clean_name(obj.name)}{final_tag}.stl"
-                combo_root['_files'].append(filename)
                 full_path = os.path.join(dir_path_str, filename)
                 if full_path in all_filepaths: duplicates.add(full_path)
                 else: all_filepaths.add(full_path)
 
-    return {root_name: tree}, duplicates
+                if getattr(mapping, "use_tag", False):
+                    file_node = {
+                        "text": bpy.path.clean_name(obj.name), 
+                        "ptr": mapping, 
+                        "prop": "tag", 
+                        "suffix": combo_suffix + ".stl"
+                    }
+                else:
+                    file_node = {
+                        "text": filename,
+                        "ptr": None,
+                        "prop": "",
+                        "suffix": ""
+                    }
+                combo_root["files"].append(file_node)
+
+    return {"root": tree}, duplicates
 
 def get_tree_lines(tree_dict):
     def traverse(d_node, prefix=""):
         lines = []
-        dirs = [k for k in d_node.keys() if k != '_files']
-        files = d_node.get('_files', [])
+        dirs = list(d_node.get("children", {}).values())
+        files = d_node.get("files", [])
         total_items = len(dirs) + len(files)
         current_item = 0
-        for k in dirs:
+        
+        for child in dirs:
             current_item += 1
             is_last = (current_item == total_items)
             connector = "└── " if is_last else "├── "
-            lines.append(prefix + connector + str(k))
+            
+            line_data = child.copy()
+            line_data["prefix"] = prefix + connector
+            line_data["icon"] = 'FILE_FOLDER'
+            lines.append(line_data)
+            
             extension = "    " if is_last else "│   "
-            lines.extend(traverse(d_node[k], prefix + extension))
+            lines.extend(traverse(child, prefix + extension))
+            
         for f in files:
             current_item += 1
             is_last = (current_item == total_items)
             connector = "└── " if is_last else "├── "
-            lines.append(prefix + connector + str(f))
+            
+            line_data = f.copy()
+            line_data["prefix"] = prefix + connector
+            line_data["icon"] = 'MESH_DATA'
+            lines.append(line_data)
+            
         return lines
 
     result_lines = []
-    for k, v in tree_dict.items():
-        result_lines.append(str(k))
-        if isinstance(v, dict):
-            result_lines.extend(traverse(v, ""))
+    root_node = tree_dict.get("root", {})
+    if root_node:
+        root_data = root_node.copy()
+        root_data["prefix"] = ""
+        root_data["icon"] = 'FILE_FOLDER'
+        result_lines.append(root_data)
+        result_lines.extend(traverse(root_node, ""))
     return result_lines
 
 # --- HEADLESS EXPORT EXECUTION ROUTINE ---
@@ -1779,10 +1819,24 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
             lines = get_tree_lines(tree_dict)
             col = t_box.column(align=True)
-            for line in lines:
+            for line_data in lines:
                 row = col.row(align=True)
-                row.scale_y = 0.7
-                row.label(text=line)
+                row.scale_y = 0.85
+                
+                split = row.split(factor=0.6)
+                
+                left_col = split.row(align=True)
+                left_col.label(text=line_data.get("prefix", "") + line_data.get("text", ""), icon=line_data.get("icon", 'NONE'))
+                
+                right_col = split.row(align=True)
+                ptr = line_data.get("ptr")
+                prop = line_data.get("prop")
+                if ptr and prop:
+                    right_col.prop(ptr, prop, text="")
+                
+                suffix = line_data.get("suffix", "")
+                if suffix:
+                    right_col.label(text=suffix)
 
         layout.separator()
         layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
