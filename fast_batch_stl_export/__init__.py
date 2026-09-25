@@ -1781,7 +1781,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             col = t_box.column(align=True)
             for line in lines:
                 row = col.row(align=True)
-                row.scale_y = 0.55
+                row.scale_y = 0.7
                 row.label(text=line)
 
         layout.separator()
