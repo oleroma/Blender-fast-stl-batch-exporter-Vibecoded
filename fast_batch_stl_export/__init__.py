@@ -442,7 +442,7 @@ def paste_preset_from_dict(new_p, data):
 # --- TREE VISUALIZER LOGIC ---
 def build_tree_dict(scene, preset):
     root_name = bpy.path.abspath(scene.batch_stl_root_dir) if scene.batch_stl_root_dir else "//"
-    tree = {"children": {}, "files": [], "text_before": root_name, "text_after": "", "ptr": scene, "prop": "batch_stl_root_dir"}
+    tree = {"children": {}, "files": [], "text_before": "", "text_after": "", "ptr": scene, "prop": "batch_stl_root_dir"}
     all_filepaths = set()
     duplicates = set()
 
@@ -450,7 +450,7 @@ def build_tree_dict(scene, preset):
     if preset.preset_prefix:
         key = preset.preset_prefix
         if key not in current_root["children"]:
-            current_root["children"][key] = {"children": {}, "files": [], "text_before": key, "text_after": "", "ptr": preset, "prop": "preset_prefix"}
+            current_root["children"][key] = {"children": {}, "files": [], "text_before": "", "text_after": "", "ptr": preset, "prop": "preset_prefix"}
         current_root = current_root["children"][key]
 
     for mapping in preset.mappings:
@@ -463,7 +463,8 @@ def build_tree_dict(scene, preset):
                     if part not in mapping_root["children"]:
                         ptr = mapping if i == len(parts) - 1 else None
                         prop = "sub_path" if i == len(parts) - 1 else ""
-                        mapping_root["children"][part] = {"children": {}, "files": [], "text_before": part, "text_after": "", "ptr": ptr, "prop": prop}
+                        text_before = "" if ptr else part
+                        mapping_root["children"][part] = {"children": {}, "files": [], "text_before": text_before, "text_after": "", "ptr": ptr, "prop": prop}
                     mapping_root = mapping_root["children"][part]
                     mapping_root_path.append(part)
 
@@ -1843,11 +1844,18 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 prop = line_data.get("prop")
                 
                 if ptr and prop:
-                    if label_str:
-                        row.label(text=label_str)
-                    row.prop(ptr, prop, text="", emboss=False)
                     if text_after:
-                        row.label(text=text_after)
+                        if label_str:
+                            row.label(text=label_str)
+                        tag_val = getattr(ptr, prop, "")
+                        factor = min(0.8, max(0.1, len(str(tag_val)) * 0.08))
+                        split = row.split(factor=factor, align=True)
+                        split.prop(ptr, prop, text="", emboss=False)
+                        split.label(text=text_after)
+                    else:
+                        if label_str:
+                            row.label(text=label_str)
+                        row.prop(ptr, prop, text="", emboss=False)
                 else:
                     row.label(text=label_str + text_after)
 
