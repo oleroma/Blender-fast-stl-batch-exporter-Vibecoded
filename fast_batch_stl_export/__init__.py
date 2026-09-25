@@ -1830,13 +1830,27 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
             layout.separator(factor=0.5)
             tip_box = layout.box()
-            tip_box.label(text="Use input values or tags to name folders or files", icon='INFO')
-            col = tip_box.column()
-            col.label(text="use tag button to name objects using input name or custom string")
-            col.label(text="use dir button to name folders using input name or custom string")
-            col.label(text="specify [ TAG ] to replace input value", icon='BLANK1')
-            col.label(text="[ _TAG ] would append it to input value, [ TAG_ ] would prepend it to input value", icon='BLANK1')
+            tip_header = tip_box.row()
+            icon_tip = 'TRIA_DOWN' if scene.batch_stl_ui_tips else 'TRIA_RIGHT'
+            tip_header.prop(scene, "batch_stl_ui_tips", text="", icon=icon_tip, emboss=False)
+            tip_header.label(text="INFO", icon='INFO')
+            
+            if scene.batch_stl_ui_tips:
+                col = tip_box.column()
 
+                col.label(text="Enable input combinations by using sweep button or adding multiple values to input", icon='BLANK1')
+                col.label(text="use sweep button to iterate through values automatically", icon='FILE_REFRESH')
+                col.label(text="for floats and integers specify 3 numbers for start value, step size, number of steps", icon='BLANK1')
+                col.label(text="for menus and booleans it will go trhough all values automatically", icon='BLANK1')
+                col.label(text="if you disable sweep button while holding SHIFT it will populate range of values for granular control", icon='BLANK1')
+                col.label(text="add multiple input values to iterate through them in same way as sweep, but with more control", icon='BLANK1')
+                col.label(text="each sweep item would be placed in its folder with value name or with value appended to object name", icon='BLANK1')
+                col.label(text="to create nested folders using value or tag_string", icon='FILE_FOLDER')
+                col.label(text="to appen object names using value or tag_string", icon='BOOKMARKS')
+                col.label(text="or use both folder nesting and tagging", icon='BLANK1')
+                col.label(text="[ tag_string ] to replace input value with tag", icon='BLANK1')
+                col.label(text="[ _tag_string ] to append tag to input value", icon='BLANK1')
+                col.label(text="[ tag_string_ ] to prepend tag to input value", icon='BLANK1')
         layout.separator()
         t_box = layout.box()
         t_header = t_box.row(align=True)
@@ -1926,6 +1940,7 @@ def register():
     bpy.types.Scene.batch_stl_ui_global_ovr = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_local_ovr = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_exclude = bpy.props.BoolProperty(default=True)
+    bpy.types.Scene.batch_stl_ui_tips = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.batch_stl_show_tree = bpy.props.BoolProperty(default=True, update=update_show_tree)
     bpy.types.Scene.batch_stl_show_console = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.batch_stl_collapsed_dirs = bpy.props.StringProperty(default="[]")
@@ -1946,7 +1961,8 @@ def unregister():
         "batch_stl_root_dir", "batch_stl_presets", "batch_stl_preset_index",
         "batch_stl_verbose_console", "batch_stl_ui_presets", "batch_stl_ui_mappings",
         "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr", "batch_stl_ui_exclude",
-        "batch_stl_show_tree", "batch_stl_show_console", "batch_stl_collapsed_dirs"
+        "batch_stl_show_tree", "batch_stl_show_console", "batch_stl_collapsed_dirs",
+        "batch_stl_ui_tips"
     ]
 
     for prop in properties_to_remove:
