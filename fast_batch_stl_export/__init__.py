@@ -1821,22 +1821,19 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             col = t_box.column(align=True)
             for line_data in lines:
                 row = col.row(align=True)
+                row.alignment = 'LEFT'
                 row.scale_y = 0.85
                 
-                split = row.split(factor=0.6)
+                row.label(text=line_data.get("prefix", "") + line_data.get("text", ""), icon=line_data.get("icon", 'NONE'))
                 
-                left_col = split.row(align=True)
-                left_col.label(text=line_data.get("prefix", "") + line_data.get("text", ""), icon=line_data.get("icon", 'NONE'))
-                
-                right_col = split.row(align=True)
                 ptr = line_data.get("ptr")
                 prop = line_data.get("prop")
                 if ptr and prop:
-                    right_col.prop(ptr, prop, text="")
+                    row.prop(ptr, prop, text="", emboss=False)
                 
                 suffix = line_data.get("suffix", "")
                 if suffix:
-                    right_col.label(text=suffix)
+                    row.label(text=suffix)
 
         layout.separator()
         layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
