@@ -442,7 +442,7 @@ def paste_preset_from_dict(new_p, data):
 # --- TREE VISUALIZER LOGIC ---
 def build_tree_dict(scene, preset):
     root_name = bpy.path.abspath(scene.batch_stl_root_dir) if scene.batch_stl_root_dir else "//"
-    tree = {"children": {}, "files": [], "text_before": "", "text_after": "", "ptr": scene, "prop": "batch_stl_root_dir"}
+    tree = {"children": {}, "files": [], "text_before": root_name, "text_after": "", "ptr": scene, "prop": "batch_stl_root_dir"}
     all_filepaths = set()
     duplicates = set()
 
@@ -450,7 +450,7 @@ def build_tree_dict(scene, preset):
     if preset.preset_prefix:
         key = preset.preset_prefix
         if key not in current_root["children"]:
-            current_root["children"][key] = {"children": {}, "files": [], "text_before": "", "text_after": "", "ptr": preset, "prop": "preset_prefix"}
+            current_root["children"][key] = {"children": {}, "files": [], "text_before": key, "text_after": "", "ptr": preset, "prop": "preset_prefix"}
         current_root = current_root["children"][key]
 
     for mapping in preset.mappings:
@@ -463,8 +463,7 @@ def build_tree_dict(scene, preset):
                     if part not in mapping_root["children"]:
                         ptr = mapping if i == len(parts) - 1 else None
                         prop = "sub_path" if i == len(parts) - 1 else ""
-                        text_before = "" if ptr else part
-                        mapping_root["children"][part] = {"children": {}, "files": [], "text_before": text_before, "text_after": "", "ptr": ptr, "prop": prop}
+                        mapping_root["children"][part] = {"children": {}, "files": [], "text_before": part, "text_after": "", "ptr": ptr, "prop": prop}
                     mapping_root = mapping_root["children"][part]
                     mapping_root_path.append(part)
 
@@ -1832,38 +1831,52 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             col = t_box.column(align=True)
             for line_data in lines:
                 row = col.row(align=True)
-                row.alignment = 'LEFT'
                 row.scale_y = 0.85
                 
                 prefix = line_data.get("prefix", "")
                 text_before = line_data.get("text_before", "")
                 text_after = line_data.get("text_after", "")
-                label_str = prefix + text_before
-                
                 ptr = line_data.get("ptr")
                 prop = line_data.get("prop")
                 
-                split = row.split(factor=0.6, align=True)
-                left = split.row(align=True)
-                right = split.row(align=True)
+                tag_val = str(getattr(ptr, prop, "")) if ptr and prop else ""
                 
-                if label_str:
-                    left.label(text=label_str)
+                CHAR_W = 0.035
+                cols_data = []
                 
-                if ptr and prop:
-                    if text_after:
-                        # Prepended tag: Tag comes first in right column, then value
-                        tag_val = getattr(ptr, prop, "")
-                        factor = min(0.8, max(0.1, len(str(tag_val)) * 0.08))
-                        sub_split = right.split(factor=factor, align=True)
-                        sub_split.prop(ptr, prop, text="", emboss=False)
-                        sub_split.label(text=text_after)
+                combined_before = prefix + text_before
+                if combined_before: 
+                    cols_data.append((len(combined_before) * CHAR_W, combined_before, 'LABEL'))
+                    
+                if ptr and prop: 
+                    cols_data.append((max(2, len(tag_val)) * CHAR_W, "", 'PROP'))
+                    
+                if text_after: 
+                    cols_data.append((len(text_after) * CHAR_W, text_after, 'LABEL'))
+                
+                total_used = sum(c[0] for c in cols_data)
+                cols_data.append((max(0.01, 1.0 - total_used), "", 'EMPTY'))
+                
+                current = row
+                total_w = sum(c[0] for c in cols_data)
+                
+                for i, (weight, text_val, c_type) in enumerate(cols_data):
+                    if i == len(cols_data) - 1:
+                        if c_type == 'LABEL': current.label(text=text_val)
+                        elif c_type == 'PROP': current.prop(ptr, prop, text="", emboss=False)
+                        else: current.label(text="")
                     else:
-                        # Appended tag
-                        right.prop(ptr, prop, text="", emboss=False)
-                else:
-                    if text_after:
-                        right.label(text=text_after)
+                        factor = min(0.99, max(0.01, weight / total_w))
+                        split = current.split(factor=factor, align=True)
+                        c1 = split.column(align=True)
+                        c2 = split.column(align=True)
+                        
+                        if c_type == 'LABEL': c1.label(text=text_val)
+                        elif c_type == 'PROP': c1.prop(ptr, prop, text="", emboss=False)
+                        else: c1.label(text="")
+                        
+                        current = c2
+                        total_w -= weight
 
         layout.separator()
         layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
