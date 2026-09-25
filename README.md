@@ -35,21 +35,19 @@ You no longer need to toggle Blender's clunky System Console to monitor headless
 
 ### 6. Geometry Node & Modifier Overrides
 Define temporary parameter states strictly during export and automatically restore original scene settings once finished.
-* **Intelligent Targeting:** Target internal nodes using a dynamically populated search field. The search dropdown automatically scans the node tree and displays both the instance name and its underlying Base Group to help you identify vaguely named internal nodes.
-* **Searchable Menu Items:** Enum/Menu overrides feature a dynamic search dropdown that fetches valid list items directly from the targeted `MENU_SWITCH` nodes.
-* **Unified Parameter Blocks:** If you add multiple discrete values for the exact same input socket, the UI intelligently merges them into a single, clean parameter block. The target socket name and node search field are shown once at the top, with all subsequent variable lines cleanly stacked underneath.
-* **Advanced Clipboard Operations:** 
-  * Copy any input state and click Paste to overwrite an existing row.
-  * **Shift + Paste:** Hold `Shift` while clicking Paste on an existing line to duplicate the state into a brand new permutation row directly beneath it, perfectly aligned inside its parent block.
-  * **Shift-Click Auto-Populate:** Hold `Shift` while clicking the ADD (`+`) button to automatically scan the target node and generate an input row for every available socket, complete with automatic data type detection.
+* **Targeting:** Target exposed modifier sockets or deeply nested internal nodes. The unified Node Search field automatically parses your target groups and displays options formatted as `Instance Name [Base Group Name]` for easy identification.
+* **Smart UI Grouping:** When assigning multiple discrete values to the same input socket, the UI seamlessly collapses them into a single clean box, keeping your target controls at the top and your value iterations stacked neatly below.
+* **Dynamic Menu Searching:** Targeting a Menu/Enum switch? The value field turns into a dynamic searchable list of all available options specific to that node.
+* **Shift-Click Workflows:**
+  * **Duplicate Row:** Hold `Shift` and click the `COPY` button on any input row to instantly duplicate it directly below the current line.
+  * **Auto-Populate Sockets:** Hold `Shift` and click the global `ADD (+)` button at the bottom of an override block to instantly scan the target node and generate an input row for every available socket.
 
 ### 7. Parametric Sweeping (The Permutation Engine)
 Turn your geometry into an automated variant generator. By clicking the **Sweep (`FILE_REFRESH`)** icon on any input row, you can define a range of values to automatically iterate through.
 * **Float/Int Syntax:** Enter your range as `start step count` (e.g., `1.0 0.5 5` generates 1.0, 1.5, 2.0, 2.5, 3.0).
 * **String Syntax:** Enter a comma-separated list of strings (e.g., `PartA, PartB, PartC`).
 * **Booleans & Menus:** Automatically calculates combinations for `True/False` or iterates through all available enum items.
-* **Shift-Click to Expand:** Hold `Shift` and click an active Sweep button to instantly calculate the permutations and unpack them into individual, duplicated input rows.
-* **Auto-Cleanup:** Enabling a Sweep automatically collapses any manually expanded rows back into a single line and zeroes out static parameters, ensuring your preset data remains uncorrupted and lightweight.
+* **Mutual Exclusivity:** The UI ensures your state remains valid. Turning on Sweep will automatically purge any manually duplicated rows for that socket. Conversely, duplicating a row using `Shift+Copy` instantly disables Sweep.
 
 ### 8. Permutation Suffix & Sub-Directory Formatting
 When permutation logic is triggered, formatting controls dynamically appear:
@@ -83,7 +81,7 @@ Save your entire export setup to an external JSON configuration file. Presets, c
 To export multiple variations of a model automatically:
 1. In the **Overrides** box, click `+` to add an override block.
 2. Select your Geometry Node Group.
-3. Use the search field to target an internal node, or leave the **Node** field blank to target the base modifier Interface.
+3. Leave the **Node** field blank to target the interface directly, or use the searchable dropdown to select a nested node.
 4. Add an input (e.g., `Wall_Thickness`) and enable the **Sweep (`FILE_REFRESH`)** icon.
 5. For a Float input, enter your sweep range (e.g., `2.0 2.0 2` to generate versions at 2.0 and 4.0).
 6. Configure the dynamic naming toggles:

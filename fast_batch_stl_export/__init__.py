@@ -716,6 +716,13 @@ def on_input_name_update(self, context):
                 if ovr: break
             if ovr: break
 
+        if ovr:
+            count = sum(1 for i in ovr.inputs if i.input_name == self.input_name)
+            if count > 1:
+                for i in ovr.inputs:
+                    if i.input_name == self.input_name:
+                        i.use_sweep = False
+
         if ovr and ovr.parent_group_ptr:
             if ovr.override_target == 'NODE' and ovr.node_name:
                 n_name = ovr.node_name.split(" [")[0].strip()
@@ -1092,32 +1099,47 @@ class BATCH_STL_OT_input_actions(bpy.types.Operator):
             msg = "Move Input Down"
         elif self.action == 'COPY' and 0 <= idx < len(lst):
             i = lst[idx]
-            _clipboard["input"] = {
-                "input_name": i.input_name, "override_type": i.override_type,
-                "value_bool": i.value_bool, "value_int": i.value_int, "value_float": i.value_float,
-                "value_string": i.value_string, "value_menu": i.value_menu,
-                "use_tag": i.use_tag, "tag": i.tag, "use_dir": i.use_dir,
-                "use_sweep": getattr(i, "use_sweep", False), "sweep_range": getattr(i, "sweep_range", "")
-            }
-        elif self.action == 'PASTE' and _clipboard.get("input"):
-            if 0 <= idx < len(lst):
-                if self.shift_pressed:
-                    new_i = lst.add()
-                    orig_name = lst[idx].input_name
-                    for k, v in _clipboard["input"].items(): setattr(new_i, k, v)
-                    new_i.input_name = orig_name
-                    lst.move(len(lst) - 1, idx + 1)
-                    msg = "Paste New Input Line"
-                else:
-                    target_i = lst[idx]
-                    orig_name = target_i.input_name
-                    for k, v in _clipboard["input"].items(): setattr(target_i, k, v)
-                    target_i.input_name = orig_name
-                    msg = "Overwrite Input Line"
-            else:
+            if self.shift_pressed:
+                # Shift+Copy = Duplicate into a new line below
                 new_i = lst.add()
-                for k, v in _clipboard["input"].items(): setattr(new_i, k, v)
-                msg = "Paste Input State"
+                orig_name = i.input_name
+
+                for k in ["input_name", "override_type", "value_bool", "value_int", "value_float", "value_string", "value_menu", "use_tag", "tag", "use_dir"]:
+                    setattr(new_i, k, getattr(i, k))
+                new_i.sweep_range = getattr(i, "sweep_range", "")
+                new_i.use_sweep = False
+
+                lst.move(len(lst) - 1, idx + 1)
+
+                # Automatically disable sweep for all items matching this target name
+                for item in lst:
+                    if item.input_name == orig_name:
+                        item.use_sweep = False
+
+                msg = "Duplicate Input Line"
+            else:
+                # Standard Copy
+                _clipboard["input"] = {
+                    "input_name": i.input_name, "override_type": i.override_type,
+                    "value_bool": i.value_bool, "value_int": i.value_int, "value_float": i.value_float,
+                    "value_string": i.value_string, "value_menu": i.value_menu,
+                    "use_tag": i.use_tag, "tag": i.tag, "use_dir": i.use_dir,
+                    "use_sweep": getattr(i, "use_sweep", False), "sweep_range": getattr(i, "sweep_range", "")
+                }
+                msg = "Copy Input State"
+        elif self.action == 'PASTE' and _clipboard.get("input"):
+            # Global Paste only (from the + / Paste row at the bottom)
+            new_i = lst.add()
+            for k, v in _clipboard["input"].items(): setattr(new_i, k, v)
+
+            # Check if this pasted item matches an existing name; if so, disable sweep for that block
+            count = sum(1 for item in lst if item.input_name == new_i.input_name)
+            if count > 1:
+                for item in lst:
+                    if item.input_name == new_i.input_name:
+                        item.use_sweep = False
+
+            msg = "Paste Input State"
 
         if msg: bpy.ops.ed.undo_push(message=msg)
         return {'FINISHED'}
@@ -1563,7 +1585,7 @@ def draw_override_block(layout, ovr, o_idx, is_pinned, freq_dict=None):
                     right_col.prop(inp, "tag", text="")
 
                 action_row = right_col.row(align=True)
-                for action, icon in [('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('PASTE', 'PASTEDOWN'), ('REMOVE', 'TRASH')]:
+                for action, icon in [('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'TRASH')]:
                     op = action_row.operator("batch_stl.input_actions", text="", icon=icon)
                     op.action = action
                     op.override_index = o_idx
