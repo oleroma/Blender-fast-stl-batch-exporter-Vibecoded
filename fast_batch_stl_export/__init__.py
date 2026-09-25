@@ -1843,21 +1843,27 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 ptr = line_data.get("ptr")
                 prop = line_data.get("prop")
                 
+                split = row.split(factor=0.6, align=True)
+                left = split.row(align=True)
+                right = split.row(align=True)
+                
+                if label_str:
+                    left.label(text=label_str)
+                
                 if ptr and prop:
                     if text_after:
-                        if label_str:
-                            row.label(text=label_str)
+                        # Prepended tag: Tag comes first in right column, then value
                         tag_val = getattr(ptr, prop, "")
                         factor = min(0.8, max(0.1, len(str(tag_val)) * 0.08))
-                        split = row.split(factor=factor, align=True)
-                        split.prop(ptr, prop, text="", emboss=False)
-                        split.label(text=text_after)
+                        sub_split = right.split(factor=factor, align=True)
+                        sub_split.prop(ptr, prop, text="", emboss=False)
+                        sub_split.label(text=text_after)
                     else:
-                        if label_str:
-                            row.label(text=label_str)
-                        row.prop(ptr, prop, text="", emboss=False)
+                        # Appended tag
+                        right.prop(ptr, prop, text="", emboss=False)
                 else:
-                    row.label(text=label_str + text_after)
+                    if text_after:
+                        right.label(text=text_after)
 
         layout.separator()
         layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
