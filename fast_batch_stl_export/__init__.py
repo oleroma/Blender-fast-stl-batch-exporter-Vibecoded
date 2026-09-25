@@ -1837,18 +1837,19 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 prefix = line_data.get("prefix", "")
                 text_before = line_data.get("text_before", "")
                 text_after = line_data.get("text_after", "")
-                icon = line_data.get("icon", 'NONE')
                 label_str = prefix + text_before
                 
                 ptr = line_data.get("ptr")
                 prop = line_data.get("prop")
                 
                 if ptr and prop:
-                    row.prop(ptr, prop, text=label_str, icon=icon, emboss=False)
+                    if label_str:
+                        row.label(text=label_str)
+                    row.prop(ptr, prop, text="", emboss=False)
                     if text_after:
                         row.label(text=text_after)
                 else:
-                    row.label(text=label_str + text_after, icon=icon)
+                    row.label(text=label_str + text_after)
 
         layout.separator()
         layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
