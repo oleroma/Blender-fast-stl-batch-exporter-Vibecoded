@@ -791,6 +791,10 @@ def on_input_name_update(self, context):
 
 def search_target_node_cb(self, context, edit_text):
     if not self.parent_group_ptr: return []
+    
+    if edit_text == self.node_name:
+        edit_text = ""
+        
     res = []
     for node in self.parent_group_ptr.nodes:
         name = node.name
@@ -847,6 +851,9 @@ def search_menu_items_cb(self, context, edit_text):
                                             break
                                     if items: break
                             if items: break
+
+        if edit_text == self.value_menu:
+            edit_text = ""
 
         if not edit_text: return items
         return [item for item in items if edit_text.lower() in item.lower()]
@@ -1635,7 +1642,7 @@ def draw_override_block(layout, ovr, o_idx, is_pinned, freq_dict=None):
                 if getattr(inp, "use_sweep", False):
                     if inp.override_type in ['INT', 'FLOAT', 'STRING']: right_col.prop(inp, "sweep_range", text="")
                     elif inp.override_type == 'BOOLEAN': right_col.label(text="True & False")
-                    elif inp.override_type == 'MENU': right_col.label(text="All Menu Items")
+                    elif inp.override_type == 'MENU': right_col.label(text="All values")
                 else:
                     if inp.override_type == 'BOOLEAN': right_col.prop(inp, "value_bool", text="True" if inp.value_bool else "False", toggle=True)
                     elif inp.override_type == 'INT': right_col.prop(inp, "value_int", text="")
@@ -1833,7 +1840,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             tip_header = tip_box.row()
             icon_tip = 'TRIA_DOWN' if scene.batch_stl_ui_tips else 'TRIA_RIGHT'
             tip_header.prop(scene, "batch_stl_ui_tips", text="", icon=icon_tip, emboss=False)
-            tip_header.label(text="INFO", icon='INFO')
+            tip_header.label(text="OVERRIDE INFO", icon='INFO')
             
             if scene.batch_stl_ui_tips:
                 col = tip_box.column()
