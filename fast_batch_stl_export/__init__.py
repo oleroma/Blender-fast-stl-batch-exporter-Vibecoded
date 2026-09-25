@@ -442,7 +442,7 @@ def paste_preset_from_dict(new_p, data):
 # --- TREE VISUALIZER LOGIC ---
 def build_tree_dict(scene, preset):
     root_name = bpy.path.abspath(scene.batch_stl_root_dir) if scene.batch_stl_root_dir else "//"
-    tree = {"children": {}, "files": [], "text": root_name, "ptr": scene, "prop": "batch_stl_root_dir", "suffix": ""}
+    tree = {"children": {}, "files": [], "text_before": root_name, "text_after": "", "ptr": scene, "prop": "batch_stl_root_dir"}
     all_filepaths = set()
     duplicates = set()
 
@@ -450,7 +450,7 @@ def build_tree_dict(scene, preset):
     if preset.preset_prefix:
         key = preset.preset_prefix
         if key not in current_root["children"]:
-            current_root["children"][key] = {"children": {}, "files": [], "text": key, "ptr": preset, "prop": "preset_prefix", "suffix": ""}
+            current_root["children"][key] = {"children": {}, "files": [], "text_before": key, "text_after": "", "ptr": preset, "prop": "preset_prefix"}
         current_root = current_root["children"][key]
 
     for mapping in preset.mappings:
@@ -463,7 +463,7 @@ def build_tree_dict(scene, preset):
                     if part not in mapping_root["children"]:
                         ptr = mapping if i == len(parts) - 1 else None
                         prop = "sub_path" if i == len(parts) - 1 else ""
-                        mapping_root["children"][part] = {"children": {}, "files": [], "text": part, "ptr": ptr, "prop": prop, "suffix": ""}
+                        mapping_root["children"][part] = {"children": {}, "files": [], "text_before": part, "text_after": "", "ptr": ptr, "prop": prop}
                     mapping_root = mapping_root["children"][part]
                     mapping_root_path.append(part)
 
@@ -489,11 +489,20 @@ def build_tree_dict(scene, preset):
                 if param_key not in processed_params:
                     val = get_input_value(inp)
                     val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
+                    text_before = ""
+                    text_after = ""
                     if inp.tag:
-                        if inp.tag.startswith("_"): naming_str = val_str + inp.tag
-                        elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
-                        else: naming_str = inp.tag
-                    else: naming_str = val_str
+                        if inp.tag.startswith("_"): 
+                            naming_str = val_str + inp.tag
+                            text_before = val_str
+                        elif inp.tag.endswith("_"): 
+                            naming_str = inp.tag + val_str
+                            text_after = val_str
+                        else: 
+                            naming_str = inp.tag
+                    else: 
+                        naming_str = val_str
+                        text_before = val_str
 
                     if getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
                     if getattr(inp, "use_dir", False):
@@ -501,7 +510,8 @@ def build_tree_dict(scene, preset):
                             base_inp = getattr(inp, "base_inp", inp)
                             combo_root["children"][naming_str] = {
                                 "children": {}, "files": [], 
-                                "text": val_str, "ptr": base_inp, "prop": "tag", "suffix": ""
+                                "text_before": text_before, "text_after": text_after, 
+                                "ptr": base_inp, "prop": "tag"
                             }
                         combo_root = combo_root["children"][naming_str]
                         combo_subpath.append(naming_str)
@@ -523,17 +533,17 @@ def build_tree_dict(scene, preset):
 
                 if getattr(mapping, "use_tag", False):
                     file_node = {
-                        "text": bpy.path.clean_name(obj.name), 
+                        "text_before": bpy.path.clean_name(obj.name), 
+                        "text_after": combo_suffix + ".stl",
                         "ptr": mapping, 
-                        "prop": "tag", 
-                        "suffix": combo_suffix + ".stl"
+                        "prop": "tag"
                     }
                 else:
                     file_node = {
-                        "text": filename,
+                        "text_before": filename,
+                        "text_after": "",
                         "ptr": None,
-                        "prop": "",
-                        "suffix": ""
+                        "prop": ""
                     }
                 combo_root["files"].append(file_node)
 
@@ -1824,16 +1834,21 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 row.alignment = 'LEFT'
                 row.scale_y = 0.85
                 
-                row.label(text=line_data.get("prefix", "") + line_data.get("text", ""), icon=line_data.get("icon", 'NONE'))
+                prefix = line_data.get("prefix", "")
+                text_before = line_data.get("text_before", "")
+                text_after = line_data.get("text_after", "")
+                icon = line_data.get("icon", 'NONE')
+                label_str = prefix + text_before
                 
                 ptr = line_data.get("ptr")
                 prop = line_data.get("prop")
-                if ptr and prop:
-                    row.prop(ptr, prop, text="", emboss=False)
                 
-                suffix = line_data.get("suffix", "")
-                if suffix:
-                    row.label(text=suffix)
+                if ptr and prop:
+                    row.prop(ptr, prop, text=label_str, icon=icon, emboss=False)
+                    if text_after:
+                        row.label(text=text_after)
+                else:
+                    row.label(text=label_str + text_after, icon=icon)
 
         layout.separator()
         layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
