@@ -1,4 +1,3 @@
-
 # Fast Batch STL Exporter
 
 > **DISCLAIMER:** This is a "vibecoded" extension created with assistance from AI. Always save and back up your project `.blend` files before running large batch exports. While engineered with an adaptive execution model and crash protection, caution is always recommended when running automated scene-mutating scripts.
@@ -18,13 +17,13 @@ The exporter intelligently analyzes your preset configuration to select the opti
 * **Synchronous Bypass:** Standard exports without node overrides are evaluated natively and written instantly in the main thread.
 * **Parallel Headless Workers:** If destructive permutations are detected, the exporter seamlessly falls back to an isolated subprocess architecture to protect your active project file. The UI remains fully unlocked, allowing you to launch multiple concurrent exports for different presets simultaneously.
 
-### 3. Predictive ASCII Tree & Overwrite Protection (New)
+### 3. Predictive ASCII Tree & Overwrite Protection
 Stop guessing where your files will end up. A predictive visualizer runs at the bottom of the extension panel:
 * **Live ASCII Directory Simulation:** Instantly calculates your permutation matrices and draws a clean ASCII tree (`├──` / `└──`) representing the exact nested folder structure that will be generated on your drive.
 * **Leaf Node File Preview:** The visualizer calculates the final dynamic naming rules and lists the specific `.stl` filenames at the end of every directory branch.
 * **Collision Detection System:** If multiple permutations or mappings accidentally result in the exact same filename in the same folder, a bold warning automatically appears at the top of the tree, allowing you to fix naming tags before you accidentally overwrite files during export.
 
-### 4. Integrated Live Console (New)
+### 4. Integrated Live Console
 You no longer need to toggle Blender's clunky System Console to monitor headless exports. 
 * **Preset-Scoped Output:** Every preset maintains its own isolated console log. The UI console only displays the standard output, execution times, and graph evaluation metrics for the preset you currently have selected.
 * **Smart Auto-Switching:** When you configure a preset, the UI displays the ASCII tree. The moment you hit Export, the UI automatically flips to the Console to stream the live progress of the background worker. Selecting a different preset automatically snaps the view back to the tree visualizer.
@@ -36,10 +35,13 @@ You no longer need to toggle Blender's clunky System Console to monitor headless
 
 ### 6. Geometry Node & Modifier Overrides
 Define temporary parameter states strictly during export and automatically restore original scene settings once finished.
-* **Targeting:** Target internal nodes or exposed modifier interface sockets using Float, Int, Boolean, String, or Menu data types.
-* **Global vs Local:** Pin overrides globally to affect all mappings in a preset, or keep them local to a specific collection.
-* **Shift-Click Reordering:** Hold `Shift` while clicking the UP/DOWN arrows on any item to instantly move it to the absolute top or bottom of the list.
-* **Shift-Click Auto-Populate:** Hold `Shift` while clicking the ADD (`+`) button to automatically scan the target node and generate an input row for every available socket, complete with automatic data type detection.
+* **Intelligent Targeting:** Target internal nodes using a dynamically populated search field. The search dropdown automatically scans the node tree and displays both the instance name and its underlying Base Group to help you identify vaguely named internal nodes.
+* **Searchable Menu Items:** Enum/Menu overrides feature a dynamic search dropdown that fetches valid list items directly from the targeted `MENU_SWITCH` nodes.
+* **Unified Parameter Blocks:** If you add multiple discrete values for the exact same input socket, the UI intelligently merges them into a single, clean parameter block. The target socket name and node search field are shown once at the top, with all subsequent variable lines cleanly stacked underneath.
+* **Advanced Clipboard Operations:** 
+  * Copy any input state and click Paste to overwrite an existing row.
+  * **Shift + Paste:** Hold `Shift` while clicking Paste on an existing line to duplicate the state into a brand new permutation row directly beneath it, perfectly aligned inside its parent block.
+  * **Shift-Click Auto-Populate:** Hold `Shift` while clicking the ADD (`+`) button to automatically scan the target node and generate an input row for every available socket, complete with automatic data type detection.
 
 ### 7. Parametric Sweeping (The Permutation Engine)
 Turn your geometry into an automated variant generator. By clicking the **Sweep (`FILE_REFRESH`)** icon on any input row, you can define a range of values to automatically iterate through.
@@ -47,6 +49,7 @@ Turn your geometry into an automated variant generator. By clicking the **Sweep 
 * **String Syntax:** Enter a comma-separated list of strings (e.g., `PartA, PartB, PartC`).
 * **Booleans & Menus:** Automatically calculates combinations for `True/False` or iterates through all available enum items.
 * **Shift-Click to Expand:** Hold `Shift` and click an active Sweep button to instantly calculate the permutations and unpack them into individual, duplicated input rows.
+* **Auto-Cleanup:** Enabling a Sweep automatically collapses any manually expanded rows back into a single line and zeroes out static parameters, ensuring your preset data remains uncorrupted and lightweight.
 
 ### 8. Permutation Suffix & Sub-Directory Formatting
 When permutation logic is triggered, formatting controls dynamically appear:
@@ -58,8 +61,8 @@ When permutation logic is triggered, formatting controls dynamically appear:
   * **Leading Underscore (`_tag`):** Appends the tag to the value (e.g., `_mm` with value `15` -> `_15_mm`).
   * **Blank Tag Field:** Defaults to the literal value of the socket.
 
-### 9. Fully Collapsible UI (New)
-To manage complex, multi-mapping workflows without scrolling fatigue, every major section of the extension (Presets, Console, Mappings, Exclusions, Global Overrides, Local Overrides, Tree) is now wrapped in a collapsible block. Click the down arrow in the header of any section to fold it away.
+### 9. Fully Collapsible UI
+To manage complex, multi-mapping workflows without scrolling fatigue, every major section of the extension (Presets, Console, Mappings, Exclusions, Global Overrides, Local Overrides, Tree) is wrapped in a collapsible block. Click the down arrow in the header of any section to fold it away.
 
 ### 10. JSON Preset Portability
 Save your entire export setup to an external JSON configuration file. Presets, collection bindings, pinned configurations, object exclusions, and permutation rules can be exported or imported with one click, allowing setups to be shared across blend files or team members.
@@ -80,7 +83,7 @@ Save your entire export setup to an external JSON configuration file. Presets, c
 To export multiple variations of a model automatically:
 1. In the **Overrides** box, click `+` to add an override block.
 2. Select your Geometry Node Group.
-3. Leave the **Node** field blank to target the Interface.
+3. Use the search field to target an internal node, or leave the **Node** field blank to target the base modifier Interface.
 4. Add an input (e.g., `Wall_Thickness`) and enable the **Sweep (`FILE_REFRESH`)** icon.
 5. For a Float input, enter your sweep range (e.g., `2.0 2.0 2` to generate versions at 2.0 and 4.0).
 6. Configure the dynamic naming toggles:

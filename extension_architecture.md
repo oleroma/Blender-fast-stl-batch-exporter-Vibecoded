@@ -19,17 +19,18 @@ This adaptive separation ensures that heavy permutations cannot corrupt the user
 The state of the exporter is stored directly in Blender's Scene data (`bpy.types.Scene.batch_stl_presets`), structured hierarchically:
 * **`BatchSTLExportPreset`**: The root configuration object. Contains a global preset name, root directory prefix, a list of mapped collections, and global (pinned) overrides. **Crucially, it also acts as the isolated state-holder for parallel execution**, containing its own `is_exporting`, `export_progress`, `cancel_export`, `export_status`, and an isolated `console_logs` collection to store stdout printouts.
 * **`BatchSTLExportItem`**: Represents a single mapped collection. Contains the pointer to the target collection, local naming tags, sub-path routes, object exclusion lists (`BatchSTLExcludedObject`), and a list of local overrides.
-* **`BatchSTLNodeOverride`**: Represents a targeted parameter injection point (either an internal Geometry Node or a Modifier Interface).
-* **`BatchSTLNodeInput`**: Represents a specific input socket and its target value, data type, and permutation rules.
+* **`BatchSTLNodeOverride`**: Represents a targeted parameter injection point. Internal nodes are targeted using a single string property (`node_name`) paired with a dynamic search callback to map human-readable base group names to instance names.
+* **`BatchSTLNodeInput`**: Represents a specific input socket and its target value, data type, and permutation rules. Features dynamic search callbacks for `MENU` data types.
 * **`BatchSTLLogLine`**: A simple string container used to cache stdout lines for the integrated UI console.
 
 ### B. The Permutation Engine
 This functional block computes the parameter matrix before export:
-* **`parse_sweep_values`**: Dynamically interprets `Sweep` ranges based on type (e.g., parsing float steps `1.0 0.5 5`, splitting comma-separated strings, or querying enum arrays).
+* **`parse_sweep_values`**: Dynamically interprets `Sweep` ranges based on type (e.g., parsing float steps `1.0 0.5 5`, splitting comma-separated strings, or actively querying enum arrays from targeted `MENU_SWITCH` internal nodes).
 * **`generate_override_combinations`**: Groups identical input targets and computes the Cartesian product (`itertools.product`) of all input states to generate a flat list of discrete permutation configurations.
 * **`reconstruct_overrides_for_combo`**: Packages a raw permutation array back into a structured `MockOverride` format that the injection logic can process.
+* **State Cleanup:** The UI operations managing sweeps (`BATCH_STL_OT_toggle_sweep`) strictly wipe static variable caches and aggressively garbage-collect unused permutation rows when a sweep is enabled to keep the JSON footprint optimal.
 
-### C. Path Simulation & Tree Visualizer (New)
+### C. Path Simulation & Tree Visualizer
 A predictive engine that visualizes the output without executing the graph:
 * **`build_tree_dict`**: Simulates the permutation matrices and directory tagging logic to generate a nested dictionary representing the final folder structure. It calculates the exact resulting `.stl` filenames and attaches them as leaf nodes.
 * **Collision Detection:** During simulation, `build_tree_dict` maintains a global set of all absolute file paths. If two combinations yield the exact same file path, they are flagged in a `duplicates` set, triggering a UI warning to prevent unintended overwrites.
@@ -65,6 +66,8 @@ Globally scoped to serve both execution paths, strictly internalizing dependenci
 
 ## 3. UI State Management & View Routing
 
+* **Dynamic Block Grouping:** Instead of displaying each parameter iteration statically, the UI loops over overrides and groups parameters that share an identical `input_name` into a unified `layout.box()`. The target selection (search field) only renders on the top line, with subsequent permutation rows cascading cleanly beneath it, leaving the first column empty for visual hierarchy.
+* **Dynamic Search Callbacks:** String properties for targeting internal nodes and menu enum selections (`node_name` and `value_menu`) utilize dynamically populated `search` callbacks. This abstracts internal graph complexity, presenting users with cleanly formatted context-aware dropdowns (e.g., `Instance Name [Base Group]`) rather than requiring manual exact-string entry.
 * **Collapsible Architecture:** The entire interface (Presets, Displays, Mappings, Global Overrides, Local Overrides, Object Filters) is wrapped in conditional `layout.box()` containers driven by Boolean properties (`batch_stl_ui_*`). This allows users to compress complex setups into a clean stack.
 * **Smart Auto-Switching:** 
   * When a user changes the `batch_stl_preset_index`, an `update` callback instantly resets the display block to show the predictive Tree Visualizer.
