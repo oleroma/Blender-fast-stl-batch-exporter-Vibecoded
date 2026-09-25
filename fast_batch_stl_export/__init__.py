@@ -213,25 +213,31 @@ def generate_override_combinations(overrides):
     pools = []
     for param_key, pairs in grouped_inputs.items():
         value_groups = {}
+        
+        has_sweep = any(getattr(inp, "use_sweep", False) for ovr, inp in pairs)
+        
         for ovr, inp in pairs:
             if getattr(inp, "use_sweep", False):
                 sweep_vals = parse_sweep_values(ovr, inp)
-                is_repeating = len(sweep_vals) > 1
                 for val in sweep_vals:
                     mock_inp = MockInput(inp, val)
-                    if not is_repeating:
-                        mock_inp.use_tag = False
-                        mock_inp.use_dir = False
                     if val not in value_groups: value_groups[val] = []
                     value_groups[val].append((ovr, mock_inp))
-            else:
+            elif not has_sweep:
                 val = get_input_value(inp)
                 mock_inp = MockInput(inp, val)
-                mock_inp.use_tag = False
-                mock_inp.use_dir = False
                 if val not in value_groups: value_groups[val] = []
                 value_groups[val].append((ovr, mock_inp))
-        pools.append(list(value_groups.values()))
+        
+        is_repeating = len(value_groups) > 1
+        if not is_repeating:
+            for val, mock_pairs in value_groups.items():
+                for ovr, mock_inp in mock_pairs:
+                    mock_inp.use_tag = False
+                    mock_inp.use_dir = False
+                    
+        if value_groups:
+            pools.append(list(value_groups.values()))
 
     if not pools: return [[]]
     combinations = list(itertools.product(*pools))
