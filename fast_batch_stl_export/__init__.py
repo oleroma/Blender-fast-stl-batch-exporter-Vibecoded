@@ -230,12 +230,7 @@ def generate_override_combinations(overrides):
                 value_groups[val].append((ovr, mock_inp))
         
         is_repeating = len(value_groups) > 1
-        if not is_repeating:
-            for val, mock_pairs in value_groups.items():
-                for ovr, mock_inp in mock_pairs:
-                    mock_inp.use_tag = False
-                    mock_inp.use_dir = False
-                    
+        
         if value_groups:
             pools.append(list(value_groups.values()))
 
@@ -528,18 +523,21 @@ def build_tree_dict(scene, preset):
 
     return {root_name: tree}, duplicates
 
-def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None):
+def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplicates=None, actual_path=""):
     if toggled_list is None:
         try:
             import json
             toggled_list = json.loads(bpy.context.scene.batch_stl_collapsed_dirs)
         except Exception:
             toggled_list = []
+    if duplicates is None:
+        duplicates = set()
 
     dirs = [k for k in tree_node.keys() if k != '_files']
     files = tree_node.get('_files', [])
     for k in dirs:
         dir_path = current_path + "/" + k
+        next_actual = os.path.normpath(os.path.join(actual_path, k)) if actual_path else os.path.normpath(k)
         
         default_expanded = (k == dirs[-1])
         is_expanded = default_expanded
@@ -562,7 +560,8 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None):
         row.scale_y = 0.4
         row.label(text=str(k))
         if not is_collapsed and isinstance(tree_node[k], dict):
-            draw_tree_dict(box, tree_node[k], dir_path, toggled_list)
+            draw_tree_dict(box, tree_node[k], dir_path, toggled_list, duplicates, next_actual)
+            
     for f in files:
         split = layout.split(factor=0.025)
         split.column()
@@ -570,6 +569,11 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None):
         
         row = col.row()
         row.scale_y = 0.4
+        
+        f_path = os.path.join(actual_path, f) if actual_path else f
+        if f_path in duplicates:
+            row.alert = True
+            
         row.label(text=str(f))
 
 # --- HEADLESS EXPORT EXECUTION ROUTINE ---
@@ -852,6 +856,14 @@ def search_menu_items_cb(self, context, edit_text):
 class BatchSTLLogLine(bpy.types.PropertyGroup):
     text: bpy.props.StringProperty()
 
+def update_node_input_use_tag(self, context):
+    if not self.use_tag and not self.use_dir:
+        self.use_dir = True
+
+def update_node_input_use_dir(self, context):
+    if not self.use_dir and not self.use_tag:
+        self.use_tag = True
+
 class BatchSTLNodeInput(bpy.types.PropertyGroup):
     input_name: bpy.props.StringProperty(name="Input", default="", update=on_input_name_update, description="Name of the node group input socket or modifier property to override")
     override_type: bpy.props.EnumProperty(
@@ -875,9 +887,9 @@ class BatchSTLNodeInput(bpy.types.PropertyGroup):
         description="Menu or Enum override value to apply",
         search=search_menu_items_cb
     )
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, description="Append tag to filename for this permutation")
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=update_node_input_use_tag, description="Append tag to filename for this permutation")
     tag: bpy.props.StringProperty(name="Tag", default="", description="Custom string for naming or folder creation")
-    use_dir: bpy.props.BoolProperty(name="Use Dir", default=False, description="Create a sub-directory for this specific input permutation")
+    use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=update_node_input_use_dir, description="Create a sub-directory for this specific input permutation")
     use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, description="Enable automatic parameter sweeping across multiple states")
     sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", description="For Int/Float: 'start step count' | For String: 'item1, item2'")
 
@@ -1816,6 +1828,15 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 for o_idx, ovr in enumerate(active_item.node_overrides):
                     draw_override_block(local_box, ovr, o_idx, False, freq_dict)
 
+            layout.separator(factor=0.5)
+            tip_box = layout.box()
+            tip_box.label(text="Use input values or tags to name folders or files", icon='INFO')
+            col = tip_box.column()
+            col.label(text="use tag button to name objects using input name or custom string")
+            col.label(text="use dir button to name folders using input name or custom string")
+            col.label(text="specify [ TAG ] to replace input value", icon='BLANK1')
+            col.label(text="[ _TAG ] would append it to input value, [ TAG_ ] would prepend it to input value", icon='BLANK1')
+
         layout.separator()
         t_box = layout.box()
         t_header = t_box.row(align=True)
@@ -1831,7 +1852,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 warn_row.label(text=f"WARNING: {len(duplicates)} naming collisions detected! Files will be overwritten.", icon='ERROR')
 
             col = t_box.column(align=True)
-            draw_tree_dict(col, tree_dict)
+            draw_tree_dict(col, tree_dict, duplicates=duplicates)
 
         layout.separator()
         layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
