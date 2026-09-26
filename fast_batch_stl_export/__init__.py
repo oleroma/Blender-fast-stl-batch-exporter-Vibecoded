@@ -1563,7 +1563,7 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
     row = layout.row(align=True)
 
     # 1. Node Group
-    s1 = row.split(factor=0.25)
+    s1 = row.split(factor=0.15)
     c1 = s1.row(align=True)
     if show_ng:
         if ng: c1.prop(ng, "group_ptr", text="")
@@ -1572,7 +1572,7 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
         c1.label(text="")
 
     # 2. Node
-    s2 = s1.split(factor=0.33)
+    s2 = s1.split(factor=0.15)
     c2 = s2.row(align=True)
     if show_n:
         if node: c2.prop(node, "name", text="", icon='NODETREE')
@@ -1582,7 +1582,7 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
         c2.label(text="")
 
     # 3. Input
-    s3 = s2.split(factor=0.33)
+    s3 = s2.split(factor=0.30)
     c3 = s3.row(align=True)
     if show_i:
         if inp:
@@ -1602,7 +1602,7 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
         c3.label(text="")
 
     # 4. Value
-    s4 = s3.split(factor=0.75)
+    s4 = s3.split(factor=0.8)
     c4 = s4.row(align=True)
     if val and inp:
         if getattr(val, "use_sweep", False):
@@ -1615,10 +1615,10 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
             elif inp.override_type == 'FLOAT': c4.prop(val, "value_float", text="")
             elif inp.override_type == 'STRING': c4.prop(val, "value_string", text="")
             elif inp.override_type == 'MENU': c4.prop(val, "value_menu", text="")
-
+        c4.prop(val, "use_dir", text="", icon='FILE_FOLDER')
         c4.prop(val, "use_tag", text="", icon='BOOKMARKS')
         c4.prop(val, "tag", text="")
-        c4.prop(val, "use_dir", text="", icon='FILE_FOLDER')
+
 
     if inp:
         if val and getattr(val, "use_sweep", False):
@@ -1668,10 +1668,10 @@ def draw_overrides_table(layout, nodegroups, is_pinned):
 
     # Table Header
     h_row = box.row(align=True)
-    s1 = h_row.split(factor=0.25); s1.label(text="Node Group")
-    s2 = s1.split(factor=0.33); s2.label(text="Target Node")
-    s3 = s2.split(factor=0.33); s3.label(text="Input Socket")
-    s4 = s3.split(factor=0.75); s4.label(text="Value & Options")
+    s1 = h_row.split(factor=0.15); s1.label(text="Node Group")
+    s2 = s1.split(factor=0.18); s2.label(text="Target Node")
+    s3 = s2.split(factor=0.35); s3.label(text="Input Socket")
+    s4 = s3.split(factor=0.8); s4.label(text="Value & Options")
     s4.label(text="Actions")
 
     for ng_idx, ng in enumerate(nodegroups):
