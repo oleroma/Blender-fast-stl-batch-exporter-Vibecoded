@@ -16,18 +16,21 @@ This adaptive separation ensures that heavy permutations cannot corrupt the user
 ## 2. Core Modules & Component Structure
 
 ### A. The Data Model (PropertyGroups)
-The state of the exporter is stored directly in Blender's Scene data (`bpy.types.Scene.batch_stl_presets`), structured hierarchically:
-* **`BatchSTLExportPreset`**: The root configuration object. Contains a global preset name, root directory prefix, a list of mapped collections, and global (pinned) overrides. **Crucially, it also acts as the isolated state-holder for parallel execution**, containing its own `is_exporting`, `export_progress`, `cancel_export`, `export_status`, and an isolated `console_logs` collection to store stdout printouts.
-* **`BatchSTLExportItem`**: Represents a single mapped collection. Contains the pointer to the target collection, local naming tags, sub-path routes, object exclusion lists (`BatchSTLExcludedObject`), and a list of local overrides.
-* **`BatchSTLNodeOverride`**: Represents a targeted parameter injection point (either an internal Geometry Node or a Modifier Interface). Contains a dynamic `node_name` search callback that resolves node instances alongside their base group names (`Instance Name [Base Group]`).
-* **`BatchSTLNodeInput`**: Represents a specific input socket and its target value, data type, and permutation rules. Features dynamic context-aware search callbacks for Enum/Menu types (`value_menu`).
+The state of the exporter is stored directly in Blender's Scene data (`bpy.types.Scene.batch_stl_presets`), structured in a strict one-to-many 6-tier hierarchy:
+* **`BatchSTLExportPreset`**: The root configuration object. Contains a global preset name, root directory prefix, a list of mapped collections, and globally pinned node group overrides. Crucially, it acts as the isolated state-holder for parallel execution, containing its own `is_exporting`, `export_progress`, `cancel_export`, and `console_logs`.
+* **`BatchSTLCollection`**: Represents a single mapped collection target. Contains the pointer to the target collection, local naming tags, sub-path routes, object exclusion lists (`BatchSTLExcludedObject`), and a list of local node groups.
+* **`BatchSTLNodeGroup`**: Represents the targeted Node Group tree holding the nodes/modifiers being injected.
+* **`BatchSTLNode`**: Represents the specific target node within the tree. If targeting the modifier directly, it falls back to a `<Modifier Interface>` placeholder.
+* **`BatchSTLInput`**: Represents a specific input socket on the target node. Handles automatic data-type inference (`infer_input_type`) upon assignment.
+* **`BatchSTLValue`**: Represents a discrete permutation value or parameter sweep setting (float, int, bool, string, or menu item) assigned to the parent input, along with local tagging and directory instructions.
 * **`BatchSTLLogLine`**: A simple string container used to cache stdout lines for the integrated UI console.
 
-### B. The Permutation Engine
-This functional block computes the parameter matrix before export:
+### B. The Permutation Engine & Data Adapters
+Because the UI data model is strictly 6-tiers deep but the permutation math requires a flattened list, an adapter pattern is employed:
+* **`get_flat_overrides` & `TempMockOverride`:** Traverses the deep `preset > collection > nodegroup > node > input > value` hierarchy and squashes it into flat `MockOverride` instances.
 * **`parse_sweep_values`**: Dynamically interprets `Sweep` ranges based on type (e.g., parsing float steps `1.0 0.5 5`, splitting comma-separated strings, or dynamically querying inner node enum arrays).
 * **`generate_override_combinations`**: Groups identical input targets and computes the Cartesian product (`itertools.product`) of all input states to generate a flat list of discrete permutation configurations.
-* **`reconstruct_overrides_for_combo`**: Packages a raw permutation array back into a structured `MockOverride` format that the injection logic can process.
+* **`reconstruct_overrides_for_combo`**: Packages a raw permutation array back into a structured format that the injection logic can process.
 
 ### C. Path Simulation & Tree Visualizer
 A predictive engine that visualizes the output without executing the graph:
@@ -65,9 +68,10 @@ Globally scoped to serve both execution paths, strictly internalizing dependenci
 
 ## 3. UI State Management & View Routing
 
-* **Collapsible Architecture:** The entire interface (Presets, Displays, Mappings, Global Overrides, Local Overrides, Object Filters) is wrapped in conditional `layout.box()` containers driven by Boolean properties (`batch_stl_ui_*`).
-* **Dynamic Input Grouping:** To prevent visual clutter, input variations sharing the exact same socket name are dynamically combined into unified sub-boxes. The socket name and sweep controls are drawn only once in the header row, with subsequent discrete values neatly stacked below.
-* **Sweep vs. Discrete Exclusivity:** The UI operations enforce strict state exclusion. Enabling a parametric sweep automatically purges manual duplicate rows and zeroes out static data values. Conversely, duplicating a row (Shift+Copy) or pasting matching state data automatically disables the sweep toggle across the group.
+* **Collapsible Architecture:** The entire interface (Presets, Displays, Collections, Global Overrides, Local Overrides, Object Filters) is wrapped in conditional `layout.box()` containers driven by Boolean properties (`batch_stl_ui_*`).
+* **Single-Table Spanning Layout:** The overrides are drawn as a unified, grid-like table rather than deeply nested graphical boxes. Using `row.split()`, the UI dynamically aligns `Node Group > Target Node > Input Socket > Value & Options > Actions` into clean, continuous columns. 
+* **Automatic Type Inference:** The extension abstracts away type-selection logic. When a user targets a node input, `infer_input_type` automatically scans the geometry nodes tree and silently assigns the correct float, int, string, bool, or menu property.
+* **Inline Actions & Exclusivity:** Users can append new structural layers via inline `(+)` operator buttons located natively inside the row gaps. Enabling a parametric sweep automatically purges manual duplicate rows and zeroes out static data values to ensure strict permutation state exclusivity.
 * **Smart Auto-Switching:** 
   * When a user changes the `batch_stl_preset_index`, an `update` callback instantly resets the display block to show the predictive Tree Visualizer.
   * When the `EXPORT_OT_batch_stl_multi` operator is invoked, it programmatically switches the display block to the Global Console mode, ensuring the user immediately sees the live output of their active task.

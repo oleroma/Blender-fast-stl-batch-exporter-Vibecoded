@@ -1102,6 +1102,11 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
     n_idx: bpy.props.IntProperty(default=-1)
     i_idx: bpy.props.IntProperty(default=-1)
     v_idx: bpy.props.IntProperty(default=-1)
+    shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
+
+    def invoke(self, context, event):
+        self.shift_pressed = event.shift
+        return self.execute(context)
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -1110,41 +1115,124 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         ng_list = preset.nodegroups if self.is_pinned else get_active_collection(preset).nodegroups
 
         if self.action == 'ADD_GROUP':
-            ng_list.add()
+            ng = ng_list.add()
+            node = ng.nodes.add()
+            node.name = "<Modifier Interface>"
+            inp = node.inputs.add()
+            inp.values.add()
         elif self.action == 'DEL_GROUP':
             ng_list.remove(self.ng_idx)
 
         elif self.action == 'ADD_NODE':
             node = ng_list[self.ng_idx].nodes.add()
             node.name = "<Modifier Interface>"
+            inp = node.inputs.add()
+            inp.values.add()
         elif self.action == 'DEL_NODE':
             ng_list[self.ng_idx].nodes.remove(self.n_idx)
 
         elif self.action == 'ADD_INPUT':
-            ng_list[self.ng_idx].nodes[self.n_idx].inputs.add()
+            ng = ng_list[self.ng_idx]
+            node = ng.nodes[self.n_idx]
+            if self.shift_pressed and ng.group_ptr:
+                is_mod = not node.name or node.name == "<Modifier Interface>"
+                source_inputs = []
+                if is_mod and hasattr(ng.group_ptr, "interface"):
+                    for item in ng.group_ptr.interface.items_tree:
+                        if getattr(item, "item_type", "SOCKET") == 'SOCKET' and getattr(item, "in_out", "INPUT") == 'INPUT':
+                            source_inputs.append(item.name)
+                elif not is_mod and node.name:
+                    target_n = ng.group_ptr.nodes.get(node.name.split(" [")[0].strip())
+                    if target_n:
+                        for i in target_n.inputs:
+                            if not getattr(i, "is_unavailable", False) and not getattr(i, "hide", False):
+                                source_inputs.append(i.name)
+                
+                if source_inputs:
+                    existing_names = {i.name for i in node.inputs}
+                    added = False
+                    for s_name in source_inputs:
+                        if s_name and s_name not in existing_names:
+                            inp = node.inputs.add()
+                            inp.name = s_name
+                            inp.values.add()
+                            added = True
+                    if added:
+                        return {'FINISHED'}
+
+            inp = node.inputs.add()
+            inp.values.add()
         elif self.action == 'DEL_INPUT':
             ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
 
-        elif self.action == 'ADD_VALUE':
-            ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.add()
         elif self.action == 'DEL_VALUE':
             ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.remove(self.v_idx)
 
-        elif self.action == 'TOGGLE_SWEEP':
+        elif self.action in ['ADD_VALUE', 'TOGGLE_SWEEP', 'VALUE_ACTION']:
             vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
-            val = vals[self.v_idx]
-            val.use_sweep = not val.use_sweep
-            if val.use_sweep:
-                for j in reversed(range(len(vals))):
-                    if j != self.v_idx: vals.remove(j)
+            
+            if self.v_idx < 0:
+                vals.add()
+            else:
+                val = vals[self.v_idx]
+                if not val.use_sweep:
+                    if self.shift_pressed:
+                        val.use_sweep = True
+                        for j in reversed(range(len(vals))):
+                            if j != self.v_idx: vals.remove(j)
+                    else:
+                        vals.add()
+                else:
+                    val.use_sweep = False
+                    if self.shift_pressed:
+                        inp_obj = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
+                        if inp_obj.override_type in ['FLOAT', 'INT', 'MENU']:
+                            ng_obj = ng_list[self.ng_idx]
+                            node_obj = ng_obj.nodes[self.n_idx]
+                            target = 'MODIFIER' if not node_obj.name or node_obj.name == "<Modifier Interface>" else 'NODE'
+                            
+                            temp_inp = TempMockInput(inp_obj.name, inp_obj.override_type, val)
+                            temp_ovr = TempMockOverride(target, ng_obj.group_ptr, node_obj.name, [temp_inp])
+                            
+                            parsed_vals = parse_sweep_values(temp_ovr, temp_inp)
+                            if parsed_vals:
+                                first_val = parsed_vals[0]
+                                if inp_obj.override_type == 'FLOAT': val.value_float = first_val
+                                elif inp_obj.override_type == 'INT': val.value_int = first_val
+                                elif inp_obj.override_type == 'MENU': val.value_menu = str(first_val)
+                                
+                                for p_val in parsed_vals[1:]:
+                                    new_val = vals.add()
+                                    new_val.use_sweep = False
+                                    if inp_obj.override_type == 'FLOAT': new_val.value_float = p_val
+                                    elif inp_obj.override_type == 'INT': new_val.value_int = p_val
+                                    elif inp_obj.override_type == 'MENU': new_val.value_menu = str(p_val)
 
-        elif self.action == 'MOVE_VAL_UP':
-            if self.v_idx > 0:
-                ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.move(self.v_idx, self.v_idx - 1)
-        elif self.action == 'MOVE_VAL_DOWN':
+        elif self.action == 'MOVE_GROUP_UP':
+            if self.ng_idx > 0: ng_list.move(self.ng_idx, self.ng_idx - 1)
+        elif self.action == 'MOVE_GROUP_DOWN':
+            if self.ng_idx < len(ng_list) - 1: ng_list.move(self.ng_idx, self.ng_idx + 1)
+
+        elif self.action == 'MOVE_NODE_UP':
+            nodes = ng_list[self.ng_idx].nodes
+            if self.n_idx > 0: nodes.move(self.n_idx, self.n_idx - 1)
+        elif self.action == 'MOVE_NODE_DOWN':
+            nodes = ng_list[self.ng_idx].nodes
+            if self.n_idx < len(nodes) - 1: nodes.move(self.n_idx, self.n_idx + 1)
+
+        elif self.action == 'MOVE_INPUT_UP':
+            inputs = ng_list[self.ng_idx].nodes[self.n_idx].inputs
+            if self.i_idx > 0: inputs.move(self.i_idx, self.i_idx - 1)
+        elif self.action == 'MOVE_INPUT_DOWN':
+            inputs = ng_list[self.ng_idx].nodes[self.n_idx].inputs
+            if self.i_idx < len(inputs) - 1: inputs.move(self.i_idx, self.i_idx + 1)
+
+        elif self.action == 'MOVE_VALUE_UP':
             vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
-            if self.v_idx < len(vals) - 1:
-                vals.move(self.v_idx, self.v_idx + 1)
+            if self.v_idx > 0: vals.move(self.v_idx, self.v_idx - 1)
+        elif self.action == 'MOVE_VALUE_DOWN':
+            vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
+            if self.v_idx < len(vals) - 1: vals.move(self.v_idx, self.v_idx + 1)
 
         return {'FINISHED'}
 
@@ -1477,39 +1565,39 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
     # 1. Node Group
     s1 = row.split(factor=0.25)
     c1 = s1.row(align=True)
-    if show_ng and ng:
-        c1.prop(ng, "group_ptr", text="")
-        op = c1.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
-        op = c1.operator("batch_stl.table_action", text="", icon='X'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+    if show_ng:
+        if ng: c1.prop(ng, "group_ptr", text="")
+        op = c1.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_GROUP'; op.is_pinned = is_pinned
     else:
         c1.label(text="")
 
     # 2. Node
     s2 = s1.split(factor=0.33)
     c2 = s2.row(align=True)
-    if show_n and node:
-        c2.prop(node, "name", text="", icon='NODETREE')
-        op = c2.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
-        op = c2.operator("batch_stl.table_action", text="", icon='X'); op.action = 'DEL_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+    if show_n:
+        if node: c2.prop(node, "name", text="", icon='NODETREE')
+        if ng:
+            op = c2.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
     else:
         c2.label(text="")
 
     # 3. Input
     s3 = s2.split(factor=0.33)
     c3 = s3.row(align=True)
-    if show_i and inp:
-        is_mod = not node.name or node.name == "<Modifier Interface>"
-        if is_mod and ng.group_ptr and hasattr(ng.group_ptr, "interface"):
-            c3.prop_search(inp, "name", ng.group_ptr.interface, "items_tree", text="")
-        elif not is_mod and ng.group_ptr and node.name:
-            target_n = ng.group_ptr.nodes.get(node.name.split(" [")[0].strip())
-            if target_n: c3.prop_search(inp, "name", target_n, "inputs", text="")
-            else: c3.prop(inp, "name", text="")
-        else:
-            c3.prop(inp, "name", text="")
+    if show_i:
+        if inp:
+            is_mod = not node.name or node.name == "<Modifier Interface>"
+            if is_mod and ng.group_ptr and hasattr(ng.group_ptr, "interface"):
+                c3.prop_search(inp, "name", ng.group_ptr.interface, "items_tree", text="")
+            elif not is_mod and ng.group_ptr and node.name:
+                target_n = ng.group_ptr.nodes.get(node.name.split(" [")[0].strip())
+                if target_n: c3.prop_search(inp, "name", target_n, "inputs", text="")
+                else: c3.prop(inp, "name", text="")
+            else:
+                c3.prop(inp, "name", text="")
 
-        op = c3.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_VALUE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-        op = c3.operator("batch_stl.table_action", text="", icon='X'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+        if node:
+            op = c3.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
     else:
         c3.label(text="")
 
@@ -1531,25 +1619,39 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
         c4.prop(val, "use_tag", text="", icon='BOOKMARKS')
         c4.prop(val, "tag", text="")
         c4.prop(val, "use_dir", text="", icon='FILE_FOLDER')
+
+    if inp:
+        if val and getattr(val, "use_sweep", False):
+            op = c4.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
+        else:
+            op = c4.operator("batch_stl.table_action", text="", icon='ADD')
+            
+        op.action = 'VALUE_ACTION'
+        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx if val else -1
     else:
         c4.label(text="")
 
     # 5. Actions
     c5 = s4.row(align=True)
-    if val and inp:
-        op = c5.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=getattr(val, 'use_sweep', False))
-        op.action = 'TOGGLE_SWEEP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
+    action_type = None
+    if show_ng: action_type = 'GROUP'
+    elif show_n: action_type = 'NODE'
+    elif show_i: action_type = 'INPUT'
+    elif show_v or (val and inp): action_type = 'VALUE'
+
+    if action_type:
         op = c5.operator("batch_stl.table_action", text="", icon='TRIA_UP')
-        op.action = 'MOVE_VAL_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+        op.action = f'MOVE_{action_type}_UP'
+        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
         op = c5.operator("batch_stl.table_action", text="", icon='TRIA_DOWN')
-        op.action = 'MOVE_VAL_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+        op.action = f'MOVE_{action_type}_DOWN'
+        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
         op = c5.operator("batch_stl.table_action", text="", icon='TRASH')
-        op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-    else:
-        c5.label(text="")
+        op.action = f'DEL_{action_type}'
+        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
 
 def draw_overrides_table(layout, nodegroups, is_pinned):
