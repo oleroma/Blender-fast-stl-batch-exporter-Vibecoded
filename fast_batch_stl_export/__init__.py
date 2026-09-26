@@ -1,6 +1,7 @@
 """
 Fast Batch STL Exporter
 Architecture: Single-File Monolithic (Optimized for Agentic Environments)
+Data Hierarchy: Preset > Collection > NodeGroup > Node > Input > Value
 """
 
 import os
@@ -26,9 +27,7 @@ from bpy.app.handlers import persistent
 
 _clipboard = {
     "preset": None,
-    "mapping": None,
-    "override": None,
-    "input": None
+    "collection": None
 }
 
 
@@ -121,7 +120,48 @@ def get_override_signature(overrides):
         sig.append((target, pg_name, node_name, tuple(inputs_sig)))
     return tuple(sig)
 
-# --- PERMUTATION ENGINE ---
+# --- PERMUTATION ENGINE (Adapters) ---
+class TempMockInput:
+    def __init__(self, name, o_type, val_obj):
+        self.input_name = name
+        self.override_type = o_type
+        self.use_tag = val_obj.use_tag
+        self.tag = val_obj.tag
+        self.use_dir = val_obj.use_dir
+        self.use_sweep = val_obj.use_sweep
+        self.sweep_range = val_obj.sweep_range
+        self._val_obj = val_obj
+    @property
+    def value_bool(self): return self._val_obj.value_bool
+    @property
+    def value_int(self): return self._val_obj.value_int
+    @property
+    def value_float(self): return self._val_obj.value_float
+    @property
+    def value_string(self): return self._val_obj.value_string
+    @property
+    def value_menu(self): return self._val_obj.value_menu
+
+class TempMockOverride:
+    def __init__(self, target, ptr, node_name, temp_inputs):
+        self.override_target = target
+        self.parent_group_ptr = ptr
+        self.node_name = node_name
+        self.inputs = temp_inputs
+
+def get_flat_overrides(nodegroups):
+    overrides = []
+    for ng in nodegroups:
+        for node in ng.nodes:
+            target = 'MODIFIER' if not node.name or node.name == "<Modifier Interface>" else 'NODE'
+            temp_inputs = []
+            for inp in node.inputs:
+                for val in inp.values:
+                    temp_inputs.append(TempMockInput(inp.name, inp.override_type, val))
+            if temp_inputs:
+                overrides.append(TempMockOverride(target, ng.group_ptr, node.name, temp_inputs))
+    return overrides
+
 class MockInput:
     def __init__(self, base_inp, override_val):
         self.input_name = base_inp.input_name
@@ -213,9 +253,8 @@ def generate_override_combinations(overrides):
     pools = []
     for param_key, pairs in grouped_inputs.items():
         value_groups = {}
-        
         has_sweep = any(getattr(inp, "use_sweep", False) for ovr, inp in pairs)
-        
+
         for ovr, inp in pairs:
             if getattr(inp, "use_sweep", False):
                 sweep_vals = parse_sweep_values(ovr, inp)
@@ -228,9 +267,7 @@ def generate_override_combinations(overrides):
                 mock_inp = MockInput(inp, val)
                 if val not in value_groups: value_groups[val] = []
                 value_groups[val].append((ovr, mock_inp))
-        
-        is_repeating = len(value_groups) > 1
-        
+
         if value_groups:
             pools.append(list(value_groups.values()))
 
@@ -326,9 +363,9 @@ def get_active_preset(scene):
     if presets and 0 <= index < len(presets): return presets[index]
     return None
 
-def get_active_mapping(preset):
-    if preset and preset.mappings and 0 <= preset.mapping_index < len(preset.mappings):
-        return preset.mappings[preset.mapping_index]
+def get_active_collection(preset):
+    if preset and preset.collections and 0 <= preset.collection_index < len(preset.collections):
+        return preset.collections[preset.collection_index]
     return None
 
 def log_to_console(preset, text):
@@ -390,62 +427,71 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
         print(f"  │         │    ├─ Disk I/O Write: {t_write-t_format:.4f}s | Path: {os.path.basename(filepath)}")
 
 # --- JSON UTILS ---
-def copy_override_to_dict(o):
+def copy_val_to_dict(v):
     return {
-        "override_target": o.override_target,
-        "parent_group": o.parent_group_ptr.name if o.parent_group_ptr else "",
-        "node_name": o.node_name,
-        "inputs": [{
-            "input_name": i.input_name, "override_type": i.override_type,
-            "value_bool": i.value_bool, "value_int": i.value_int, "value_float": i.value_float,
-            "value_string": i.value_string, "value_menu": i.value_menu,
-            "use_tag": i.use_tag, "tag": i.tag, "use_dir": i.use_dir,
-            "use_sweep": getattr(i, "use_sweep", False), "sweep_range": getattr(i, "sweep_range", "")
-        } for i in o.inputs]
+        "value_bool": v.value_bool, "value_int": v.value_int, "value_float": v.value_float,
+        "value_string": v.value_string, "value_menu": v.value_menu,
+        "use_tag": v.use_tag, "tag": v.tag, "use_dir": v.use_dir,
+        "use_sweep": getattr(v, "use_sweep", False), "sweep_range": getattr(v, "sweep_range", "")
     }
 
-def paste_override_from_dict(new_o, data):
-    new_o.override_target = data["override_target"]
-    pg_name = data["parent_group"]
-    new_o.parent_group_ptr = bpy.data.node_groups.get(pg_name) if pg_name else None
-    new_o.node_name = data["node_name"]
-    for i_data in data["inputs"]:
-        new_i = new_o.inputs.add()
-        for k, v in i_data.items(): setattr(new_i, k, v)
+def copy_input_to_dict(i):
+    return {"name": i.name, "override_type": i.override_type, "values": [copy_val_to_dict(v) for v in i.values]}
 
-def copy_mapping_to_dict(m):
+def copy_node_to_dict(n):
+    return {"name": n.name, "inputs": [copy_input_to_dict(i) for i in n.inputs]}
+
+def copy_ng_to_dict(ng):
+    return {"group": ng.group_ptr.name if ng.group_ptr else "", "nodes": [copy_node_to_dict(n) for n in ng.nodes]}
+
+def copy_collection_to_dict(c):
     return {
-        "collection_name": m.collection_ptr.name if m.collection_ptr else "",
-        "use_tag": m.use_tag, "tag": m.tag, "sub_path": m.sub_path,
-        "use_filter": getattr(m, "use_filter", False),
-        "excluded_objects": [e.name for e in m.excluded_objects],
-        "overrides": [copy_override_to_dict(o) for o in m.node_overrides]
+        "collection_name": c.collection_ptr.name if c.collection_ptr else "",
+        "use_tag": c.use_tag, "tag": c.tag, "sub_path": c.sub_path,
+        "use_filter": getattr(c, "use_filter", False),
+        "excluded_objects": [e.name for e in c.excluded_objects],
+        "nodegroups": [copy_ng_to_dict(ng) for ng in c.nodegroups]
     }
-
-def paste_mapping_from_dict(new_m, data):
-    c_name = data.get("collection_name", "")
-    new_m.collection_ptr = bpy.data.collections.get(c_name) if c_name else None
-    new_m.use_tag = data.get("use_tag", True)
-    new_m.tag = data.get("tag", "")
-    new_m.sub_path = data.get("sub_path", "")
-    new_m.use_filter = data.get("use_filter", False)
-    for obj_name in data.get("excluded_objects", []):
-        new_m.excluded_objects.add().name = obj_name
-    for o_data in data.get("overrides", []):
-        paste_override_from_dict(new_m.node_overrides.add(), o_data)
 
 def copy_preset_to_dict(src):
     return {
         "name": src.name, "preset_prefix": src.preset_prefix,
-        "pinned_overrides": [copy_override_to_dict(o) for o in src.pinned_overrides],
-        "mappings": [copy_mapping_to_dict(m) for m in src.mappings]
+        "nodegroups": [copy_ng_to_dict(ng) for ng in src.nodegroups],
+        "collections": [copy_collection_to_dict(c) for c in src.collections]
     }
+
+def paste_val_from_dict(new_v, data):
+    for k, v in data.items(): setattr(new_v, k, v)
+
+def paste_input_from_dict(new_i, data):
+    new_i.name = data["name"]
+    new_i.override_type = data.get("override_type", 'FLOAT')
+    for v_data in data.get("values", []): paste_val_from_dict(new_i.values.add(), v_data)
+
+def paste_node_from_dict(new_n, data):
+    new_n.name = data["name"]
+    for i_data in data.get("inputs", []): paste_input_from_dict(new_n.inputs.add(), i_data)
+
+def paste_ng_from_dict(new_ng, data):
+    g_name = data.get("group", "")
+    new_ng.group_ptr = bpy.data.node_groups.get(g_name) if g_name else None
+    for n_data in data.get("nodes", []): paste_node_from_dict(new_ng.nodes.add(), n_data)
+
+def paste_collection_from_dict(new_c, data):
+    c_name = data.get("collection_name", "")
+    new_c.collection_ptr = bpy.data.collections.get(c_name) if c_name else None
+    new_c.use_tag = data.get("use_tag", True)
+    new_c.tag = data.get("tag", "")
+    new_c.sub_path = data.get("sub_path", "")
+    new_c.use_filter = data.get("use_filter", False)
+    for obj_name in data.get("excluded_objects", []): new_c.excluded_objects.add().name = obj_name
+    for ng_data in data.get("nodegroups", []): paste_ng_from_dict(new_c.nodegroups.add(), ng_data)
 
 def paste_preset_from_dict(new_p, data):
     new_p.name = data.get("name", "Imported Preset")
     new_p.preset_prefix = data.get("preset_prefix", "")
-    for o_data in data.get("pinned_overrides", []): paste_override_from_dict(new_p.pinned_overrides.add(), o_data)
-    for m_data in data.get("mappings", []): paste_mapping_from_dict(new_p.mappings.add(), m_data)
+    for ng_data in data.get("nodegroups", []): paste_ng_from_dict(new_p.nodegroups.add(), ng_data)
+    for c_data in data.get("collections", []): paste_collection_from_dict(new_p.collections.add(), c_data)
 
 # --- TREE VISUALIZER LOGIC ---
 def build_tree_dict(scene, preset):
@@ -459,19 +505,19 @@ def build_tree_dict(scene, preset):
         current_root[preset.preset_prefix] = {}
         current_root = current_root[preset.preset_prefix]
 
-    for mapping in preset.mappings:
-        mapping_root = current_root
-        mapping_root_path = []
-        if mapping.sub_path:
-            parts = mapping.sub_path.replace('\\', '/').split('/')
+    for c in preset.collections:
+        c_root = current_root
+        c_root_path = []
+        if c.sub_path:
+            parts = c.sub_path.replace('\\', '/').split('/')
             for part in parts:
                 if part:
-                    if part not in mapping_root: mapping_root[part] = {}
-                    mapping_root = mapping_root[part]
-                    mapping_root_path.append(part)
+                    if part not in c_root: c_root[part] = {}
+                    c_root = c_root[part]
+                    c_root_path.append(part)
 
-        all_overrides = list(preset.pinned_overrides) + list(mapping.node_overrides)
-        
+        all_overrides = get_flat_overrides(preset.nodegroups) + get_flat_overrides(c.nodegroups)
+
         freq_dict = {}
         for o in all_overrides:
             for i in o.inputs:
@@ -481,9 +527,9 @@ def build_tree_dict(scene, preset):
 
         combinations = generate_override_combinations(all_overrides)
         valid_objs = []
-        if mapping.collection_ptr:
-            excluded_names = {e.name for e in mapping.excluded_objects} if getattr(mapping, "use_filter", False) else set()
-            for obj in mapping.collection_ptr.all_objects:
+        if c.collection_ptr:
+            excluded_names = {e.name for e in c.excluded_objects} if getattr(c, "use_filter", False) else set()
+            for obj in c.collection_ptr.all_objects:
                 if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
                     if obj.name not in excluded_names: valid_objs.append(obj)
 
@@ -491,7 +537,7 @@ def build_tree_dict(scene, preset):
         if not combinations: combinations = [[]]
 
         for combo in combinations:
-            combo_root = mapping_root
+            combo_root = c_root
             combo_suffix = ""
             combo_subpath = []
             processed_params = set()
@@ -516,11 +562,11 @@ def build_tree_dict(scene, preset):
                     processed_params.add(param_key)
 
             if '_files' not in combo_root: combo_root['_files'] = []
-            base_tag = mapping.tag if getattr(mapping, "use_tag", False) and mapping.tag else ""
+            base_tag = c.tag if getattr(c, "use_tag", False) and c.tag else ""
             final_tag = base_tag + combo_suffix
 
             full_dir_parts = [preset.preset_prefix] if preset.preset_prefix else []
-            full_dir_parts.extend(mapping_root_path)
+            full_dir_parts.extend(c_root_path)
             full_dir_parts.extend(combo_subpath)
             dir_path_str = os.path.normpath(os.path.join(root_name, *full_dir_parts))
 
@@ -548,42 +594,42 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
     for k in dirs:
         dir_path = current_path + "/" + k
         next_actual = os.path.normpath(os.path.join(actual_path, k)) if actual_path else os.path.normpath(k)
-        
+
         default_expanded = (k == dirs[-1])
         is_expanded = default_expanded
         if dir_path in toggled_list:
             is_expanded = not default_expanded
-            
+
         is_collapsed = not is_expanded
 
         split = layout.split(factor=0.005)
-        split.column() # Spacer for extra indentation
+        split.column()
         col = split.column()
-        
+
         box = col.box()
         row = box.row()
-        
+
         icon = 'TRIA_RIGHT' if is_collapsed else 'TRIA_DOWN'
         op = row.operator("batch_stl.toggle_dir_tree", text="", icon=icon, emboss=False)
         op.dir_path = dir_path
-        
+
         row.scale_y = 0.4
         row.label(text=str(k))
         if not is_collapsed and isinstance(tree_node[k], dict):
             draw_tree_dict(box, tree_node[k], dir_path, toggled_list, duplicates, next_actual)
-            
+
     for f in files:
         split = layout.split(factor=0.025)
         split.column()
         col = split.column()
-        
+
         row = col.row()
         row.scale_y = 0.4
-        
+
         f_path = os.path.join(actual_path, f) if actual_path else f
         if f_path in duplicates:
             row.alert = True
-            
+
         row.label(text=str(f))
 
 # --- HEADLESS EXPORT EXECUTION ROUTINE ---
@@ -605,9 +651,9 @@ def run_headless_export(preset_index):
     t_phase0_start = time.perf_counter()
 
     active_export_objects = set()
-    for mapping in preset.mappings:
-        if mapping.collection_ptr and not is_collection_excluded(bpy.context, mapping.collection_ptr):
-            active_export_objects.update(mapping.collection_ptr.all_objects)
+    for c in preset.collections:
+        if c.collection_ptr and not is_collection_excluded(bpy.context, c.collection_ptr):
+            active_export_objects.update(c.collection_ptr.all_objects)
 
     muted_count = 0
     for obj in bpy.context.view_layer.objects:
@@ -620,17 +666,15 @@ def run_headless_export(preset_index):
     print(f"    ├─ Permanently Muted {muted_count} unused GN modifiers to accelerate Graph evaluation in {time.perf_counter() - t_phase0_start:.4f}s")
 
     execution_batches = {}
-    sig_pinned = get_override_signature(preset.pinned_overrides)
+    sig_pinned = get_override_signature(get_flat_overrides(preset.nodegroups))
 
-    for mapping in preset.mappings:
-        if not mapping.collection_ptr: continue
-        if is_collection_excluded(bpy.context, mapping.collection_ptr):
-            print(f"  ├─ Skipping '{mapping.collection_ptr.name}' (Excluded from View Layer)")
-            continue
-        sig_local = get_override_signature(mapping.node_overrides)
+    for c in preset.collections:
+        if not c.collection_ptr: continue
+        if is_collection_excluded(bpy.context, c.collection_ptr): continue
+        sig_local = get_override_signature(get_flat_overrides(c.nodegroups))
         full_sig = sig_pinned + sig_local
         if full_sig not in execution_batches: execution_batches[full_sig] = []
-        execution_batches[full_sig].append(mapping)
+        execution_batches[full_sig].append(c)
 
     if not execution_batches:
         print("  └─ No active collections to export.")
@@ -638,12 +682,12 @@ def run_headless_export(preset_index):
         sys.exit(0)
 
     total_operations = 0
-    for signature, mappings_in_batch in execution_batches.items():
-        first_mapping = mappings_in_batch[0]
-        all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
+    for signature, c_in_batch in execution_batches.items():
+        first_c = c_in_batch[0]
+        all_overrides = get_flat_overrides(preset.nodegroups) + get_flat_overrides(first_c.nodegroups)
         combinations = generate_override_combinations(all_overrides)
         batch_obj_count = 0
-        for m in mappings_in_batch:
+        for m in c_in_batch:
             excluded_names = {e.name for e in m.excluded_objects} if getattr(m, "use_filter", False) else set()
             for obj in m.collection_ptr.all_objects:
                 if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
@@ -656,27 +700,27 @@ def run_headless_export(preset_index):
     current_op_step = 0
     batch_counter = 1
 
-    for signature, mappings_in_batch in execution_batches.items():
+    for signature, c_in_batch in execution_batches.items():
         t_batch_start = time.perf_counter()
-        first_mapping = mappings_in_batch[0]
-        all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
-        
+        first_c = c_in_batch[0]
+        all_overrides = get_flat_overrides(preset.nodegroups) + get_flat_overrides(first_c.nodegroups)
+
         freq_dict = {}
         for o in all_overrides:
             for i in o.inputs:
                 key = (o.override_target, o.node_name, i.input_name)
                 weight = 2 if getattr(i, "use_sweep", False) else 1
                 freq_dict[key] = freq_dict.get(key, 0) + weight
-                
+
         combinations = generate_override_combinations(all_overrides)
 
-        is_clean_batch = len(first_mapping.node_overrides) == 0
-        batch_type = "Clean (Pinned Only)" if is_clean_batch else f"Dirty ({len(first_mapping.node_overrides)} Local Overrides)"
-        collection_names = [f"{m.collection_ptr.name} [{m.tag}]" for m in mappings_in_batch]
-        print(f"  ├─ Batch {batch_counter}/{len(execution_batches)} [{batch_type}]: Processing {len(collection_names)} mapped instances with {len(combinations)} permutation(s)")
+        is_clean_batch = len(get_flat_overrides(first_c.nodegroups)) == 0
+        batch_type = "Clean (Pinned Only)" if is_clean_batch else f"Dirty ({len(get_flat_overrides(first_c.nodegroups))} Local Overrides)"
+        c_names = [f"{m.collection_ptr.name} [{m.tag}]" for m in c_in_batch]
+        print(f"  ├─ Batch {batch_counter}/{len(execution_batches)} [{batch_type}]: Processing {len(c_names)} mapped instances with {len(combinations)} permutation(s)")
 
         batch_objects = set()
-        for m in mappings_in_batch: batch_objects.update(m.collection_ptr.all_objects)
+        for m in c_in_batch: batch_objects.update(m.collection_ptr.all_objects)
 
         for combo_idx, combo in enumerate(combinations):
             print(f"  │    ├─ Permutation {combo_idx + 1}/{len(combinations)}")
@@ -693,7 +737,7 @@ def run_headless_export(preset_index):
                         elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
                         else: naming_str = inp.tag
                     else: naming_str = val_str
-                    
+
                     is_permutation = freq_dict.get(param_key, 0) > 1
                     if is_permutation and getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
                     if is_permutation and getattr(inp, "use_dir", False): combo_subpath = os.path.join(combo_subpath, naming_str)
@@ -709,13 +753,13 @@ def run_headless_export(preset_index):
                 depsgraph = bpy.context.evaluated_depsgraph_get()
                 print(f"  │    │    ├─ Applied & Synced Graph: {time.perf_counter() - t_ovr:.4f}s")
 
-                for mapping in mappings_in_batch:
-                    out_dir = os.path.normpath(os.path.join(root_dir, mapping.sub_path, combo_subpath))
+                for c in c_in_batch:
+                    out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path, combo_subpath))
                     os.makedirs(out_dir, exist_ok=True)
-                    print(f"  │    │    ├─ Exporting: {mapping.collection_ptr.name}{' ['+mapping.tag+']' if mapping.tag else ''}")
+                    print(f"  │    │    ├─ Exporting: {c.collection_ptr.name}{' ['+c.tag+']' if c.tag else ''}")
 
-                    excluded_names = {e.name for e in mapping.excluded_objects} if getattr(mapping, "use_filter", False) else set()
-                    for obj in mapping.collection_ptr.all_objects:
+                    excluded_names = {e.name for e in c.excluded_objects} if getattr(c, "use_filter", False) else set()
+                    for obj in c.collection_ptr.all_objects:
                         if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
                             if obj.name in excluded_names: continue
                             t_eval = time.perf_counter()
@@ -725,7 +769,7 @@ def run_headless_export(preset_index):
                             print(f"  │         ├─ Evaluated Mesh [{obj.name}]: {time.perf_counter() - t_eval:.4f}s")
 
                             if mesh:
-                                base_tag = mapping.tag if getattr(mapping, "use_tag", False) and mapping.tag else ""
+                                base_tag = c.tag if getattr(c, "use_tag", False) and c.tag else ""
                                 final_tag = base_tag + combo_suffix
                                 filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{final_tag}.stl")
                                 write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=True)
@@ -755,205 +799,194 @@ def run_headless_export(preset_index):
 # === [ 3. PROPERTY GROUPS ] ===
 # ==============================================================================
 
+def infer_input_type(group_ptr, node_name, input_name):
+    if not group_ptr or not input_name: return 'FLOAT'
+    if not node_name or node_name == "<Modifier Interface>":
+        if hasattr(group_ptr, "interface"):
+            item = group_ptr.interface.items_tree.get(input_name)
+            if item:
+                s_type = getattr(item, "socket_type", "")
+                if 'Float' in s_type: return 'FLOAT'
+                elif 'Int' in s_type: return 'INT'
+                elif 'Bool' in s_type: return 'BOOLEAN'
+                elif 'String' in s_type: return 'STRING'
+                elif 'Menu' in s_type: return 'MENU'
+        else:
+            inp = group_ptr.inputs.get(input_name)
+            if inp:
+                if inp.type in ['VALUE', 'FLOAT']: return 'FLOAT'
+                elif inp.type == 'INT': return 'INT'
+                elif inp.type == 'BOOLEAN': return 'BOOLEAN'
+                elif inp.type == 'STRING': return 'STRING'
+                elif inp.type == 'MENU': return 'MENU'
+    else:
+        n_name = node_name.split(" [")[0].strip()
+        node = group_ptr.nodes.get(n_name)
+        if node and input_name in node.inputs:
+            s_type = node.inputs[input_name].type
+            if s_type in ['VALUE', 'FLOAT']: return 'FLOAT'
+            elif s_type == 'INT': return 'INT'
+            elif s_type == 'BOOLEAN': return 'BOOLEAN'
+            elif s_type == 'STRING': return 'STRING'
+            elif s_type == 'MENU': return 'MENU'
+    return 'FLOAT'
+
 def on_input_name_update(self, context):
     try:
-        ovr = None
+        found_ng, found_node = None, None
         for p in context.scene.batch_stl_presets:
-            for o in p.pinned_overrides:
-                if self in o.inputs.values():
-                    ovr = o; break
-            if ovr: break
-            for m in p.mappings:
-                for o in m.node_overrides:
-                    if self in o.inputs.values():
-                        ovr = o; break
-                if ovr: break
-            if ovr: break
+            for ng in p.nodegroups:
+                for n in ng.nodes:
+                    if self in n.inputs.values(): found_ng, found_node = ng, n; break
+                if found_ng: break
+            if found_ng: break
+            for c in p.collections:
+                for ng in c.nodegroups:
+                    for n in ng.nodes:
+                        if self in n.inputs.values(): found_ng, found_node = ng, n; break
+                    if found_ng: break
+                if found_ng: break
 
-        if ovr:
-            count = sum(1 for i in ovr.inputs if i.input_name == self.input_name)
-            if count > 1:
-                for i in ovr.inputs:
-                    if i.input_name == self.input_name:
-                        i.use_sweep = False
-
-        if ovr and ovr.parent_group_ptr:
-            if ovr.override_target == 'NODE' and ovr.node_name:
-                n_name = ovr.node_name.split(" [")[0].strip()
-                node = ovr.parent_group_ptr.nodes.get(n_name)
-                if node and self.input_name in node.inputs:
-                    s_type = node.inputs[self.input_name].type
-                    if s_type in ['VALUE', 'FLOAT']: self.override_type = 'FLOAT'
-                    elif s_type == 'INT': self.override_type = 'INT'
-                    elif s_type == 'BOOLEAN': self.override_type = 'BOOLEAN'
-                    elif s_type == 'STRING': self.override_type = 'STRING'
-                    elif s_type == 'MENU': self.override_type = 'MENU'
-            elif ovr.override_target == 'MODIFIER':
-                if hasattr(ovr.parent_group_ptr, "interface"):
-                    item = ovr.parent_group_ptr.interface.items_tree.get(self.input_name)
-                    if item:
-                        s_type = getattr(item, "socket_type", "")
-                        if 'Float' in s_type: self.override_type = 'FLOAT'
-                        elif 'Int' in s_type: self.override_type = 'INT'
-                        elif 'Bool' in s_type: self.override_type = 'BOOLEAN'
-                        elif 'String' in s_type: self.override_type = 'STRING'
-                        elif 'Menu' in s_type: self.override_type = 'MENU'
-                else:
-                    inp = ovr.parent_group_ptr.inputs.get(self.input_name)
-                    if inp:
-                        s_type = inp.type
-                        if s_type in ['VALUE', 'FLOAT']: self.override_type = 'FLOAT'
-                        elif s_type == 'INT': self.override_type = 'INT'
-                        elif s_type == 'BOOLEAN': self.override_type = 'BOOLEAN'
-                        elif s_type == 'STRING': self.override_type = 'STRING'
-                        elif s_type == 'MENU': self.override_type = 'MENU'
+        if found_ng and found_node:
+            self.override_type = infer_input_type(found_ng.group_ptr, found_node.name, self.name)
+            for v in self.values: v.use_sweep = False
     except Exception: pass
 
 def search_target_node_cb(self, context, edit_text):
-    if not self.parent_group_ptr: return []
-    
-    if edit_text == self.node_name:
-        edit_text = ""
-        
-    res = []
-    for node in self.parent_group_ptr.nodes:
-        name = node.name
-        if node.type == 'GROUP' and getattr(node, "node_tree", None):
-            val = f"{name} [{node.node_tree.name}]"
-        else:
-            val = f"{name} [{node.type}]"
-        if not edit_text or edit_text.lower() in val.lower():
-            res.append(val)
+    res = ["<Modifier Interface>"]
+    found_ng = None
+    for p in context.scene.batch_stl_presets:
+        for ng in p.nodegroups:
+            if self in ng.nodes.values(): found_ng = ng; break
+        if found_ng: break
+        for c in p.collections:
+            for ng in c.nodegroups:
+                if self in ng.nodes.values(): found_ng = ng; break
+            if found_ng: break
+
+    if found_ng and found_ng.group_ptr:
+        for node in found_ng.group_ptr.nodes:
+            name = node.name
+            if node.type == 'GROUP' and getattr(node, "node_tree", None):
+                val = f"{name} [{node.node_tree.name}]"
+            else:
+                val = f"{name} [{node.type}]"
+            if not edit_text or edit_text.lower() in val.lower():
+                res.append(val)
+
+    if edit_text == self.name: edit_text = ""
     return res
 
 def search_menu_items_cb(self, context, edit_text):
-    try:
-        ovr = None
-        for p in context.scene.batch_stl_presets:
-            for o in p.pinned_overrides:
-                if self in o.inputs.values():
-                    ovr = o; break
-            if ovr: break
-            for m in p.mappings:
-                for o in m.node_overrides:
-                    if self in o.inputs.values():
-                        ovr = o; break
-                if ovr: break
-            if ovr: break
+    found_inp, found_n, found_ng = None, None, None
+    for p in context.scene.batch_stl_presets:
+        for ng in p.nodegroups:
+            for n in ng.nodes:
+                for i in n.inputs:
+                    if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
+                if found_inp: break
+            if found_inp: break
+        if found_inp: break
+        for c in p.collections:
+            for ng in c.nodegroups:
+                for n in ng.nodes:
+                    for i in n.inputs:
+                        if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
+                    if found_inp: break
+                if found_inp: break
+            if found_inp: break
 
-        if not ovr: return []
+    items = []
+    if found_ng and found_ng.group_ptr and found_inp:
+        is_mod = not found_n.name or found_n.name == "<Modifier Interface>"
+        if is_mod:
+            for node in found_ng.group_ptr.nodes:
+                if node.type == 'MENU_SWITCH' and hasattr(node, 'enum_items'):
+                    for sock in node.inputs:
+                        for link in sock.links:
+                            if link.from_node.type == 'GROUP_INPUT' and link.from_socket.name == found_inp.name:
+                                items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in node.enum_items]
+                                break
+                        if items: break
+                if items: break
+        else:
+            n_name = found_n.name.split(" [")[0].strip()
+            node = found_ng.group_ptr.nodes.get(n_name)
+            if node:
+                if node.type == 'MENU_SWITCH' and hasattr(node, 'enum_items'):
+                    items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in node.enum_items]
+                elif node.type == 'GROUP' and hasattr(node, 'node_tree') and node.node_tree:
+                    for inner_node in node.node_tree.nodes:
+                        if inner_node.type == 'MENU_SWITCH' and hasattr(inner_node, 'enum_items'):
+                            for sock in inner_node.inputs:
+                                for link in sock.links:
+                                    if link.from_node.type == 'GROUP_INPUT' and link.from_socket.name == found_inp.name:
+                                        items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in inner_node.enum_items]
+                                        break
+                                if items: break
+                        if items: break
 
-        items = []
-        if ovr.parent_group_ptr:
-            if ovr.override_target == 'MODIFIER':
-                for node in ovr.parent_group_ptr.nodes:
-                    if node.type == 'MENU_SWITCH' and hasattr(node, 'enum_items'):
-                        for sock in node.inputs:
-                            for link in sock.links:
-                                if link.from_node.type == 'GROUP_INPUT' and link.from_socket.name == self.input_name:
-                                    items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in node.enum_items]
-                                    break
-                            if items: break
-                    if items: break
-            elif ovr.override_target == 'NODE' and ovr.node_name:
-                n_name = ovr.node_name.split(" [")[0].strip()
-                node = ovr.parent_group_ptr.nodes.get(n_name)
-                if node:
-                    if node.type == 'MENU_SWITCH' and hasattr(node, 'enum_items'):
-                        items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in node.enum_items]
-                    elif node.type == 'GROUP' and hasattr(node, 'node_tree') and node.node_tree:
-                        for inner_node in node.node_tree.nodes:
-                            if inner_node.type == 'MENU_SWITCH' and hasattr(inner_node, 'enum_items'):
-                                for sock in inner_node.inputs:
-                                    for link in sock.links:
-                                        if link.from_node.type == 'GROUP_INPUT' and link.from_socket.name == self.input_name:
-                                            items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in inner_node.enum_items]
-                                            break
-                                    if items: break
-                            if items: break
-
-        if edit_text == self.value_menu:
-            edit_text = ""
-
-        if not edit_text: return items
-        return [item for item in items if edit_text.lower() in item.lower()]
-    except Exception:
-        return []
+    if edit_text == self.value_menu: edit_text = ""
+    if not edit_text: return items
+    return [item for item in items if edit_text.lower() in item.lower()]
 
 class BatchSTLLogLine(bpy.types.PropertyGroup):
     text: bpy.props.StringProperty()
 
-def update_node_input_use_tag(self, context):
-    if not self.use_tag and not self.use_dir:
-        self.use_dir = True
+def update_val_use_tag(self, context):
+    if not self.use_tag and not self.use_dir: self.use_dir = True
 
-def update_node_input_use_dir(self, context):
-    if not self.use_dir and not self.use_tag:
-        self.use_tag = True
+def update_val_use_dir(self, context):
+    if not self.use_dir and not self.use_tag: self.use_tag = True
 
-class BatchSTLNodeInput(bpy.types.PropertyGroup):
-    input_name: bpy.props.StringProperty(name="Input", default="", update=on_input_name_update, description="Name of the node group input socket or modifier property to override")
-    override_type: bpy.props.EnumProperty(
-        name="Type",
-        items=(
-            ('BOOLEAN', "Bool", "Boolean data type"),
-            ('INT', "Int", "Integer data type"),
-            ('FLOAT', "Float", "Floating-point data type"),
-            ('STRING', "Str", "String text data type"),
-            ('MENU', "Menu", "Menu or Enum data type")
-        ),
-        default='BOOLEAN',
-        description="Data type of the override value"
-    )
-    value_bool: bpy.props.BoolProperty(name="Value", default=True, description="Boolean override value to apply")
-    value_int: bpy.props.IntProperty(name="Value", default=0, description="Integer override value to apply")
-    value_float: bpy.props.FloatProperty(name="Value", default=0.0, description="Float override value to apply")
-    value_string: bpy.props.StringProperty(name="Value", default="", description="String override value to apply")
-    value_menu: bpy.props.StringProperty(
-        name="Value", default="",
-        description="Menu or Enum override value to apply",
-        search=search_menu_items_cb
-    )
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=update_node_input_use_tag, description="Append tag to filename for this permutation")
-    tag: bpy.props.StringProperty(name="Tag", default="", description="Custom string for naming or folder creation")
-    use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=update_node_input_use_dir, description="Create a sub-directory for this specific input permutation")
-    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, description="Enable automatic parameter sweeping across multiple states")
-    sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", description="For Int/Float: 'start step count' | For String: 'item1, item2'")
+class BatchSTLValue(bpy.types.PropertyGroup):
+    value_bool: bpy.props.BoolProperty(name="Value", default=True)
+    value_int: bpy.props.IntProperty(name="Value", default=0)
+    value_float: bpy.props.FloatProperty(name="Value", default=0.0)
+    value_string: bpy.props.StringProperty(name="Value", default="")
+    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb)
 
-class BatchSTLNodeOverride(bpy.types.PropertyGroup):
-    override_target: bpy.props.EnumProperty(
-        name="Target",
-        items=(('NODE', "Node", "Target an internal node"), ('MODIFIER', "Modifier", "Target a socket directly on the Modifier interface")),
-        default='NODE', description="Target type to override"
-    )
-    parent_group_ptr: bpy.props.PointerProperty(type=bpy.types.NodeTree, name="Group")
-    node_name: bpy.props.StringProperty(
-        name="Node",
-        default="",
-        description="Target node name. Searchable list includes base group names.",
-        search=search_target_node_cb
-    )
-    inputs: bpy.props.CollectionProperty(type=BatchSTLNodeInput, description="List of specific input sockets to override")
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=update_val_use_tag)
+    tag: bpy.props.StringProperty(name="Tag", default="")
+    use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=update_val_use_dir)
+
+    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False)
+    sweep_range: bpy.props.StringProperty(name="Sweep Range", default="")
+
+class BatchSTLInput(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty(name="Input Socket", default="", update=on_input_name_update)
+    override_type: bpy.props.StringProperty(default='FLOAT')
+    values: bpy.props.CollectionProperty(type=BatchSTLValue)
+
+class BatchSTLNode(bpy.types.PropertyGroup):
+    name: bpy.props.StringProperty(name="Target Node", default="", search=search_target_node_cb, description="Select <Modifier Interface> to target the modifier directly")
+    inputs: bpy.props.CollectionProperty(type=BatchSTLInput)
+
+class BatchSTLNodeGroup(bpy.types.PropertyGroup):
+    group_ptr: bpy.props.PointerProperty(type=bpy.types.NodeTree, name="Node Group")
+    nodes: bpy.props.CollectionProperty(type=BatchSTLNode)
 
 class BatchSTLExcludedObject(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(description="Name of the object to exclude from export")
+    name: bpy.props.StringProperty()
 
-class BatchSTLExportItem(bpy.types.PropertyGroup):
+class BatchSTLCollection(bpy.types.PropertyGroup):
     collection_ptr: bpy.props.PointerProperty(type=bpy.types.Collection, name="Collection")
     use_tag: bpy.props.BoolProperty(name="Use Tag", default=True)
     tag: bpy.props.StringProperty(name="Tag", default="")
     sub_path: bpy.props.StringProperty(name="Sub-folder", default="")
-    node_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride)
     use_filter: bpy.props.BoolProperty(name="Filter Objects", default=False)
     excluded_objects: bpy.props.CollectionProperty(type=BatchSTLExcludedObject)
+    nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
 
 class BatchSTLExportPreset(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Preset Name", default="New Preset")
     preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="")
     last_export_time: bpy.props.FloatProperty(name="Last Export Time", default=0.0)
-    pinned_overrides: bpy.props.CollectionProperty(type=BatchSTLNodeOverride)
-    mappings: bpy.props.CollectionProperty(type=BatchSTLExportItem)
-    mapping_index: bpy.props.IntProperty(name="Mapping Index", default=0)
+
+    nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
+    collections: bpy.props.CollectionProperty(type=BatchSTLCollection)
+    collection_index: bpy.props.IntProperty(name="Collection Index", default=0)
+
     is_exporting: bpy.props.BoolProperty(default=False)
     cancel_export: bpy.props.BoolProperty(default=False)
     export_progress: bpy.props.FloatProperty(name="Progress", default=0.0, min=0.0, max=1.0)
@@ -969,7 +1002,6 @@ class BatchSTLExportPreset(bpy.types.PropertyGroup):
 class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
     bl_idname = "batch_stl.export_presets_json"
     bl_label = "Export JSON"
-    bl_description = "Export all current batch export presets to a JSON configuration file"
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
@@ -981,7 +1013,6 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     bl_idname = "batch_stl.import_presets_json"
     bl_label = "Import JSON"
     bl_options = {'REGISTER', 'UNDO'}
-    bl_description = "Import batch export presets from a JSON configuration file"
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
@@ -993,7 +1024,6 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
 class BATCH_STL_OT_clear_console(bpy.types.Operator):
     bl_idname = "batch_stl.clear_console"
     bl_label = "Clear Console"
-    bl_description = "Clear the integrated console output log for the active preset"
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -1031,9 +1061,9 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
         if self.action != 'COPY': bpy.ops.ed.undo_push(message="Preset Action")
         return {'FINISHED'}
 
-class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
-    bl_idname = "batch_stl.mapping_actions"
-    bl_label = "Mapping Actions"
+class BATCH_STL_OT_collection_actions(bpy.types.Operator):
+    bl_idname = "batch_stl.collection_actions"
+    bl_label = "Collection Actions"
     bl_options = {'REGISTER', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
@@ -1045,236 +1075,79 @@ class BATCH_STL_OT_mapping_actions(bpy.types.Operator):
     def execute(self, context):
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}
-        lst, idx = preset.mappings, preset.mapping_index
-        if self.action == 'ADD': lst.add(); preset.mapping_index = len(lst) - 1
-        elif self.action == 'REMOVE' and lst: lst.remove(idx); preset.mapping_index = max(0, idx - 1)
+        lst, idx = preset.collections, preset.collection_index
+        if self.action == 'ADD': lst.add(); preset.collection_index = len(lst) - 1
+        elif self.action == 'REMOVE' and lst: lst.remove(idx); preset.collection_index = max(0, idx - 1)
         elif self.action == 'UP' and idx > 0:
             lst.move(idx, 0 if self.shift_pressed else idx - 1)
-            preset.mapping_index = 0 if self.shift_pressed else idx - 1
+            preset.collection_index = 0 if self.shift_pressed else idx - 1
         elif self.action == 'DOWN' and idx < len(lst) - 1:
             lst.move(idx, len(lst) - 1 if self.shift_pressed else idx + 1)
-            preset.mapping_index = len(lst) - 1 if self.shift_pressed else idx + 1
-        elif self.action == 'COPY' and lst: _clipboard["mapping"] = copy_mapping_to_dict(lst[idx])
-        elif self.action == 'PASTE' and _clipboard.get("mapping"): paste_mapping_from_dict(lst.add(), _clipboard["mapping"]); preset.mapping_index = len(lst) - 1
+            preset.collection_index = len(lst) - 1 if self.shift_pressed else idx + 1
+        elif self.action == 'COPY' and lst: _clipboard["collection"] = copy_collection_to_dict(lst[idx])
+        elif self.action == 'PASTE' and _clipboard.get("collection"): paste_collection_from_dict(lst.add(), _clipboard["collection"]); preset.collection_index = len(lst) - 1
 
-        if self.action != 'COPY': bpy.ops.ed.undo_push(message="Mapping Action")
+        if self.action != 'COPY': bpy.ops.ed.undo_push(message="Collection Action")
         return {'FINISHED'}
 
-class BATCH_STL_OT_override_actions(bpy.types.Operator):
-    bl_idname = "batch_stl.override_actions"
-    bl_label = "Override Actions"
-    bl_options = {'REGISTER', 'INTERNAL'}
-    action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", ""), ('PIN', "", ""), ('UNPIN', "", "")))
-    override_index: bpy.props.IntProperty(default=-1)
-    is_pinned: bpy.props.BoolProperty(default=False)
-    shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
 
-    def invoke(self, context, event):
-        self.shift_pressed = event.shift
-        return self.execute(context)
+class BATCH_STL_OT_table_action(bpy.types.Operator):
+    bl_idname = "batch_stl.table_action"
+    bl_label = "Table Action"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action: bpy.props.StringProperty()
+    is_pinned: bpy.props.BoolProperty()
+    ng_idx: bpy.props.IntProperty(default=-1)
+    n_idx: bpy.props.IntProperty(default=-1)
+    i_idx: bpy.props.IntProperty(default=-1)
+    v_idx: bpy.props.IntProperty(default=-1)
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
-        mapping = get_active_mapping(preset)
         if not preset: return {'CANCELLED'}
-        lst = preset.pinned_overrides if self.is_pinned else (mapping.node_overrides if mapping else None)
-        if lst is None: return {'CANCELLED'}
 
-        idx = self.override_index
-        if self.action == 'ADD': lst.add()
-        elif self.action == 'REMOVE' and 0 <= idx < len(lst): lst.remove(idx)
-        elif self.action == 'UP' and idx > 0: lst.move(idx, 0 if self.shift_pressed else idx - 1)
-        elif self.action == 'DOWN' and 0 <= idx < len(lst) - 1: lst.move(idx, len(lst) - 1 if self.shift_pressed else idx + 1)
-        elif self.action == 'COPY' and 0 <= idx < len(lst):
-            if self.shift_pressed:
-                paste_override_from_dict(lst.add(), copy_override_to_dict(lst[idx]))
-                lst.move(len(lst) - 1, idx + 1)
-            else:
-                _clipboard["override"] = copy_override_to_dict(lst[idx])
-        elif self.action == 'PASTE' and _clipboard.get("override"):
-            paste_override_from_dict(lst.add(), _clipboard["override"])
-            lst.move(len(lst) - 1, idx + 1)
-        elif self.action == 'PIN' and not self.is_pinned and 0 <= idx < len(lst):
-            paste_override_from_dict(preset.pinned_overrides.add(), copy_override_to_dict(lst[idx]))
-            lst.remove(idx)
-        elif self.action == 'UNPIN' and self.is_pinned and 0 <= idx < len(lst):
-            for m in preset.mappings: paste_override_from_dict(m.node_overrides.add(), copy_override_to_dict(lst[idx]))
-            lst.remove(idx)
+        ng_list = preset.nodegroups if self.is_pinned else get_active_collection(preset).nodegroups
 
-        if self.action != 'COPY': bpy.ops.ed.undo_push(message="Override Action")
-        return {'FINISHED'}
+        if self.action == 'ADD_GROUP':
+            ng_list.add()
+        elif self.action == 'DEL_GROUP':
+            ng_list.remove(self.ng_idx)
 
-class BATCH_STL_OT_input_actions(bpy.types.Operator):
-    bl_idname = "batch_stl.input_actions"
-    bl_label = "Input Actions"
-    bl_options = {'REGISTER', 'INTERNAL'}
-    action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
-    override_index: bpy.props.IntProperty(default=-1)
-    input_index: bpy.props.IntProperty(default=-1)
-    is_pinned: bpy.props.BoolProperty(default=False)
-    shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
+        elif self.action == 'ADD_NODE':
+            node = ng_list[self.ng_idx].nodes.add()
+            node.name = "<Modifier Interface>"
+        elif self.action == 'DEL_NODE':
+            ng_list[self.ng_idx].nodes.remove(self.n_idx)
 
-    def invoke(self, context, event):
-        self.shift_pressed = event.shift
-        return self.execute(context)
+        elif self.action == 'ADD_INPUT':
+            ng_list[self.ng_idx].nodes[self.n_idx].inputs.add()
+        elif self.action == 'DEL_INPUT':
+            ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
 
-    def execute(self, context):
-        preset = get_active_preset(context.scene)
-        mapping = get_active_mapping(preset)
-        ovr_list = preset.pinned_overrides if self.is_pinned else (mapping.node_overrides if mapping else None)
-        if not ovr_list or self.override_index < 0 or self.override_index >= len(ovr_list): return {'CANCELLED'}
+        elif self.action == 'ADD_VALUE':
+            ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.add()
+        elif self.action == 'DEL_VALUE':
+            ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.remove(self.v_idx)
 
-        lst = ovr_list[self.override_index].inputs
-        idx = self.input_index
-        msg = None
+        elif self.action == 'TOGGLE_SWEEP':
+            vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
+            val = vals[self.v_idx]
+            val.use_sweep = not val.use_sweep
+            if val.use_sweep:
+                for j in reversed(range(len(vals))):
+                    if j != self.v_idx: vals.remove(j)
 
-        if self.action == 'ADD':
-            if self.shift_pressed:
-                ovr = ovr_list[self.override_index]
-                if ovr.parent_group_ptr:
-                    inputs_to_add = []
-                    if ovr.override_target == 'NODE' and ovr.node_name:
-                        n_name = ovr.node_name.split(" [")[0].strip()
-                        node = ovr.parent_group_ptr.nodes.get(n_name)
-                        if node:
-                            for inp in node.inputs: inputs_to_add.append((inp.name, inp.type))
-                    elif ovr.override_target == 'MODIFIER':
-                        if hasattr(ovr.parent_group_ptr, "interface"):
-                            for item in ovr.parent_group_ptr.interface.items_tree:
-                                if getattr(item, "item_type", "") == 'SOCKET' and item.in_out == 'INPUT':
-                                    inputs_to_add.append((item.name, getattr(item, "socket_type", "")))
-                        else:
-                            for inp in ovr.parent_group_ptr.inputs: inputs_to_add.append((inp.name, inp.type))
-
-                    if inputs_to_add:
-                        for name, s_type in inputs_to_add:
-                            new_i = lst.add()
-                            new_i.input_name = name
-                            if 'Float' in s_type or s_type in ['VALUE', 'FLOAT']: new_i.override_type = 'FLOAT'
-                            elif 'Int' in s_type or s_type == 'INT': new_i.override_type = 'INT'
-                            elif 'Bool' in s_type or s_type == 'BOOLEAN': new_i.override_type = 'BOOLEAN'
-                            elif 'String' in s_type or s_type == 'STRING': new_i.override_type = 'STRING'
-                            elif 'Menu' in s_type or s_type == 'MENU': new_i.override_type = 'MENU'
-                    else: lst.add()
-                else: lst.add()
-                msg = "Auto-Populate Sockets"
-            else:
-                lst.add()
-                msg = "Add Input State"
-
-        elif self.action == 'REMOVE' and 0 <= idx < len(lst):
-            lst.remove(idx)
-            msg = "Remove Input State"
-        elif self.action == 'UP' and idx > 0:
-            lst.move(idx, 0 if self.shift_pressed else idx - 1)
-            msg = "Move Input Up"
-        elif self.action == 'DOWN' and 0 <= idx < len(lst) - 1:
-            lst.move(idx, len(lst) - 1 if self.shift_pressed else idx + 1)
-            msg = "Move Input Down"
-        elif self.action == 'COPY' and 0 <= idx < len(lst):
-            i = lst[idx]
-            if self.shift_pressed:
-                # Shift+Copy = Duplicate into a new line below
-                new_i = lst.add()
-                orig_name = i.input_name
-
-                for k in ["input_name", "override_type", "value_bool", "value_int", "value_float", "value_string", "value_menu", "use_tag", "tag", "use_dir"]:
-                    setattr(new_i, k, getattr(i, k))
-                new_i.sweep_range = getattr(i, "sweep_range", "")
-                new_i.use_sweep = False
-
-                lst.move(len(lst) - 1, idx + 1)
-
-                # Automatically disable sweep for all items matching this target name
-                for item in lst:
-                    if item.input_name == orig_name:
-                        item.use_sweep = False
-
-                msg = "Duplicate Input Line"
-            else:
-                # Standard Copy
-                _clipboard["input"] = {
-                    "input_name": i.input_name, "override_type": i.override_type,
-                    "value_bool": i.value_bool, "value_int": i.value_int, "value_float": i.value_float,
-                    "value_string": i.value_string, "value_menu": i.value_menu,
-                    "use_tag": i.use_tag, "tag": i.tag, "use_dir": i.use_dir,
-                    "use_sweep": getattr(i, "use_sweep", False), "sweep_range": getattr(i, "sweep_range", "")
-                }
-                msg = "Copy Input State"
-        elif self.action == 'PASTE' and _clipboard.get("input"):
-            # Global Paste only (from the + / Paste row at the bottom)
-            new_i = lst.add()
-            for k, v in _clipboard["input"].items(): setattr(new_i, k, v)
-
-            # Check if this pasted item matches an existing name; if so, disable sweep for that block
-            count = sum(1 for item in lst if item.input_name == new_i.input_name)
-            if count > 1:
-                for item in lst:
-                    if item.input_name == new_i.input_name:
-                        item.use_sweep = False
-
-            msg = "Paste Input State"
-
-        if msg: bpy.ops.ed.undo_push(message=msg)
-        return {'FINISHED'}
-
-class BATCH_STL_OT_toggle_sweep(bpy.types.Operator):
-    bl_idname = "batch_stl.toggle_sweep"
-    bl_label = "Toggle Sweep"
-    bl_options = {'REGISTER', 'INTERNAL'}
-    override_index: bpy.props.IntProperty(default=-1)
-    input_index: bpy.props.IntProperty(default=-1)
-    is_pinned: bpy.props.BoolProperty(default=False)
-
-    def invoke(self, context, event):
-        preset = get_active_preset(context.scene)
-        mapping = get_active_mapping(preset)
-        ovr_list = preset.pinned_overrides if self.is_pinned else (mapping.node_overrides if mapping else None)
-        if not ovr_list or self.override_index < 0 or self.override_index >= len(ovr_list): return {'CANCELLED'}
-        ovr = ovr_list[self.override_index]
-        if self.input_index < 0 or self.input_index >= len(ovr.inputs): return {'CANCELLED'}
-        inp = ovr.inputs[self.input_index]
-
-        if event.shift and inp.use_sweep:
-            vals = parse_sweep_values(ovr, inp)
-            if vals:
-                inp.use_sweep = False
-                def assign_val(target, val):
-                    if target.override_type == 'BOOLEAN': target.value_bool = bool(val)
-                    elif target.override_type == 'INT': target.value_int = int(val)
-                    elif target.override_type == 'FLOAT': target.value_float = float(val)
-                    elif target.override_type == 'STRING': target.value_string = str(val)
-                    elif target.override_type == 'MENU': target.value_menu = str(val)
-                assign_val(inp, vals[0])
-                for i, v in enumerate(vals[1:]):
-                    new_inp = ovr.inputs.add()
-                    new_inp.input_name = inp.input_name
-                    new_inp.override_type = inp.override_type
-                    new_inp.use_tag = inp.use_tag
-                    new_inp.tag = inp.tag
-                    new_inp.use_dir = inp.use_dir
-                    new_inp.use_sweep = False
-                    assign_val(new_inp, v)
-                    ovr.inputs.move(len(ovr.inputs) - 1, self.input_index + i + 1)
-                bpy.ops.ed.undo_push(message="Expand Sweep Permutations")
-            else:
-                inp.use_sweep = False
-                bpy.ops.ed.undo_push(message="Disable Sweep")
-        else:
-            inp.use_sweep = not inp.use_sweep
-            if inp.use_sweep:
-                to_remove = [j for j, other in enumerate(ovr.inputs) if other.input_name == inp.input_name and j != self.input_index]
-                for j in reversed(to_remove):
-                    ovr.inputs.remove(j)
-
-                # Zero out explicitly stored parameters so sweep configurations do not save false data
-                inp.value_string = ""
-                inp.value_menu = ""
-                inp.value_float = 0.0
-                inp.value_int = 0
-            bpy.ops.ed.undo_push(message="Enable Sweep" if inp.use_sweep else "Disable Sweep")
+        elif self.action == 'MOVE_VAL_UP':
+            if self.v_idx > 0:
+                ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.move(self.v_idx, self.v_idx - 1)
+        elif self.action == 'MOVE_VAL_DOWN':
+            vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
+            if self.v_idx < len(vals) - 1:
+                vals.move(self.v_idx, self.v_idx + 1)
 
         return {'FINISHED'}
+
 
 class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
     bl_idname = "batch_stl.toggle_exclusion"
@@ -1284,17 +1157,17 @@ class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
-        mapping = get_active_mapping(preset)
-        if mapping:
+        collection = get_active_collection(preset)
+        if collection:
             idx = -1
-            for i, e in enumerate(mapping.excluded_objects):
+            for i, e in enumerate(collection.excluded_objects):
                 if e.name == self.object_name:
                     idx = i; break
             if idx >= 0:
-                mapping.excluded_objects.remove(idx)
+                collection.excluded_objects.remove(idx)
                 bpy.ops.ed.undo_push(message=f"Include '{self.object_name}' in Export")
             else:
-                mapping.excluded_objects.add().name = self.object_name
+                collection.excluded_objects.add().name = self.object_name
                 bpy.ops.ed.undo_push(message=f"Exclude '{self.object_name}' from Export")
         return {'FINISHED'}
 
@@ -1312,12 +1185,12 @@ class BATCH_STL_OT_toggle_dir_tree(bpy.types.Operator):
             collapsed = json.loads(scene.batch_stl_collapsed_dirs)
         except Exception:
             collapsed = []
-            
+
         if self.dir_path in collapsed:
             collapsed.remove(self.dir_path)
         else:
             collapsed.append(self.dir_path)
-            
+
         scene.batch_stl_collapsed_dirs = json.dumps(collapsed)
         return {'FINISHED'}
 
@@ -1366,7 +1239,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         self.preset.console_logs.clear()
         context.scene.batch_stl_show_console = True
 
-        has_overrides = bool(self.preset.pinned_overrides) or any(bool(m.node_overrides) for m in self.preset.mappings)
+        has_overrides = bool(self.preset.nodegroups) or any(bool(c.nodegroups) for c in self.preset.collections)
         verbose = scene.batch_stl_verbose_console
 
         if not has_overrides:
@@ -1375,11 +1248,11 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 root_dir = os.path.normpath(os.path.join(root_dir, self.preset.preset_prefix))
 
             total_objs = 0
-            for mapping in self.preset.mappings:
-                if not mapping.collection_ptr: continue
-                if is_collection_excluded(context, mapping.collection_ptr): continue
-                excluded_names = {e.name for e in mapping.excluded_objects} if mapping.use_filter else set()
-                for obj in mapping.collection_ptr.all_objects:
+            for c in self.preset.collections:
+                if not c.collection_ptr: continue
+                if is_collection_excluded(context, c.collection_ptr): continue
+                excluded_names = {e.name for e in c.excluded_objects} if c.use_filter else set()
+                for obj in c.collection_ptr.all_objects:
                     if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
                         if obj.name not in excluded_names: total_objs += 1
 
@@ -1391,14 +1264,14 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             if verbose: print(log_msg)
             log_to_console(self.preset, log_msg)
 
-            for mapping in self.preset.mappings:
-                if not mapping.collection_ptr: continue
-                if is_collection_excluded(context, mapping.collection_ptr): continue
-                out_dir = os.path.normpath(os.path.join(root_dir, mapping.sub_path))
+            for c in self.preset.collections:
+                if not c.collection_ptr: continue
+                if is_collection_excluded(context, c.collection_ptr): continue
+                out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path))
                 os.makedirs(out_dir, exist_ok=True)
-                excluded_names = {e.name for e in mapping.excluded_objects} if mapping.use_filter else set()
+                excluded_names = {e.name for e in c.excluded_objects} if c.use_filter else set()
 
-                for obj in mapping.collection_ptr.all_objects:
+                for obj in c.collection_ptr.all_objects:
                     if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
                         if obj.name in excluded_names: continue
                         t_eval_start = time.perf_counter()
@@ -1410,7 +1283,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                         log_to_console(self.preset, perf_msg)
 
                         if mesh:
-                            base_tag = mapping.tag if mapping.use_tag and mapping.tag else ""
+                            base_tag = c.tag if c.use_tag and c.tag else ""
                             filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{base_tag}.stl")
                             write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=verbose)
                             obj_eval.to_mesh_clear()
@@ -1570,7 +1443,7 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
             op = row.operator("export_scene.batch_stl_multi", text="", icon='EXPORT')
             op.preset_index = index
 
-class BATCH_STL_UL_items(bpy.types.UIList):
+class BATCH_STL_UL_collections(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         row.prop(item, "use_filter", text="", icon='FILTER')
@@ -1597,147 +1470,131 @@ def draw_inline_controls(layout, operator_id, use_clipboard=False):
         row.operator(operator_id, icon='COPYDOWN', text="").action = 'COPY'
         row.operator(operator_id, icon='PASTEDOWN', text="").action = 'PASTE'
 
-def get_override_groups(overrides):
-    groups = []
-    current_group = []
-    current_ptr = None
-    
-    for o_idx, ovr in enumerate(overrides):
-        ptr = ovr.parent_group_ptr
-        if ptr is not None and ptr == current_ptr:
-            current_group.append((o_idx, ovr))
+
+def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, v_idx, show_ng, show_n, show_i, show_v):
+    row = layout.row(align=True)
+
+    # 1. Node Group
+    s1 = row.split(factor=0.25)
+    c1 = s1.row(align=True)
+    if show_ng and ng:
+        c1.prop(ng, "group_ptr", text="")
+        op = c1.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+        op = c1.operator("batch_stl.table_action", text="", icon='X'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+    else:
+        c1.label(text="")
+
+    # 2. Node
+    s2 = s1.split(factor=0.33)
+    c2 = s2.row(align=True)
+    if show_n and node:
+        c2.prop(node, "name", text="", icon='NODETREE')
+        op = c2.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+        op = c2.operator("batch_stl.table_action", text="", icon='X'); op.action = 'DEL_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+    else:
+        c2.label(text="")
+
+    # 3. Input
+    s3 = s2.split(factor=0.33)
+    c3 = s3.row(align=True)
+    if show_i and inp:
+        is_mod = not node.name or node.name == "<Modifier Interface>"
+        if is_mod and ng.group_ptr and hasattr(ng.group_ptr, "interface"):
+            c3.prop_search(inp, "name", ng.group_ptr.interface, "items_tree", text="")
+        elif not is_mod and ng.group_ptr and node.name:
+            target_n = ng.group_ptr.nodes.get(node.name.split(" [")[0].strip())
+            if target_n: c3.prop_search(inp, "name", target_n, "inputs", text="")
+            else: c3.prop(inp, "name", text="")
         else:
-            if current_group:
-                groups.append(current_group)
-            current_group = [(o_idx, ovr)]
-            current_ptr = ptr
-            
-    if current_group:
-        groups.append(current_group)
-        
-    return groups
+            c3.prop(inp, "name", text="")
 
-def draw_override_group(layout, ovr_group, is_pinned, freq_dict=None):
-    if freq_dict is None: freq_dict = {}
-    if not ovr_group: return
+        op = c3.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_VALUE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+        op = c3.operator("batch_stl.table_action", text="", icon='X'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+    else:
+        c3.label(text="")
 
-    is_grouped = len(ovr_group) > 1
-    
-    group_box = layout.box()
-
-    if is_grouped:
-        first_ovr = ovr_group[0][1]
-        top_header = group_box.box()
-        top_row = top_header.row(align=True)
-        top_row.prop(first_ovr, "parent_group_ptr", text="")
-
-    for o_idx, ovr in ovr_group:
-        if is_grouped:
-            ovr_box = group_box.box()
+    # 4. Value
+    s4 = s3.split(factor=0.75)
+    c4 = s4.row(align=True)
+    if val and inp:
+        if getattr(val, "use_sweep", False):
+            if inp.override_type in ['INT', 'FLOAT', 'STRING']: c4.prop(val, "sweep_range", text="")
+            elif inp.override_type == 'BOOLEAN': c4.label(text="True & False")
+            elif inp.override_type == 'MENU': c4.label(text="All values")
         else:
-            ovr_box = group_box
+            if inp.override_type == 'BOOLEAN': c4.prop(val, "value_bool", text="True" if val.value_bool else "False", toggle=True)
+            elif inp.override_type == 'INT': c4.prop(val, "value_int", text="")
+            elif inp.override_type == 'FLOAT': c4.prop(val, "value_float", text="")
+            elif inp.override_type == 'STRING': c4.prop(val, "value_string", text="")
+            elif inp.override_type == 'MENU': c4.prop(val, "value_menu", text="")
 
-        header_box = ovr_box.box()
-        row = header_box.row(align=True)
+        c4.prop(val, "use_tag", text="", icon='BOOKMARKS')
+        c4.prop(val, "tag", text="")
+        c4.prop(val, "use_dir", text="", icon='FILE_FOLDER')
+    else:
+        c4.label(text="")
 
-        if not is_grouped:
-            row.prop(ovr, "parent_group_ptr", text="")
+    # 5. Actions
+    c5 = s4.row(align=True)
+    if val and inp:
+        op = c5.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=getattr(val, 'use_sweep', False))
+        op.action = 'TOGGLE_SWEEP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
-        if ovr.override_target == 'NODE' and ovr.parent_group_ptr:
-            row.prop(ovr, "node_name", text="", icon='NODETREE')
-        
-        row.prop(ovr, "override_target", text="")
+        op = c5.operator("batch_stl.table_action", text="", icon='TRIA_UP')
+        op.action = 'MOVE_VAL_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
-        for action, icon in [('UNPIN' if is_pinned else 'PIN', 'PINNED' if is_pinned else 'UNPINNED'), ('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'X')]:
-            op = row.operator("batch_stl.override_actions", text="", icon=icon)
-            op.action, op.override_index, op.is_pinned = action, o_idx, is_pinned
+        op = c5.operator("batch_stl.table_action", text="", icon='TRIA_DOWN')
+        op.action = 'MOVE_VAL_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
-        inputs_box = ovr_box.box()
-        
-        target_node = None
-        is_valid_target = False
+        op = c5.operator("batch_stl.table_action", text="", icon='TRASH')
+        op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+    else:
+        c5.label(text="")
 
-        if ovr.parent_group_ptr:
-            if ovr.override_target == 'MODIFIER':
-                is_valid_target = True
-            elif ovr.override_target == 'NODE' and ovr.node_name:
-                n_name = ovr.node_name.split(" [")[0].strip()
-                target_node = ovr.parent_group_ptr.nodes.get(n_name)
-                if target_node:
-                    is_valid_target = True
 
-        if is_valid_target:
-            ordered_groups = []
-            seen = set()
-            for i_idx, inp in enumerate(ovr.inputs):
-                name = inp.input_name
-                if name not in seen:
-                    seen.add(name)
-                    group = [(j, other_inp) for j, other_inp in enumerate(ovr.inputs) if other_inp.input_name == name]
-                    ordered_groups.append((name, group))
+def draw_overrides_table(layout, nodegroups, is_pinned):
+    box = layout.box()
 
-            for name, items in ordered_groups:
-                is_inp_grouped = len(items) > 1
-                grp_box = inputs_box.box() if is_inp_grouped else inputs_box
+    header_row = box.row()
+    header_row.label(text="Global Pinned Overrides" if is_pinned else "Local Overrides", icon='PINNED' if is_pinned else 'UNPINNED')
+    op = header_row.operator("batch_stl.table_action", text="Add Node Group", icon='ADD')
+    op.action = 'ADD_GROUP'; op.is_pinned = is_pinned
 
-                for row_idx, (i_idx, inp) in enumerate(items):
-                    v_row = grp_box.row(align=True)
-                    split = v_row.split(factor=0.4)
+    if len(nodegroups) == 0:
+        box.label(text="No overrides defined.")
+        return
 
-                    left_col = split.row(align=True)
-                    if row_idx == 0:
-                        left_col.label(icon='FORWARD')
-                        if ovr.override_target == 'NODE':
-                            if target_node: left_col.prop_search(inp, "input_name", target_node, "inputs", text="")
-                            else: left_col.prop(inp, "input_name", text="")
-                        elif ovr.override_target == 'MODIFIER':
-                            if hasattr(ovr.parent_group_ptr, "interface"): left_col.prop_search(inp, "input_name", ovr.parent_group_ptr.interface, "items_tree", text="")
-                            else: left_col.prop_search(inp, "input_name", ovr.parent_group_ptr, "inputs", text="")
-                        else: left_col.prop(inp, "input_name", text="")
+    # Table Header
+    h_row = box.row(align=True)
+    s1 = h_row.split(factor=0.25); s1.label(text="Node Group")
+    s2 = s1.split(factor=0.33); s2.label(text="Target Node")
+    s3 = s2.split(factor=0.33); s3.label(text="Input Socket")
+    s4 = s3.split(factor=0.75); s4.label(text="Value & Options")
+    s4.label(text="Actions")
 
-                        op = left_col.operator("batch_stl.toggle_sweep", text="", icon='FILE_REFRESH', depress=inp.use_sweep)
-                        op.override_index = o_idx
-                        op.input_index = i_idx
-                        op.is_pinned = is_pinned
-                    else:
-                        left_col.label(text="")
+    for ng_idx, ng in enumerate(nodegroups):
+        ng_first = True
+        if not ng.nodes:
+            draw_table_row(box, ng, None, None, None, is_pinned, ng_idx, -1, -1, -1, ng_first, True, True, True)
+            continue
 
-                    right_col = split.row(align=True)
+        for n_idx, node in enumerate(ng.nodes):
+            n_first = True
+            if not node.inputs:
+                draw_table_row(box, ng, node, None, None, is_pinned, ng_idx, n_idx, -1, -1, ng_first, n_first, True, True)
+                ng_first = False
+                continue
 
-                    if getattr(inp, "use_sweep", False):
-                        if inp.override_type in ['INT', 'FLOAT', 'STRING']: right_col.prop(inp, "sweep_range", text="")
-                        elif inp.override_type == 'BOOLEAN': right_col.label(text="True & False")
-                        elif inp.override_type == 'MENU': right_col.label(text="All values")
-                    else:
-                        if inp.override_type == 'BOOLEAN': right_col.prop(inp, "value_bool", text="True" if inp.value_bool else "False", toggle=True)
-                        elif inp.override_type == 'INT': right_col.prop(inp, "value_int", text="")
-                        elif inp.override_type == 'FLOAT': right_col.prop(inp, "value_float", text="")
-                        elif inp.override_type == 'STRING': right_col.prop(inp, "value_string", text="")
-                        elif inp.override_type == 'MENU': right_col.prop(inp, "value_menu", text="")
+            for i_idx, inp in enumerate(node.inputs):
+                i_first = True
+                if not inp.values:
+                    draw_table_row(box, ng, node, inp, None, is_pinned, ng_idx, n_idx, i_idx, -1, ng_first, n_first, i_first, True)
+                    ng_first = False; n_first = False
+                    continue
 
-                    key = (ovr.override_target, ovr.node_name, inp.input_name)
-                    if is_inp_grouped or freq_dict.get(key, 0) > 1:
-                        right_col.prop(inp, "use_dir", text="", icon='FILE_FOLDER')
-                        right_col.prop(inp, "use_tag", text="", icon='BOOKMARKS')
-                        right_col.prop(inp, "tag", text="")
-
-                    action_row = right_col.row(align=True)
-                    for action, icon in [('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'TRASH')]:
-                        op = action_row.operator("batch_stl.input_actions", text="", icon=icon)
-                        op.action = action
-                        op.override_index = o_idx
-                        op.input_index = i_idx
-                        op.is_pinned = is_pinned
-
-            add_row = inputs_box.row(align=True)
-            for action, icon in [('ADD', 'PLUS'), ('PASTE', 'PASTEDOWN')]:
-                op = add_row.operator("batch_stl.input_actions", text="", icon=icon)
-                op.action = action
-                op.override_index = o_idx
-                op.input_index = -1
-                op.is_pinned = is_pinned
-        else:
-            inputs_box.label(text="Specify valid Group and Node/Modifier to add inputs.", icon='INFO')
+                for v_idx, val in enumerate(inp.values):
+                    draw_table_row(box, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, v_idx, ng_first, n_first, i_first, v_idx == 0)
+                    ng_first = False; n_first = False; i_first = False
 
 
 class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
@@ -1786,37 +1643,37 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
             return
 
-        total_mappings = len(active_preset.mappings)
+        total_collections = len(active_preset.collections)
         total_objects = 0
         total_preset_combos = 0
 
-        for m in active_preset.mappings:
-            m_combos = len(generate_override_combinations(list(active_preset.pinned_overrides) + list(m.node_overrides)))
-            total_preset_combos += m_combos
+        for c in active_preset.collections:
+            c_combos = len(generate_override_combinations(get_flat_overrides(active_preset.nodegroups) + get_flat_overrides(c.nodegroups)))
+            total_preset_combos += c_combos
             obj_count = 0
-            if m.collection_ptr:
-                excluded_names = {e.name for e in m.excluded_objects} if getattr(m, "use_filter", False) else set()
-                for obj in m.collection_ptr.all_objects:
+            if c.collection_ptr:
+                excluded_names = {e.name for e in c.excluded_objects} if getattr(c, "use_filter", False) else set()
+                for obj in c.collection_ptr.all_objects:
                     if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
                         if obj.name not in excluded_names: obj_count += 1
-            total_objects += (obj_count * m_combos)
+            total_objects += (obj_count * c_combos)
 
         layout.separator(factor=0.5)
         m_box = layout.box()
         m_header = m_box.row()
-        icon_m = 'TRIA_DOWN' if scene.batch_stl_ui_mappings else 'TRIA_RIGHT'
-        m_header.prop(scene, "batch_stl_ui_mappings", text="", icon=icon_m, emboss=False)
+        icon_m = 'TRIA_DOWN' if scene.batch_stl_ui_collections else 'TRIA_RIGHT'
+        m_header.prop(scene, "batch_stl_ui_collections", text="", icon=icon_m, emboss=False)
 
-        m_title = f"{active_preset.name} | {total_mappings} collections | {total_preset_combos} combos | {total_objects} objects total"
+        m_title = f"{active_preset.name} | {total_collections} collections | {total_preset_combos} combos | {total_objects} objects total"
         m_header.label(text=m_title, icon='OUTLINER_COLLECTION')
-        draw_inline_controls(m_header, "batch_stl.mapping_actions", use_clipboard=True)
+        draw_inline_controls(m_header, "batch_stl.collection_actions", use_clipboard=True)
 
-        if scene.batch_stl_ui_mappings:
-            m_box.template_list("BATCH_STL_UL_items", "", active_preset, "mappings", active_preset, "mapping_index", rows=5)
-            active_item = get_active_mapping(active_preset)
-            if active_item and active_item.collection_ptr:
+        if scene.batch_stl_ui_collections:
+            m_box.template_list("BATCH_STL_UL_collections", "", active_preset, "collections", active_preset, "collection_index", rows=5)
+            active_col = get_active_collection(active_preset)
+            if active_col and active_col.collection_ptr:
                 m_box.separator()
-                if active_item.use_filter:
+                if active_col.use_filter:
                     filter_box = m_box.box()
                     f_header = filter_box.row()
                     icon_f = 'TRIA_DOWN' if scene.batch_stl_ui_exclude else 'TRIA_RIGHT'
@@ -1825,18 +1682,18 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
                     if scene.batch_stl_ui_exclude:
                         col = filter_box.column(align=True)
-                        for obj in active_item.collection_ptr.all_objects:
+                        for obj in active_col.collection_ptr.all_objects:
                             if obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}: continue
-                            is_excl = any(e.name == obj.name for e in active_item.excluded_objects)
+                            is_excl = any(e.name == obj.name for e in active_col.excluded_objects)
                             icon_btn = 'CHECKBOX_DEHLT' if is_excl else 'CHECKBOX_HLT'
                             op = col.operator("batch_stl.toggle_exclusion", text=obj.name, icon=icon_btn, depress=not is_excl)
                             op.object_name = obj.name
 
         layout.separator()
 
-        if get_active_mapping(active_preset):
-            active_item = get_active_mapping(active_preset)
-            all_ovrs = list(active_preset.pinned_overrides) + list(active_item.node_overrides)
+        if get_active_collection(active_preset):
+            active_col = get_active_collection(active_preset)
+            all_ovrs = get_flat_overrides(active_preset.nodegroups) + get_flat_overrides(active_col.nodegroups)
             freq_dict = {}
             unique_targets = set()
             total_inputs = 0
@@ -1852,55 +1709,38 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             num_targets = len(unique_targets)
             num_combos = len(generate_override_combinations(all_ovrs))
             active_obj_count = 0
-            if active_item.collection_ptr:
-                excluded_names = {e.name for e in active_item.excluded_objects} if getattr(active_item, "use_filter", False) else set()
-                for obj in active_item.collection_ptr.all_objects:
+            if active_col.collection_ptr:
+                excluded_names = {e.name for e in active_col.excluded_objects} if getattr(active_col, "use_filter", False) else set()
+                for obj in active_col.collection_ptr.all_objects:
                     if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
                         if obj.name not in excluded_names: active_obj_count += 1
 
             mapping_total_objects = active_obj_count * num_combos
-            c_name = active_item.collection_ptr.name if active_item.collection_ptr else "Unassigned"
-            if active_item.tag: c_name += f" [{active_item.tag}]"
+            c_name = active_col.collection_ptr.name if active_col.collection_ptr else "Unassigned"
+            if active_col.tag: c_name += f" [{active_col.tag}]"
 
             metric_str = f"{c_name} | {num_targets} targets | {total_inputs} inputs | {num_combos} combos | {mapping_total_objects} objects"
             header = layout.row()
             header.label(text=metric_str, icon='MODIFIER')
             layout.separator()
 
-            pinned_box = layout.box()
-            p_header = pinned_box.row()
+            # Global Table
+            g_header = layout.row()
             icon_g = 'TRIA_DOWN' if scene.batch_stl_ui_global_ovr else 'TRIA_RIGHT'
-            p_header.prop(scene, "batch_stl_ui_global_ovr", text="", icon=icon_g, emboss=False)
-            p_header.label(text="Global Pinned Overrides:", icon='PINNED')
-
-            p_actions = p_header.row(align=True)
-            op = p_actions.operator("batch_stl.override_actions", text="", icon='ADD')
-            op.action, op.override_index, op.is_pinned = 'ADD', -1, True
-            op = p_actions.operator("batch_stl.override_actions", text="", icon='PASTEDOWN')
-            op.action, op.override_index, op.is_pinned = 'PASTE', -1, True
-
+            g_header.prop(scene, "batch_stl_ui_global_ovr", text="", icon=icon_g, emboss=False)
+            g_header.label(text="Global Pinned Overrides (Shared)")
             if scene.batch_stl_ui_global_ovr:
-                groups = get_override_groups(active_preset.pinned_overrides)
-                for grp in groups:
-                    draw_override_group(pinned_box, grp, True, freq_dict)
+                draw_overrides_table(layout, active_preset.nodegroups, is_pinned=True)
 
             layout.separator(factor=0.5)
-            local_box = layout.box()
-            l_header = local_box.row()
+
+            # Local Table
+            l_header = layout.row()
             icon_l = 'TRIA_DOWN' if scene.batch_stl_ui_local_ovr else 'TRIA_RIGHT'
             l_header.prop(scene, "batch_stl_ui_local_ovr", text="", icon=icon_l, emboss=False)
-            l_header.label(text="Local Overrides:", icon='UNPINNED')
-
-            l_actions = l_header.row(align=True)
-            op = l_actions.operator("batch_stl.override_actions", text="", icon='ADD')
-            op.action, op.override_index, op.is_pinned = 'ADD', -1, False
-            op = l_actions.operator("batch_stl.override_actions", text="", icon='PASTEDOWN')
-            op.action, op.override_index, op.is_pinned = 'PASTE', -1, False
-
+            l_header.label(text="Local Overrides (Specific to Collection)")
             if scene.batch_stl_ui_local_ovr:
-                groups = get_override_groups(active_item.node_overrides)
-                for grp in groups:
-                    draw_override_group(local_box, grp, False, freq_dict)
+                draw_overrides_table(layout, active_col.nodegroups, is_pinned=False)
 
             layout.separator(factor=0.5)
             tip_box = layout.box()
@@ -1908,32 +1748,21 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             icon_tip = 'TRIA_DOWN' if scene.batch_stl_ui_tips else 'TRIA_RIGHT'
             tip_header.prop(scene, "batch_stl_ui_tips", text="", icon=icon_tip, emboss=False)
             tip_header.label(text="OVERRIDE INFO", icon='INFO')
-            
+
             if scene.batch_stl_ui_tips:
                 col = tip_box.column()
-
-                col.label(text="For override specify parent nodegroup and nested node name", icon='NODETREE')
-                col.label(text="Enable combinations via Sweep button or by adding multiple inputs", icon='BLANK1')
-                col.label(text="Combine input values to generate combined exports", icon='BLANK1')
+                col.label(text="Hierarchy: NodeGroup > Node > Input > Value.", icon='BLANK1')
+                col.label(text="For modifier targets, leave Node blank or set as <Modifier Interface>", icon='BLANK1')
+                col.label(text="Types are auto-assigned when inputs are selected.", icon='BLANK1')
                 col.label(text="Use Sweep button to iterate through values automatically:", icon='FILE_REFRESH')
                 col.label(text="  • Floats/Ints: Specify start value, step size, and step count", icon='BLANK1')
                 col.label(text="  • Menus/Bools: Automatically iterates through all values", icon='BLANK1')
-                col.label(text="Disable Sweep while holding SHIFT to populate a range for manual control", icon='BLANK1')
-                col.label(text="Add input while holding SHIFT auto-fill all inputs from target node", icon='BLANK1')
 
-                col.label(text="Add multiple values to input for maximum control", icon='BLANK1')
-                
-                col.separator()
-                col.label(text="Formatting outputs (Folders & Names):", icon='BLANK1')
-                col.label(text="  • Create nested folders using the value or a tag string", icon='FILE_FOLDER')
-                col.label(text="  • Append to object names using the value or a tag string", icon='BOOKMARKS')
-                
                 col.separator()
                 col.label(text="Tag String Formatting:", icon='BLANK1')
                 col.label(text="  • [ tag ] replaces input value with the tag", icon='BLANK1')
                 col.label(text="  • [ _tag ] appends the tag to the input value", icon='BLANK1')
                 col.label(text="  • [ tag_ ] prepends the tag to the input value", icon='BLANK1')
-                col.label(text="Press item UP or DOWN while holding SHIFT to jump bottom or top", icon='BLANK1')
 
         layout.separator()
         t_box = layout.box()
@@ -1962,7 +1791,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
 @persistent
 def reset_batch_stl_state(scene):
-    """Force flush export UI lock on file load or crash recovery."""
     try:
         for p in bpy.context.scene.batch_stl_presets:
             p.is_exporting = False
@@ -1971,29 +1799,27 @@ def reset_batch_stl_state(scene):
             p.export_status = ""
     except Exception: pass
 
-# --- EXPLICIT TOPOLOGICAL CLASSES TUPLE ---
-# This strict ordering ensures properties map correctly before being called in UI.
 classes = (
     # 1. Properties
     BatchSTLLogLine,
-    BatchSTLNodeInput,
-    BatchSTLNodeOverride,
+    BatchSTLValue,
+    BatchSTLInput,
+    BatchSTLNode,
+    BatchSTLNodeGroup,
     BatchSTLExcludedObject,
-    BatchSTLExportItem,
+    BatchSTLCollection,
     BatchSTLExportPreset,
 
     # 2. UI Lists
     BATCH_STL_UL_presets,
-    BATCH_STL_UL_items,
+    BATCH_STL_UL_collections,
     BATCH_STL_UL_console_logs,
 
     # 3. Operators
     BATCH_STL_OT_clear_console,
     BATCH_STL_OT_preset_actions,
-    BATCH_STL_OT_mapping_actions,
-    BATCH_STL_OT_override_actions,
-    BATCH_STL_OT_input_actions,
-    BATCH_STL_OT_toggle_sweep,
+    BATCH_STL_OT_collection_actions,
+    BATCH_STL_OT_table_action,
     BATCH_STL_OT_toggle_exclusion,
     BATCH_STL_OT_toggle_dir_tree,
     BATCH_STL_OT_cancel_export,
@@ -2013,14 +1839,13 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
-    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH", description="Master directory path on disk where all batch STL exports will be saved")
-    bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset, description="List of all batch export presets")
-    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0, description="Select the active batch export preset to edit")
-    bpy.types.Scene.batch_stl_verbose_console = bpy.props.BoolProperty(name="Verbose Console Output", default=False, description="Print granular timing statistics and evaluation logs to the system console during export")
+    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH")
+    bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
+    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0)
+    bpy.types.Scene.batch_stl_verbose_console = bpy.props.BoolProperty(name="Verbose Console Output", default=False)
 
-    # UI Collapsible States
     bpy.types.Scene.batch_stl_ui_presets = bpy.props.BoolProperty(default=True)
-    bpy.types.Scene.batch_stl_ui_mappings = bpy.props.BoolProperty(default=True)
+    bpy.types.Scene.batch_stl_ui_collections = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_global_ovr = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_local_ovr = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_exclude = bpy.props.BoolProperty(default=True)
@@ -2043,7 +1868,7 @@ def unregister():
 
     properties_to_remove = [
         "batch_stl_root_dir", "batch_stl_presets", "batch_stl_preset_index",
-        "batch_stl_verbose_console", "batch_stl_ui_presets", "batch_stl_ui_mappings",
+        "batch_stl_verbose_console", "batch_stl_ui_presets", "batch_stl_ui_collections",
         "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr", "batch_stl_ui_exclude",
         "batch_stl_show_tree", "batch_stl_show_console", "batch_stl_collapsed_dirs",
         "batch_stl_ui_tips"
