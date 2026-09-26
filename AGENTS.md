@@ -9,5 +9,8 @@
 - **Property Lifecycle:** Register PropertyGroups before classes that depend on them, and unregister in reverse order. Always delete dynamically added properties on `bpy.types.Scene` or `bpy.types.WindowManager` in `unregister()`.
 - **Code Output:** Output complete, drop-in class or function blocks rather than partial diffs.
 
+## Edit rules ##
+Dont edit anything outside the scope of current request. Do changes only in parts that neccessary for completing the task. Be careful not to alter any functionality.
+
 ## Extension documentation
 Use 'extension_architecture.md' and 'README.md' for all necessary information. After implementing anything, update those files to reflect changes.
