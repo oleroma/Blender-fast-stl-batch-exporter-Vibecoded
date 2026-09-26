@@ -9,11 +9,5 @@
 - **Property Lifecycle:** Register PropertyGroups before classes that depend on them, and unregister in reverse order. Always delete dynamically added properties on `bpy.types.Scene` or `bpy.types.WindowManager` in `unregister()`.
 - **Code Output:** Output complete, drop-in class or function blocks rather than partial diffs.
 
-## Verification & MCP Protocol
-- **No Blind Edits:** You MUST verify every change to `__init__.py` using the Blender MCP tool before reporting completion.
-- **Never Run Raw CLI:** Do not run terminal bash commands for Blender. Use the MCP tool explicitly.
-- **Standard Test Harness:** When testing, instruct the MCP server to run `test_harness.py`. 
-- If the MCP run returns an error, trace the error, apply the fix in `__init__.py`, and re-run verification before returning the response to the user.
-
 ## Extension documentation
 Use 'extension_architecture.md' and 'README.md' for all necessary information. After implementing anything, update those files to reflect changes.

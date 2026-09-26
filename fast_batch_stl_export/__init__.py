@@ -471,6 +471,14 @@ def build_tree_dict(scene, preset):
                     mapping_root_path.append(part)
 
         all_overrides = list(preset.pinned_overrides) + list(mapping.node_overrides)
+        
+        freq_dict = {}
+        for o in all_overrides:
+            for i in o.inputs:
+                key = (o.override_target, o.node_name, i.input_name)
+                weight = 2 if getattr(i, "use_sweep", False) else 1
+                freq_dict[key] = freq_dict.get(key, 0) + weight
+
         combinations = generate_override_combinations(all_overrides)
         valid_objs = []
         if mapping.collection_ptr:
@@ -498,8 +506,10 @@ def build_tree_dict(scene, preset):
                         else: naming_str = inp.tag
                     else: naming_str = val_str
 
-                    if getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
-                    if getattr(inp, "use_dir", False):
+                    is_permutation = freq_dict.get(param_key, 0) > 1
+
+                    if is_permutation and getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
+                    if is_permutation and getattr(inp, "use_dir", False):
                         if naming_str not in combo_root: combo_root[naming_str] = {}
                         combo_root = combo_root[naming_str]
                         combo_subpath.append(naming_str)
@@ -650,6 +660,14 @@ def run_headless_export(preset_index):
         t_batch_start = time.perf_counter()
         first_mapping = mappings_in_batch[0]
         all_overrides = list(preset.pinned_overrides) + list(first_mapping.node_overrides)
+        
+        freq_dict = {}
+        for o in all_overrides:
+            for i in o.inputs:
+                key = (o.override_target, o.node_name, i.input_name)
+                weight = 2 if getattr(i, "use_sweep", False) else 1
+                freq_dict[key] = freq_dict.get(key, 0) + weight
+                
         combinations = generate_override_combinations(all_overrides)
 
         is_clean_batch = len(first_mapping.node_overrides) == 0
@@ -675,8 +693,10 @@ def run_headless_export(preset_index):
                         elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
                         else: naming_str = inp.tag
                     else: naming_str = val_str
-                    if getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
-                    if getattr(inp, "use_dir", False): combo_subpath = os.path.join(combo_subpath, naming_str)
+                    
+                    is_permutation = freq_dict.get(param_key, 0) > 1
+                    if is_permutation and getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
+                    if is_permutation and getattr(inp, "use_dir", False): combo_subpath = os.path.join(combo_subpath, naming_str)
                     processed_params.add(param_key)
 
             t_ovr = time.perf_counter()
@@ -1065,10 +1085,15 @@ class BATCH_STL_OT_override_actions(bpy.types.Operator):
         elif self.action == 'REMOVE' and 0 <= idx < len(lst): lst.remove(idx)
         elif self.action == 'UP' and idx > 0: lst.move(idx, 0 if self.shift_pressed else idx - 1)
         elif self.action == 'DOWN' and 0 <= idx < len(lst) - 1: lst.move(idx, len(lst) - 1 if self.shift_pressed else idx + 1)
-        elif self.action == 'COPY' and 0 <= idx < len(lst): _clipboard["override"] = copy_override_to_dict(lst[idx])
+        elif self.action == 'COPY' and 0 <= idx < len(lst):
+            if self.shift_pressed:
+                paste_override_from_dict(lst.add(), copy_override_to_dict(lst[idx]))
+                lst.move(len(lst) - 1, idx + 1)
+            else:
+                _clipboard["override"] = copy_override_to_dict(lst[idx])
         elif self.action == 'PASTE' and _clipboard.get("override"):
             paste_override_from_dict(lst.add(), _clipboard["override"])
-            if 0 <= idx < len(lst): lst.move(len(lst) - 1, idx + 1)
+            lst.move(len(lst) - 1, idx + 1)
         elif self.action == 'PIN' and not self.is_pinned and 0 <= idx < len(lst):
             paste_override_from_dict(preset.pinned_overrides.add(), copy_override_to_dict(lst[idx]))
             lst.remove(idx)
@@ -1572,107 +1597,147 @@ def draw_inline_controls(layout, operator_id, use_clipboard=False):
         row.operator(operator_id, icon='COPYDOWN', text="").action = 'COPY'
         row.operator(operator_id, icon='PASTEDOWN', text="").action = 'PASTE'
 
-def draw_override_block(layout, ovr, o_idx, is_pinned, freq_dict=None):
+def get_override_groups(overrides):
+    groups = []
+    current_group = []
+    current_ptr = None
+    
+    for o_idx, ovr in enumerate(overrides):
+        ptr = ovr.parent_group_ptr
+        if ptr is not None and ptr == current_ptr:
+            current_group.append((o_idx, ovr))
+        else:
+            if current_group:
+                groups.append(current_group)
+            current_group = [(o_idx, ovr)]
+            current_ptr = ptr
+            
+    if current_group:
+        groups.append(current_group)
+        
+    return groups
+
+def draw_override_group(layout, ovr_group, is_pinned, freq_dict=None):
     if freq_dict is None: freq_dict = {}
+    if not ovr_group: return
 
-    ovr_box = layout.box()
-    header_box = ovr_box.box()
-    row = header_box.row(align=True)
-    row.prop(ovr, "parent_group_ptr", text="")
-    if ovr.override_target == 'NODE' and ovr.parent_group_ptr:
-        row.prop(ovr, "node_name", text="", icon='NODETREE')
-    row.prop(ovr, "override_target", text="")
+    is_grouped = len(ovr_group) > 1
+    
+    group_box = layout.box()
 
-    for action, icon in [('UNPIN' if is_pinned else 'PIN', 'PINNED' if is_pinned else 'UNPINNED'), ('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'X')]:
-        op = row.operator("batch_stl.override_actions", text="", icon=icon)
-        op.action, op.override_index, op.is_pinned = action, o_idx, is_pinned
+    if is_grouped:
+        first_ovr = ovr_group[0][1]
+        top_header = group_box.box()
+        top_row = top_header.row(align=True)
+        top_row.prop(first_ovr, "parent_group_ptr", text="")
 
-    inputs_box = ovr_box.box()
-    target_node = None
-    is_valid_target = False
+    for o_idx, ovr in ovr_group:
+        if is_grouped:
+            ovr_box = group_box.box()
+        else:
+            ovr_box = group_box
 
-    if ovr.parent_group_ptr:
-        if ovr.override_target == 'MODIFIER':
-            is_valid_target = True
-        elif ovr.override_target == 'NODE' and ovr.node_name:
-            n_name = ovr.node_name.split(" [")[0].strip()
-            target_node = ovr.parent_group_ptr.nodes.get(n_name)
-            if target_node:
+        header_box = ovr_box.box()
+        row = header_box.row(align=True)
+
+        if not is_grouped:
+            row.prop(ovr, "parent_group_ptr", text="")
+
+        if ovr.override_target == 'NODE' and ovr.parent_group_ptr:
+            row.prop(ovr, "node_name", text="", icon='NODETREE')
+        
+        row.prop(ovr, "override_target", text="")
+
+        for action, icon in [('UNPIN' if is_pinned else 'PIN', 'PINNED' if is_pinned else 'UNPINNED'), ('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'X')]:
+            op = row.operator("batch_stl.override_actions", text="", icon=icon)
+            op.action, op.override_index, op.is_pinned = action, o_idx, is_pinned
+
+        inputs_box = ovr_box.box()
+        
+        target_node = None
+        is_valid_target = False
+
+        if ovr.parent_group_ptr:
+            if ovr.override_target == 'MODIFIER':
                 is_valid_target = True
+            elif ovr.override_target == 'NODE' and ovr.node_name:
+                n_name = ovr.node_name.split(" [")[0].strip()
+                target_node = ovr.parent_group_ptr.nodes.get(n_name)
+                if target_node:
+                    is_valid_target = True
 
-    if is_valid_target:
-        ordered_groups = []
-        seen = set()
-        for i_idx, inp in enumerate(ovr.inputs):
-            name = inp.input_name
-            if name not in seen:
-                seen.add(name)
-                group = [(j, other_inp) for j, other_inp in enumerate(ovr.inputs) if other_inp.input_name == name]
-                ordered_groups.append((name, group))
+        if is_valid_target:
+            ordered_groups = []
+            seen = set()
+            for i_idx, inp in enumerate(ovr.inputs):
+                name = inp.input_name
+                if name not in seen:
+                    seen.add(name)
+                    group = [(j, other_inp) for j, other_inp in enumerate(ovr.inputs) if other_inp.input_name == name]
+                    ordered_groups.append((name, group))
 
-        for name, items in ordered_groups:
-            is_grouped = len(items) > 1
-            grp_box = inputs_box.box() if is_grouped else inputs_box
+            for name, items in ordered_groups:
+                is_inp_grouped = len(items) > 1
+                grp_box = inputs_box.box() if is_inp_grouped else inputs_box
 
-            for row_idx, (i_idx, inp) in enumerate(items):
-                v_row = grp_box.row(align=True)
-                split = v_row.split(factor=0.4)
+                for row_idx, (i_idx, inp) in enumerate(items):
+                    v_row = grp_box.row(align=True)
+                    split = v_row.split(factor=0.4)
 
-                left_col = split.row(align=True)
-                if row_idx == 0:
-                    left_col.label(icon='FORWARD')
-                    if ovr.override_target == 'NODE':
-                        if target_node: left_col.prop_search(inp, "input_name", target_node, "inputs", text="")
+                    left_col = split.row(align=True)
+                    if row_idx == 0:
+                        left_col.label(icon='FORWARD')
+                        if ovr.override_target == 'NODE':
+                            if target_node: left_col.prop_search(inp, "input_name", target_node, "inputs", text="")
+                            else: left_col.prop(inp, "input_name", text="")
+                        elif ovr.override_target == 'MODIFIER':
+                            if hasattr(ovr.parent_group_ptr, "interface"): left_col.prop_search(inp, "input_name", ovr.parent_group_ptr.interface, "items_tree", text="")
+                            else: left_col.prop_search(inp, "input_name", ovr.parent_group_ptr, "inputs", text="")
                         else: left_col.prop(inp, "input_name", text="")
-                    elif ovr.override_target == 'MODIFIER':
-                        if hasattr(ovr.parent_group_ptr, "interface"): left_col.prop_search(inp, "input_name", ovr.parent_group_ptr.interface, "items_tree", text="")
-                        else: left_col.prop_search(inp, "input_name", ovr.parent_group_ptr, "inputs", text="")
-                    else: left_col.prop(inp, "input_name", text="")
 
-                    op = left_col.operator("batch_stl.toggle_sweep", text="", icon='FILE_REFRESH', depress=inp.use_sweep)
-                    op.override_index = o_idx
-                    op.input_index = i_idx
-                    op.is_pinned = is_pinned
-                else:
-                    # Provide empty spacing aligned with the initial target selection field
-                    left_col.label(text="")
+                        op = left_col.operator("batch_stl.toggle_sweep", text="", icon='FILE_REFRESH', depress=inp.use_sweep)
+                        op.override_index = o_idx
+                        op.input_index = i_idx
+                        op.is_pinned = is_pinned
+                    else:
+                        left_col.label(text="")
 
-                right_col = split.row(align=True)
+                    right_col = split.row(align=True)
 
-                if getattr(inp, "use_sweep", False):
-                    if inp.override_type in ['INT', 'FLOAT', 'STRING']: right_col.prop(inp, "sweep_range", text="")
-                    elif inp.override_type == 'BOOLEAN': right_col.label(text="True & False")
-                    elif inp.override_type == 'MENU': right_col.label(text="All values")
-                else:
-                    if inp.override_type == 'BOOLEAN': right_col.prop(inp, "value_bool", text="True" if inp.value_bool else "False", toggle=True)
-                    elif inp.override_type == 'INT': right_col.prop(inp, "value_int", text="")
-                    elif inp.override_type == 'FLOAT': right_col.prop(inp, "value_float", text="")
-                    elif inp.override_type == 'STRING': right_col.prop(inp, "value_string", text="")
-                    elif inp.override_type == 'MENU': right_col.prop(inp, "value_menu", text="")
+                    if getattr(inp, "use_sweep", False):
+                        if inp.override_type in ['INT', 'FLOAT', 'STRING']: right_col.prop(inp, "sweep_range", text="")
+                        elif inp.override_type == 'BOOLEAN': right_col.label(text="True & False")
+                        elif inp.override_type == 'MENU': right_col.label(text="All values")
+                    else:
+                        if inp.override_type == 'BOOLEAN': right_col.prop(inp, "value_bool", text="True" if inp.value_bool else "False", toggle=True)
+                        elif inp.override_type == 'INT': right_col.prop(inp, "value_int", text="")
+                        elif inp.override_type == 'FLOAT': right_col.prop(inp, "value_float", text="")
+                        elif inp.override_type == 'STRING': right_col.prop(inp, "value_string", text="")
+                        elif inp.override_type == 'MENU': right_col.prop(inp, "value_menu", text="")
 
-                key = (ovr.override_target, ovr.node_name, inp.input_name)
-                if is_grouped or freq_dict.get(key, 0) > 1:
-                    right_col.prop(inp, "use_dir", text="", icon='FILE_FOLDER')
-                    right_col.prop(inp, "use_tag", text="", icon='BOOKMARKS')
-                    right_col.prop(inp, "tag", text="")
+                    key = (ovr.override_target, ovr.node_name, inp.input_name)
+                    if is_inp_grouped or freq_dict.get(key, 0) > 1:
+                        right_col.prop(inp, "use_dir", text="", icon='FILE_FOLDER')
+                        right_col.prop(inp, "use_tag", text="", icon='BOOKMARKS')
+                        right_col.prop(inp, "tag", text="")
 
-                action_row = right_col.row(align=True)
-                for action, icon in [('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'TRASH')]:
-                    op = action_row.operator("batch_stl.input_actions", text="", icon=icon)
-                    op.action = action
-                    op.override_index = o_idx
-                    op.input_index = i_idx
-                    op.is_pinned = is_pinned
+                    action_row = right_col.row(align=True)
+                    for action, icon in [('UP', 'TRIA_UP'), ('DOWN', 'TRIA_DOWN'), ('COPY', 'COPYDOWN'), ('REMOVE', 'TRASH')]:
+                        op = action_row.operator("batch_stl.input_actions", text="", icon=icon)
+                        op.action = action
+                        op.override_index = o_idx
+                        op.input_index = i_idx
+                        op.is_pinned = is_pinned
 
-        add_row = inputs_box.row(align=True)
-        for action, icon in [('ADD', 'PLUS'), ('PASTE', 'PASTEDOWN')]:
-            op = add_row.operator("batch_stl.input_actions", text="", icon=icon)
-            op.action = action
-            op.override_index = o_idx
-            op.input_index = -1
-            op.is_pinned = is_pinned
-    else:
-        inputs_box.label(text="Specify valid Group and Node/Modifier to add inputs.", icon='INFO')
+            add_row = inputs_box.row(align=True)
+            for action, icon in [('ADD', 'PLUS'), ('PASTE', 'PASTEDOWN')]:
+                op = add_row.operator("batch_stl.input_actions", text="", icon=icon)
+                op.action = action
+                op.override_index = o_idx
+                op.input_index = -1
+                op.is_pinned = is_pinned
+        else:
+            inputs_box.label(text="Specify valid Group and Node/Modifier to add inputs.", icon='INFO')
 
 
 class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
@@ -1815,8 +1880,9 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             op.action, op.override_index, op.is_pinned = 'PASTE', -1, True
 
             if scene.batch_stl_ui_global_ovr:
-                for o_idx, ovr in enumerate(active_preset.pinned_overrides):
-                    draw_override_block(pinned_box, ovr, o_idx, True, freq_dict)
+                groups = get_override_groups(active_preset.pinned_overrides)
+                for grp in groups:
+                    draw_override_group(pinned_box, grp, True, freq_dict)
 
             layout.separator(factor=0.5)
             local_box = layout.box()
@@ -1832,8 +1898,9 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             op.action, op.override_index, op.is_pinned = 'PASTE', -1, False
 
             if scene.batch_stl_ui_local_ovr:
-                for o_idx, ovr in enumerate(active_item.node_overrides):
-                    draw_override_block(local_box, ovr, o_idx, False, freq_dict)
+                groups = get_override_groups(active_item.node_overrides)
+                for grp in groups:
+                    draw_override_group(local_box, grp, False, freq_dict)
 
             layout.separator(factor=0.5)
             tip_box = layout.box()
