@@ -1562,27 +1562,60 @@ def draw_inline_controls(layout, operator_id, use_clipboard=False):
 def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, v_idx, show_ng, show_n, show_i, show_v):
     row = layout.row(align=True)
 
+    action_type = None
+    if show_ng: action_type = 'GROUP'
+    elif show_n: action_type = 'NODE'
+    elif show_i: action_type = 'INPUT'
+    elif show_v or (val and inp): action_type = 'VALUE'
+
+    def draw_actions(container):
+        if not action_type: return
+        container.alignment = 'RIGHT'
+        op = container.operator("batch_stl.table_action", text="", icon='TRIA_UP')
+        op.action = f'MOVE_{action_type}_UP'
+        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+
+        op = container.operator("batch_stl.table_action", text="", icon='TRIA_DOWN')
+        op.action = f'MOVE_{action_type}_DOWN'
+        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+
+        op = container.operator("batch_stl.table_action", text="", icon='TRASH')
+        op.action = f'DEL_{action_type}'
+        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+
+    # 0. Actions for NG
+    s0 = row.split(factor=0.09, align=True)
+    c0 = s0.row(align=True)
+    if show_ng:
+        draw_actions(c0)
+    else:
+        c0.label(text="")
+
     # 1. Node Group
-    s1 = row.split(factor=0.15)
+    s1 = s0.split(factor=0.17, align=True)
     c1 = s1.row(align=True)
     if show_ng:
         if ng: c1.prop(ng, "group_ptr", text="")
         op = c1.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_GROUP'; op.is_pinned = is_pinned
+    elif show_n:
+        draw_actions(c1)
     else:
         c1.label(text="")
 
     # 2. Node
-    s2 = s1.split(factor=0.15)
+    s2 = s1.split(factor=0.24, align=True)
     c2 = s2.row(align=True)
     if show_n:
         if node: c2.prop(node, "name", text="", icon='NODETREE')
         if ng:
             op = c2.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+    elif show_i:
+        draw_actions(c2)
     else:
         c2.label(text="")
 
     # 3. Input
-    s3 = s2.split(factor=0.30)
+    s3 = s2.split(factor=0.4, align=True)
     c3 = s3.row(align=True)
     if show_i:
         if inp:
@@ -1598,11 +1631,13 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
 
         if node:
             op = c3.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+    elif show_v or (val and inp):
+        draw_actions(c3)
     else:
         c3.label(text="")
 
     # 4. Value
-    s4 = s3.split(factor=0.8)
+    s4 = s3.split(factor=0.5, align=True)
     c4 = s4.row(align=True)
     if val and inp:
         if getattr(val, "use_sweep", False):
@@ -1615,43 +1650,25 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
             elif inp.override_type == 'FLOAT': c4.prop(val, "value_float", text="")
             elif inp.override_type == 'STRING': c4.prop(val, "value_string", text="")
             elif inp.override_type == 'MENU': c4.prop(val, "value_menu", text="")
-        c4.prop(val, "use_dir", text="", icon='FILE_FOLDER')
-        c4.prop(val, "use_tag", text="", icon='BOOKMARKS')
-        c4.prop(val, "tag", text="")
 
+    # 5. Dir / Tag
+    c5 = s4.row(align=True)
+    if val and inp:
+        c5.prop(val, "use_dir", text="", icon='FILE_FOLDER')
+        c5.prop(val, "use_tag", text="", icon='BOOKMARKS')
+        c5.prop(val, "tag", text="")
 
     if inp:
         if val and getattr(val, "use_sweep", False):
-            op = c4.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
+            op = c5.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
         else:
-            op = c4.operator("batch_stl.table_action", text="", icon='ADD')
+            op = c5.operator("batch_stl.table_action", text="", icon='ADD')
             
         op.action = 'VALUE_ACTION'
         op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx if val else -1
     else:
         c4.label(text="")
-
-    # 5. Actions
-    c5 = s4.row(align=True)
-
-    action_type = None
-    if show_ng: action_type = 'GROUP'
-    elif show_n: action_type = 'NODE'
-    elif show_i: action_type = 'INPUT'
-    elif show_v or (val and inp): action_type = 'VALUE'
-
-    if action_type:
-        op = c5.operator("batch_stl.table_action", text="", icon='TRIA_UP')
-        op.action = f'MOVE_{action_type}_UP'
-        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-
-        op = c5.operator("batch_stl.table_action", text="", icon='TRIA_DOWN')
-        op.action = f'MOVE_{action_type}_DOWN'
-        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-
-        op = c5.operator("batch_stl.table_action", text="", icon='TRASH')
-        op.action = f'DEL_{action_type}'
-        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+        c5.label(text="")
 
 
 def draw_overrides_table(layout, nodegroups, is_pinned):
@@ -1668,12 +1685,12 @@ def draw_overrides_table(layout, nodegroups, is_pinned):
 
     # Table Header
     h_row = box.row(align=True)
-    s1 = h_row.split(factor=0.15); s1.label(text="Node Group")
-    s2 = s1.split(factor=0.18); s2.label(text="Target")
-    s3 = s2.split(factor=0.35); s3.label(text="Input")
-    s4 = s3.split(factor=0.8); s4.label(text="Value")
-    s4 = s3.split(factor=0.8); s4.label(text="tag")
-    s4.label(text="Actions")
+    s0 = h_row.split(factor=0.09, align=True); s0.label(text="")
+    s1 = s0.split(factor=0.17, align=True); s1.label(text="Node Group")
+    s2 = s1.split(factor=0.24, align=True); s2.label(text="Target")
+    s3 = s2.split(factor=0.4, align=True); s3.label(text="Input")
+    s4 = s3.split(factor=0.3, align=True); s4.label(text="Value")
+    s4.label(text="Dir / Tag")
 
     for ng_idx, ng in enumerate(nodegroups):
         ng_first = True
