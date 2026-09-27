@@ -1189,6 +1189,13 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         elif self.action == 'DEL_VALUE':
             ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.remove(self.v_idx)
 
+        elif self.action == 'DEL_VALUE_OR_INPUT':
+            inp = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
+            if len(inp.values) > 1:
+                inp.values.remove(self.v_idx)
+            else:
+                ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
+
         elif self.action in ['ADD_VALUE', 'TOGGLE_SWEEP', 'VALUE_ACTION']:
             vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
 
@@ -1606,15 +1613,15 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
         ng_box = box.box()
         ng_layout = ng_box.column()
         ng_row = ng_layout.row(align=True)
+        op = ng_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
         ng_row.prop(ng, "group_ptr", text="")
         
         if len(nodegroups) > 1:
             op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
             op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
-        op = ng_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
         op = ng_row.operator("batch_stl.table_action", text="", icon='PINNED' if is_pinned else 'UNPINNED'); op.action = 'UNPIN_GROUP' if is_pinned else 'PIN_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
         op = ng_row.operator("batch_stl.table_action", text="", icon='COPYDOWN'); op.action = 'COPY_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
-        op = ng_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
         
         if not ng.nodes:
             continue
@@ -1630,13 +1637,13 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
             node_layout = node_container.column()
 
             n_row = node_layout.row(align=True)
-            n_row.prop(node, "name", text="")
+            op = n_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+            n_row.prop(node, "name", text="", icon='NODETREE')
             
             if len(ng.nodes) > 1:
                 op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_NODE_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
                 op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_NODE_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
                 op = n_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
-            op = n_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
 
             if not node.inputs:
                 continue
@@ -1644,26 +1651,20 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
             i_split = node_layout.split(factor=0.03)
             i_split.column()
             inputs_col = i_split.column()
-            inputs_box = inputs_col.box() if len(node.inputs) > 1 else inputs_col
+            inputs_box = inputs_col.box()
             inputs_layout = inputs_box.column()
 
             for i_idx, inp in enumerate(node.inputs):
-                input_container = inputs_layout.box() if len(inp.values) > 1 else inputs_layout
-                input_layout = input_container.column()
+                input_layout = inputs_layout.column()
                 
                 if not inp.values:
                     i_row = input_layout.row(align=True)
-                    s_main = i_row.split(factor=0.35, align=True)
+                    s_main = i_row.split(factor=0.35, align=False)
                     c_inp = s_main.row(align=True)
                     
                     op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
                     op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = -1
 
-                    if len(node.inputs) > 1:
-                        op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                        op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                        op = c_inp.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                    
                     is_mod = not node.name or node.name == "<Modifier Interface>"
                     if is_mod and ng.group_ptr and hasattr(ng.group_ptr, "interface"):
                         c_inp.prop_search(inp, "name", ng.group_ptr.interface, "items_tree", text="")
@@ -1674,16 +1675,22 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                     else:
                         c_inp.prop(inp, "name", text="")
                         
-                    s_val = s_main.split(factor=0.5, align=True)
+                    s_val = s_main.split(factor=0.5, align=False)
                     c_val = s_val.row(align=True)
                     c_dir = s_val.row(align=True)
+
+                    if len(node.inputs) > 1:
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                    op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+
                     continue
 
                 for v_idx, val in enumerate(inp.values):
                     i_first = (v_idx == 0)
                     i_row = input_layout.row(align=True)
                     
-                    s_main = i_row.split(factor=0.35, align=True)
+                    s_main = i_row.split(factor=0.35, align=False)
                     c_inp = s_main.row(align=True)
 
                     if i_first:
@@ -1693,11 +1700,6 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                             op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
                         op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
 
-                        if len(node.inputs) > 1:
-                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                        
                         is_mod = not node.name or node.name == "<Modifier Interface>"
                         if is_mod and ng.group_ptr and hasattr(ng.group_ptr, "interface"):
                             c_inp.prop_search(inp, "name", ng.group_ptr.interface, "items_tree", text="")
@@ -1709,12 +1711,8 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                             c_inp.prop(inp, "name", text="")
                     else:
                         c_inp.alignment = 'RIGHT'
-                        if len(inp.values) > 1:
-                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_VALUE_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
-                    s_val = s_main.split(factor=0.5, align=True)
+                    s_val = s_main.split(factor=0.5, align=False)
                     c_val = s_val.row(align=True)
                     
                     if getattr(val, "use_sweep", False):
@@ -1744,6 +1742,18 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                     c_dir.prop(val, "use_dir", text="", icon='FILE_FOLDER')
                     c_dir.prop(val, "use_tag", text="", icon='BOOKMARKS')
                     c_dir.prop(val, "tag", text="")
+
+                    if i_first:
+                        if len(node.inputs) > 1:
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE_OR_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
+                    else:
+                        if len(inp.values) > 1:
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_VALUE_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
                     # Removed ADD/Sweep button from children
 

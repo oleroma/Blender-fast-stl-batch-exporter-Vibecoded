@@ -15,7 +15,7 @@ The highest level of the hierarchy. It defines which Geometry Node tree the over
   - **Trash**: Deletes the NodeGroup.
   - **Pin / Unpin**: Moves the NodeGroup between the Global (shared across all collections) and Local (specific to the active collection) tables.
   - **Copy / Paste**: Copies the entire group hierarchy to the clipboard to be pasted elsewhere.
-  - **Add Node**: Spawns a new child Node within this group.
+- **Add Node Action** (Left-aligned): Spawns a new child Node within this group.
 
 ### 2. Node (Level 2)
 Targets a specific node inside the parent NodeGroup.
@@ -24,20 +24,20 @@ Targets a specific node inside the parent NodeGroup.
 - **Actions** (Right-aligned):
   - **Move Up / Down**: Reorders the Node (only spawns if multiple nodes exist).
   - **Trash**: Deletes the Node.
-  - **Add Input**: Spawns a new child Input parameter for this node.
+- **Add Input Action** (Left-aligned): Spawns a new child Input parameter for this node.
 
 ### 3. Input (Level 3)
 Targets a specific socket/parameter on the parent Node.
-- **Visuals**: If an Input contains multiple Values (children), it dynamically generates a wrapper box around the input row and all its values. This ensures multiple iterations of a single input are visually grouped. It is indented 3% inward from the Node wrapper.
+- **Visuals**: All inputs belonging to a Node are now wrapped together in a single shared box container. This box is indented 3% inward from the Node wrapper.
 - **Target**: A string property (`name`) mapping to the exact socket name.
 - **Actions**:
   - **Add Value / Sweep** (Left-aligned, before the name): Adds a new value iteration to this input. If clicked with `Shift`, it toggles **Sweep Mode**. 
-  - **Move Up / Down**: Reorders the Input (only spawns if multiple inputs exist).
-  - **Trash**: Deletes the Input.
+  - **Move Up / Down** (Right-aligned): Reorders the Input (only spawns if multiple inputs exist).
+  - **Trash** (Right-aligned): Deletes the Input.
 
 ### 4. Value (Level 4 - Leaf)
 The specific value(s) to be injected into the target Input during export.
-- **Visuals**: Values are drawn horizontally aligned with the Input row. The gap between the input column and the value column is removed (`align=True`) for a compact, spreadsheet-like appearance.
+- **Visuals**: Values are drawn horizontally aligned with the Input row. A small gap separates the input column, value column, and metadata column for readability (`align=False` on row splits).
 - **Data Types**: Automatically inferred from the target socket. Supports `FLOAT`, `INT`, `STRING`, `BOOLEAN`, and `MENU`.
 - **Value Actions** (Right-aligned, on subsequent values if multiple exist):
   - **Move Up / Down**: Reorders the value within the input's list.
