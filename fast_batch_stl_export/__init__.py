@@ -1147,7 +1147,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                         for i in target_n.inputs:
                             if not getattr(i, "is_unavailable", False) and not getattr(i, "hide", False):
                                 source_inputs.append(i.name)
-                
+
                 if source_inputs:
                     existing_names = {i.name for i in node.inputs}
                     added = False
@@ -1170,7 +1170,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
 
         elif self.action in ['ADD_VALUE', 'TOGGLE_SWEEP', 'VALUE_ACTION']:
             vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
-            
+
             if self.v_idx < 0:
                 vals.add()
             else:
@@ -1190,17 +1190,17 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                             ng_obj = ng_list[self.ng_idx]
                             node_obj = ng_obj.nodes[self.n_idx]
                             target = 'MODIFIER' if not node_obj.name or node_obj.name == "<Modifier Interface>" else 'NODE'
-                            
+
                             temp_inp = TempMockInput(inp_obj.name, inp_obj.override_type, val)
                             temp_ovr = TempMockOverride(target, ng_obj.group_ptr, node_obj.name, [temp_inp])
-                            
+
                             parsed_vals = parse_sweep_values(temp_ovr, temp_inp)
                             if parsed_vals:
                                 first_val = parsed_vals[0]
                                 if inp_obj.override_type == 'FLOAT': val.value_float = first_val
                                 elif inp_obj.override_type == 'INT': val.value_int = first_val
                                 elif inp_obj.override_type == 'MENU': val.value_menu = str(first_val)
-                                
+
                                 for p_val in parsed_vals[1:]:
                                     new_val = vals.add()
                                     new_val.use_sweep = False
@@ -1641,15 +1641,23 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
     c4 = s4.row(align=True)
     if val and inp:
         if getattr(val, "use_sweep", False):
-            if inp.override_type in ['INT', 'FLOAT', 'STRING']: c4.prop(val, "sweep_range", text="")
-            elif inp.override_type == 'BOOLEAN': c4.label(text="True & False")
-            elif inp.override_type == 'MENU': c4.label(text="All values")
+            if inp.override_type in ['INT', 'FLOAT', 'STRING']:
+                c4.prop(val, "sweep_range", text="")
+            elif inp.override_type == 'BOOLEAN':
+                c4.label(text="True & False")
+            elif inp.override_type == 'MENU':
+                c4.label(text="All values")
         else:
-            if inp.override_type == 'BOOLEAN': c4.prop(val, "value_bool", text="True" if val.value_bool else "False", toggle=True)
-            elif inp.override_type == 'INT': c4.prop(val, "value_int", text="")
-            elif inp.override_type == 'FLOAT': c4.prop(val, "value_float", text="")
-            elif inp.override_type == 'STRING': c4.prop(val, "value_string", text="")
-            elif inp.override_type == 'MENU': c4.prop(val, "value_menu", text="")
+            if inp.override_type == 'BOOLEAN':
+                c4.prop(val, "value_bool", text="True" if val.value_bool else "False", toggle=True)
+            elif inp.override_type == 'INT':
+                c4.prop(val, "value_int", text="")
+            elif inp.override_type == 'FLOAT':
+                c4.prop(val, "value_float", text="")
+            elif inp.override_type == 'STRING':
+                c4.prop(val, "value_string", text="")
+            elif inp.override_type == 'MENU':
+                c4.prop(val, "value_menu", text="")
 
     # 5. Dir / Tag
     c5 = s4.row(align=True)
@@ -1663,7 +1671,7 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
             op = c5.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
         else:
             op = c5.operator("batch_stl.table_action", text="", icon='ADD')
-            
+
         op.action = 'VALUE_ACTION'
         op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx if val else -1
     else:
@@ -1685,12 +1693,12 @@ def draw_overrides_table(layout, nodegroups, is_pinned):
 
     # Table Header
     h_row = box.row(align=True)
-    s0 = h_row.split(factor=0.09, align=True); s0.label(text="")
-    s1 = s0.split(factor=0.17, align=True); s1.label(text="Node Group")
-    s2 = s1.split(factor=0.24, align=True); s2.label(text="Target")
-    s3 = s2.split(factor=0.4, align=True); s3.label(text="Input")
-    s4 = s3.split(factor=0.3, align=True); s4.label(text="Value")
-    s4.label(text="Dir / Tag")
+    s0 = h_row.split(factor=0.09, align=True); r0 = s0.row(align=True); r0.alignment = 'CENTER'; r0.label(text="Action")
+    s1 = s0.split(factor=0.17, align=True); r1 = s1.row(align=True); r1.alignment = 'CENTER'; r1.label(text="Node Group")
+    s2 = s1.split(factor=0.24, align=True); r2 = s2.row(align=True); r2.alignment = 'CENTER'; r2.label(text="Target")
+    s3 = s2.split(factor=0.4, align=True); r3 = s3.row(align=True); r3.alignment = 'CENTER'; r3.label(text="Input")
+    s4 = s3.split(factor=0.3, align=True); r4 = s4.row(align=True); r4.alignment = 'CENTER'; r4.label(text="Value")
+    r5 = s4.row(align=True); r5.alignment = 'CENTER'; r5.label(text="Tag")
 
     for ng_idx, ng in enumerate(nodegroups):
         ng_first = True
