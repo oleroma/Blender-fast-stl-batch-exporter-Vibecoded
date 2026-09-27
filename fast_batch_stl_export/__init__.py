@@ -853,6 +853,7 @@ def on_input_name_update(self, context):
     except Exception: pass
 
 def search_target_node_cb(self, context, edit_text):
+    if edit_text == self.name: edit_text = ""
     res = ["<Modifier Interface>"]
     found_ng = None
     for p in context.scene.batch_stl_presets:
@@ -874,7 +875,6 @@ def search_target_node_cb(self, context, edit_text):
             if not edit_text or edit_text.lower() in val.lower():
                 res.append(val)
 
-    if edit_text == self.name: edit_text = ""
     return res
 
 def search_menu_items_cb(self, context, edit_text):
@@ -1669,9 +1669,10 @@ def draw_overrides_table(layout, nodegroups, is_pinned):
     # Table Header
     h_row = box.row(align=True)
     s1 = h_row.split(factor=0.15); s1.label(text="Node Group")
-    s2 = s1.split(factor=0.18); s2.label(text="Target Node")
-    s3 = s2.split(factor=0.35); s3.label(text="Input Socket")
-    s4 = s3.split(factor=0.8); s4.label(text="Value & Options")
+    s2 = s1.split(factor=0.18); s2.label(text="Target")
+    s3 = s2.split(factor=0.35); s3.label(text="Input")
+    s4 = s3.split(factor=0.8); s4.label(text="Value")
+    s4 = s3.split(factor=0.8); s4.label(text="tag")
     s4.label(text="Actions")
 
     for ng_idx, ng in enumerate(nodegroups):
