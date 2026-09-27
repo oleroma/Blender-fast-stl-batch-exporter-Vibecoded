@@ -1606,7 +1606,7 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
     s2 = s1.split(factor=0.24, align=True)
     c2 = s2.row(align=True)
     if show_n:
-        if node: c2.prop(node, "name", text="", icon='NODETREE')
+        if node: c2.prop(node, "name", text="")
         if ng:
             op = c2.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
     elif show_i:
@@ -1637,7 +1637,7 @@ def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, 
         c3.label(text="")
 
     # 4. Value
-    s4 = s3.split(factor=0.5, align=True)
+    s4 = s3.split(factor=0.4, align=True)
     c4 = s4.row(align=True)
     if val and inp:
         if getattr(val, "use_sweep", False):
