@@ -1090,6 +1090,7 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
         if self.action != 'COPY': bpy.ops.ed.undo_push(message="Collection Action")
         return {'FINISHED'}
 
+_clipboard = {}
 
 class BATCH_STL_OT_table_action(bpy.types.Operator):
     bl_idname = "batch_stl.table_action"
@@ -1122,6 +1123,26 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
             inp.values.add()
         elif self.action == 'DEL_GROUP':
             ng_list.remove(self.ng_idx)
+        elif self.action == 'PIN_GROUP':
+            if not self.is_pinned:
+                src_ng = ng_list[self.ng_idx]
+                dst_ng = preset.nodegroups.add()
+                paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
+                ng_list.remove(self.ng_idx)
+        elif self.action == 'UNPIN_GROUP':
+            if self.is_pinned:
+                active_col = get_active_collection(preset)
+                if active_col:
+                    src_ng = ng_list[self.ng_idx]
+                    dst_ng = active_col.nodegroups.add()
+                    paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
+                    ng_list.remove(self.ng_idx)
+        elif self.action == 'COPY_GROUP':
+            global _clipboard
+            _clipboard["nodegroup"] = copy_ng_to_dict(ng_list[self.ng_idx])
+        elif self.action == 'PASTE_GROUP':
+            if _clipboard.get("nodegroup"):
+                paste_ng_from_dict(ng_list.add(), _clipboard["nodegroup"])
 
         elif self.action == 'ADD_NODE':
             node = ng_list[self.ng_idx].nodes.add()
@@ -1559,170 +1580,172 @@ def draw_inline_controls(layout, operator_id, use_clipboard=False):
         row.operator(operator_id, icon='PASTEDOWN', text="").action = 'PASTE'
 
 
-def draw_table_row(layout, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, v_idx, show_ng, show_n, show_i, show_v):
-    row = layout.row(align=True)
-
-    action_type = None
-    if show_ng: action_type = 'GROUP'
-    elif show_n: action_type = 'NODE'
-    elif show_i: action_type = 'INPUT'
-    elif show_v or (val and inp): action_type = 'VALUE'
-
-    def draw_actions(container):
-        if not action_type: return
-        container.alignment = 'RIGHT'
-        op = container.operator("batch_stl.table_action", text="", icon='TRIA_UP')
-        op.action = f'MOVE_{action_type}_UP'
-        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-
-        op = container.operator("batch_stl.table_action", text="", icon='TRIA_DOWN')
-        op.action = f'MOVE_{action_type}_DOWN'
-        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-
-        op = container.operator("batch_stl.table_action", text="", icon='TRASH')
-        op.action = f'DEL_{action_type}'
-        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-
-    # 0. Actions for NG
-    s0 = row.split(factor=0.09, align=True)
-    c0 = s0.row(align=True)
-    if show_ng:
-        draw_actions(c0)
-    else:
-        c0.label(text="")
-
-    # 1. Node Group
-    s1 = s0.split(factor=0.17, align=True)
-    c1 = s1.row(align=True)
-    if show_ng:
-        if ng: c1.prop(ng, "group_ptr", text="")
-        op = c1.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_GROUP'; op.is_pinned = is_pinned
-    elif show_n:
-        draw_actions(c1)
-    else:
-        c1.label(text="")
-
-    # 2. Node
-    s2 = s1.split(factor=0.24, align=True)
-    c2 = s2.row(align=True)
-    if show_n:
-        if node: c2.prop(node, "name", text="")
-        if ng:
-            op = c2.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
-    elif show_i:
-        draw_actions(c2)
-    else:
-        c2.label(text="")
-
-    # 3. Input
-    s3 = s2.split(factor=0.4, align=True)
-    c3 = s3.row(align=True)
-    if show_i:
-        if inp:
-            is_mod = not node.name or node.name == "<Modifier Interface>"
-            if is_mod and ng.group_ptr and hasattr(ng.group_ptr, "interface"):
-                c3.prop_search(inp, "name", ng.group_ptr.interface, "items_tree", text="")
-            elif not is_mod and ng.group_ptr and node.name:
-                target_n = ng.group_ptr.nodes.get(node.name.split(" [")[0].strip())
-                if target_n: c3.prop_search(inp, "name", target_n, "inputs", text="")
-                else: c3.prop(inp, "name", text="")
-            else:
-                c3.prop(inp, "name", text="")
-
-        if node:
-            op = c3.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
-    elif show_v or (val and inp):
-        draw_actions(c3)
-    else:
-        c3.label(text="")
-
-    # 4. Value
-    s4 = s3.split(factor=0.4, align=True)
-    c4 = s4.row(align=True)
-    if val and inp:
-        if getattr(val, "use_sweep", False):
-            if inp.override_type in ['INT', 'FLOAT', 'STRING']:
-                c4.prop(val, "sweep_range", text="")
-            elif inp.override_type == 'BOOLEAN':
-                c4.label(text="True & False")
-            elif inp.override_type == 'MENU':
-                c4.label(text="All values")
-        else:
-            if inp.override_type == 'BOOLEAN':
-                c4.prop(val, "value_bool", text="True" if val.value_bool else "False", toggle=True)
-            elif inp.override_type == 'INT':
-                c4.prop(val, "value_int", text="")
-            elif inp.override_type == 'FLOAT':
-                c4.prop(val, "value_float", text="")
-            elif inp.override_type == 'STRING':
-                c4.prop(val, "value_string", text="")
-            elif inp.override_type == 'MENU':
-                c4.prop(val, "value_menu", text="")
-
-    # 5. Dir / Tag
-    c5 = s4.row(align=True)
-    if val and inp:
-        c5.prop(val, "use_dir", text="", icon='FILE_FOLDER')
-        c5.prop(val, "use_tag", text="", icon='BOOKMARKS')
-        c5.prop(val, "tag", text="")
-
-    if inp:
-        if val and getattr(val, "use_sweep", False):
-            op = c5.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
-        else:
-            op = c5.operator("batch_stl.table_action", text="", icon='ADD')
-
-        op.action = 'VALUE_ACTION'
-        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx if val else -1
-    else:
-        c4.label(text="")
-        c5.label(text="")
-
-
-def draw_overrides_table(layout, nodegroups, is_pinned):
+def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, title_text):
     box = layout.box()
 
     header_row = box.row()
-    header_row.label(text="Global Pinned Overrides" if is_pinned else "Local Overrides", icon='PINNED' if is_pinned else 'UNPINNED')
-    op = header_row.operator("batch_stl.table_action", text="Add Node Group", icon='ADD')
+    is_open = getattr(scene, is_open_prop)
+    icon_open = 'TRIA_DOWN' if is_open else 'TRIA_RIGHT'
+    header_row.prop(scene, is_open_prop, text="", icon=icon_open, emboss=False)
+    header_row.label(text=title_text, icon='PINNED' if is_pinned else 'UNPINNED')
+
+    op_row = header_row.row(align=True)
+    op = op_row.operator("batch_stl.table_action", text="", icon='ADD')
     op.action = 'ADD_GROUP'; op.is_pinned = is_pinned
+    op = op_row.operator("batch_stl.table_action", text="", icon='PASTEDOWN')
+    op.action = 'PASTE_GROUP'; op.is_pinned = is_pinned
+
+    if not is_open:
+        return
 
     if len(nodegroups) == 0:
         box.label(text="No overrides defined.")
         return
 
-    # Table Header
-    h_row = box.row(align=True)
-    s0 = h_row.split(factor=0.09, align=True); r0 = s0.row(align=True); r0.alignment = 'CENTER'; r0.label(text="Action")
-    s1 = s0.split(factor=0.17, align=True); r1 = s1.row(align=True); r1.alignment = 'CENTER'; r1.label(text="Node Group")
-    s2 = s1.split(factor=0.24, align=True); r2 = s2.row(align=True); r2.alignment = 'CENTER'; r2.label(text="Target")
-    s3 = s2.split(factor=0.4, align=True); r3 = s3.row(align=True); r3.alignment = 'CENTER'; r3.label(text="Input")
-    s4 = s3.split(factor=0.3, align=True); r4 = s4.row(align=True); r4.alignment = 'CENTER'; r4.label(text="Value")
-    r5 = s4.row(align=True); r5.alignment = 'CENTER'; r5.label(text="Tag")
-
     for ng_idx, ng in enumerate(nodegroups):
-        ng_first = True
+        ng_box = box.box()
+        ng_layout = ng_box.column()
+        ng_row = ng_layout.row(align=True)
+        ng_row.prop(ng, "group_ptr", text="")
+        
+        if len(nodegroups) > 1:
+            op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+            op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='PINNED' if is_pinned else 'UNPINNED'); op.action = 'UNPIN_GROUP' if is_pinned else 'PIN_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='COPYDOWN'); op.action = 'COPY_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+        
         if not ng.nodes:
-            draw_table_row(box, ng, None, None, None, is_pinned, ng_idx, -1, -1, -1, ng_first, True, True, True)
             continue
 
+        n_split = ng_layout.split(factor=0.03)
+        n_split.column()
+        nodes_col = n_split.column()
+        nodes_box = nodes_col.box() if len(ng.nodes) > 1 else nodes_col
+        nodes_layout = nodes_box.column()
+
         for n_idx, node in enumerate(ng.nodes):
-            n_first = True
+            node_container = nodes_layout.box()
+            node_layout = node_container.column()
+
+            n_row = node_layout.row(align=True)
+            n_row.prop(node, "name", text="")
+            
+            if len(ng.nodes) > 1:
+                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_NODE_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_NODE_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+            op = n_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+
             if not node.inputs:
-                draw_table_row(box, ng, node, None, None, is_pinned, ng_idx, n_idx, -1, -1, ng_first, n_first, True, True)
-                ng_first = False
                 continue
 
+            i_split = node_layout.split(factor=0.03)
+            i_split.column()
+            inputs_col = i_split.column()
+            inputs_box = inputs_col.box() if len(node.inputs) > 1 else inputs_col
+            inputs_layout = inputs_box.column()
+
             for i_idx, inp in enumerate(node.inputs):
-                i_first = True
+                input_container = inputs_layout.box() if len(inp.values) > 1 else inputs_layout
+                input_layout = input_container.column()
+                
                 if not inp.values:
-                    draw_table_row(box, ng, node, inp, None, is_pinned, ng_idx, n_idx, i_idx, -1, ng_first, n_first, i_first, True)
-                    ng_first = False; n_first = False
+                    i_row = input_layout.row(align=True)
+                    s_main = i_row.split(factor=0.35, align=True)
+                    c_inp = s_main.row(align=True)
+                    
+                    op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
+                    op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = -1
+
+                    if len(node.inputs) > 1:
+                        op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        op = c_inp.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                    
+                    is_mod = not node.name or node.name == "<Modifier Interface>"
+                    if is_mod and ng.group_ptr and hasattr(ng.group_ptr, "interface"):
+                        c_inp.prop_search(inp, "name", ng.group_ptr.interface, "items_tree", text="")
+                    elif not is_mod and ng.group_ptr and node.name:
+                        target_n = ng.group_ptr.nodes.get(node.name.split(" [")[0].strip())
+                        if target_n: c_inp.prop_search(inp, "name", target_n, "inputs", text="")
+                        else: c_inp.prop(inp, "name", text="")
+                    else:
+                        c_inp.prop(inp, "name", text="")
+                        
+                    s_val = s_main.split(factor=0.5, align=True)
+                    c_val = s_val.row(align=True)
+                    c_dir = s_val.row(align=True)
                     continue
 
                 for v_idx, val in enumerate(inp.values):
-                    draw_table_row(box, ng, node, inp, val, is_pinned, ng_idx, n_idx, i_idx, v_idx, ng_first, n_first, i_first, v_idx == 0)
-                    ng_first = False; n_first = False; i_first = False
+                    i_first = (v_idx == 0)
+                    i_row = input_layout.row(align=True)
+                    
+                    s_main = i_row.split(factor=0.35, align=True)
+                    c_inp = s_main.row(align=True)
+
+                    if i_first:
+                        if getattr(val, "use_sweep", False):
+                            op = c_inp.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
+                        else:
+                            op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
+                        op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
+
+                        if len(node.inputs) > 1:
+                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        
+                        is_mod = not node.name or node.name == "<Modifier Interface>"
+                        if is_mod and ng.group_ptr and hasattr(ng.group_ptr, "interface"):
+                            c_inp.prop_search(inp, "name", ng.group_ptr.interface, "items_tree", text="")
+                        elif not is_mod and ng.group_ptr and node.name:
+                            target_n = ng.group_ptr.nodes.get(node.name.split(" [")[0].strip())
+                            if target_n: c_inp.prop_search(inp, "name", target_n, "inputs", text="")
+                            else: c_inp.prop(inp, "name", text="")
+                        else:
+                            c_inp.prop(inp, "name", text="")
+                    else:
+                        c_inp.alignment = 'RIGHT'
+                        if len(inp.values) > 1:
+                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_VALUE_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                            op = c_inp.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+
+                    s_val = s_main.split(factor=0.5, align=True)
+                    c_val = s_val.row(align=True)
+                    
+                    if getattr(val, "use_sweep", False):
+                        if inp.override_type in ['INT', 'FLOAT', 'STRING']:
+                            c_val.prop(val, "sweep_range", text="")
+                        elif inp.override_type == 'BOOLEAN':
+                            sub = c_val.row(align=True)
+                            sub.active = False
+                            sub.operator("wm.context_set_string", text="True & False")
+                        elif inp.override_type == 'MENU':
+                            sub = c_val.row(align=True)
+                            sub.active = False
+                            sub.operator("wm.context_set_string", text="All values")
+                    else:
+                        if inp.override_type == 'BOOLEAN':
+                            c_val.prop(val, "value_bool", text="True" if val.value_bool else "False", toggle=True)
+                        elif inp.override_type == 'INT':
+                            c_val.prop(val, "value_int", text="")
+                        elif inp.override_type == 'FLOAT':
+                            c_val.prop(val, "value_float", text="")
+                        elif inp.override_type == 'STRING':
+                            c_val.prop(val, "value_string", text="")
+                        elif inp.override_type == 'MENU':
+                            c_val.prop(val, "value_menu", text="")
+
+                    c_dir = s_val.row(align=True)
+                    c_dir.prop(val, "use_dir", text="", icon='FILE_FOLDER')
+                    c_dir.prop(val, "use_tag", text="", icon='BOOKMARKS')
+                    c_dir.prop(val, "tag", text="")
+
+                    # Removed ADD/Sweep button from children
 
 
 class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
@@ -1853,23 +1876,12 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             layout.separator()
 
             # Global Table
-            g_header = layout.row()
-            icon_g = 'TRIA_DOWN' if scene.batch_stl_ui_global_ovr else 'TRIA_RIGHT'
-            g_header.prop(scene, "batch_stl_ui_global_ovr", text="", icon=icon_g, emboss=False)
-            g_header.label(text="Global Pinned Overrides (Shared)")
-            if scene.batch_stl_ui_global_ovr:
-                draw_overrides_table(layout, active_preset.nodegroups, is_pinned=True)
+            draw_overrides_table(layout, scene, active_preset.nodegroups, True, "batch_stl_ui_global_ovr", "Global Pinned Overrides (Shared)")
 
             layout.separator(factor=0.5)
 
             # Local Table
-            l_header = layout.row()
-            icon_l = 'TRIA_DOWN' if scene.batch_stl_ui_local_ovr else 'TRIA_RIGHT'
-            l_header.prop(scene, "batch_stl_ui_local_ovr", text="", icon=icon_l, emboss=False)
-            l_header.label(text="Local Overrides (Specific to Collection)")
-            if scene.batch_stl_ui_local_ovr:
-                draw_overrides_table(layout, active_col.nodegroups, is_pinned=False)
-
+            draw_overrides_table(layout, scene, active_col.nodegroups, False, "batch_stl_ui_local_ovr", "Local Overrides (Specific to Collection)")
             layout.separator(factor=0.5)
             tip_box = layout.box()
             tip_header = tip_box.row()
@@ -1976,6 +1988,8 @@ def register():
     bpy.types.Scene.batch_stl_ui_collections = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_global_ovr = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_local_ovr = bpy.props.BoolProperty(default=True)
+    bpy.types.Scene.batch_stl_ui_global_ovr_nested = bpy.props.BoolProperty(default=False)
+    bpy.types.Scene.batch_stl_ui_local_ovr_nested = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.batch_stl_ui_exclude = bpy.props.BoolProperty(default=True)
     bpy.types.Scene.batch_stl_ui_tips = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.batch_stl_show_tree = bpy.props.BoolProperty(default=True, update=update_show_tree)
@@ -1999,7 +2013,7 @@ def unregister():
         "batch_stl_verbose_console", "batch_stl_ui_presets", "batch_stl_ui_collections",
         "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr", "batch_stl_ui_exclude",
         "batch_stl_show_tree", "batch_stl_show_console", "batch_stl_collapsed_dirs",
-        "batch_stl_ui_tips"
+        "batch_stl_ui_tips", "batch_stl_ui_global_ovr_nested", "batch_stl_ui_local_ovr_nested"
     ]
 
     for prop in properties_to_remove:
