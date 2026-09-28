@@ -3,15 +3,6 @@ Fast Batch STL Exporter
 Architecture: Modular (Optimized for Agentic Environments)
 Data Hierarchy: Preset > Collection > NodeGroup > Node > Input > Value
 """
-bl_info = {
-    "name": "Fast Batch STL Exporter",
-    "author": "Modular Port",
-    "version": (1, 0),
-    "blender": (4, 0, 0),
-    "location": "View3D > Sidebar > Export",
-    "description": "Mass export parameterized geometry with multithreaded permutation mapping",
-    "category": "Import-Export",
-}
 
 import bpy
 from bpy.app.handlers import persistent
