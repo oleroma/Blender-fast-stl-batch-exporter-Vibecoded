@@ -38,9 +38,8 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
     mesh.vertices.foreach_get("co", verts.ravel())
     mat = np.array(matrix_world, dtype=np.float32)
 
-    # 4D vector padding for standard 4x4 matrix multiplication
-    verts_vec4 = np.c_[verts, np.ones(len(verts), dtype=np.float32)]
-    verts = np.dot(verts_vec4, mat.T)[:, :3]
+    # Optimize 3D to 4D matrix transformation by using affine logic directly
+    verts = np.dot(verts, mat[:3, :3].T) + mat[:3, 3]
 
     # Vectorized face extraction
     tri_verts = np.empty((num_tris, 3), dtype=np.int32)
@@ -64,11 +63,13 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
         ('v1', np.float32, (3,)), ('v2', np.float32, (3,)),
         ('attr', np.uint16)
     ])
-    data = np.zeros(num_tris, dtype=stl_dtype)
+    # Use empty instead of zeros since we overwrite all fields anyway
+    data = np.empty(num_tris, dtype=stl_dtype)
     data['normals'] = tri_normals
     data['v0'] = verts[tri_verts[:, 0]]
     data['v1'] = verts[tri_verts[:, 1]]
     data['v2'] = verts[tri_verts[:, 2]]
+    data['attr'] = 0
 
     t_format = time.perf_counter()
     if verbose:
@@ -81,8 +82,8 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
         f.write(b'Batch STL Fast Export' + b'\x00' * 59)
         # 4-byte unsigned int containing face count
         f.write(struct.pack('<I', num_tris))
-        # Raw block stream of mapped vertices
-        f.write(data.tobytes())
+        # Raw block stream of mapped vertices via native numpy file output
+        data.tofile(f)
 
     t_write = time.perf_counter()
     if verbose:
@@ -114,8 +115,9 @@ def run_headless_export(preset_index):
 
     # Pre-calculate active objects to skip evaluate operations on hidden meshes
     active_export_objects = set()
+    exclusion_cache = {}
     for c in preset.collections:
-        if c.collection_ptr and not is_collection_excluded(bpy.context, c.collection_ptr):
+        if c.collection_ptr and not is_collection_excluded(bpy.context, c.collection_ptr, cache=exclusion_cache):
             active_export_objects.update(c.collection_ptr.all_objects)
 
     muted_count = 0
@@ -135,7 +137,7 @@ def run_headless_export(preset_index):
     # Group collections into batches based on their override signature to minimize redundant Graph updates
     for c in preset.collections:
         if not c.collection_ptr: continue
-        if is_collection_excluded(bpy.context, c.collection_ptr): continue
+        if is_collection_excluded(bpy.context, c.collection_ptr, cache=exclusion_cache): continue
         sig_local = get_override_signature(get_flat_overrides(c.nodegroups))
         full_sig = sig_pinned + sig_local
         if full_sig not in execution_batches: execution_batches[full_sig] = []

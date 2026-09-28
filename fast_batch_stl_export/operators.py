@@ -474,9 +474,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 root_dir = os.path.normpath(os.path.join(root_dir, self.preset.preset_prefix))
 
             total_objs = 0
+            exclusion_cache = {}
             for c in self.preset.collections:
                 if not c.collection_ptr: continue
-                if is_collection_excluded(context, c.collection_ptr): continue
+                if is_collection_excluded(context, c.collection_ptr, cache=exclusion_cache): continue
                 excluded_names = {e.name for e in c.excluded_objects} if c.use_filter else set()
                 for obj in c.collection_ptr.all_objects:
                     if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
@@ -492,7 +493,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
             for c in self.preset.collections:
                 if not c.collection_ptr: continue
-                if is_collection_excluded(context, c.collection_ptr): continue
+                if is_collection_excluded(context, c.collection_ptr, cache=exclusion_cache): continue
                 out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path))
                 os.makedirs(out_dir, exist_ok=True)
                 excluded_names = {e.name for e in c.excluded_objects} if c.use_filter else set()

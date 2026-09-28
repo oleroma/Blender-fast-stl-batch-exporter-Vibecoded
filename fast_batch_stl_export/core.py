@@ -11,7 +11,10 @@ import bpy
 # === GRAPH EVALUATION & OVERRIDES ===
 # ==============================================================================
 
-def is_collection_excluded(context, target_collection):
+def is_collection_excluded(context, target_collection, cache=None):
+    if cache is not None and target_collection.name in cache:
+        return cache[target_collection.name]
+
     # Recursively searches the view layer hierarchy to check if a collection is excluded (unchecked)
     # This prevents the exporter from processing hidden/disabled collections.
     def traverse(layer_collection):
@@ -24,7 +27,11 @@ def is_collection_excluded(context, target_collection):
         return None
 
     result = traverse(context.view_layer.layer_collection)
-    return result if result is not None else True
+    final_result = result if result is not None else True
+    
+    if cache is not None:
+        cache[target_collection.name] = final_result
+    return final_result
 
 def get_modifier_socket_identifier(node_group, socket_name):
     # Retrieves the internal identifier (e.g. 'Socket_2') for a given UI name.
@@ -339,6 +346,16 @@ def apply_overrides(overrides, target_objects, dry_run=False):
 
         # Handling external MODIFIER overrides (locally impacts only specific objects)
         elif override.override_target == 'MODIFIER' and override.parent_group_ptr:
+            # Optimization: Pre-filter matching modifiers to avoid O(inputs * objects * modifiers) lookups
+            matching_mods = []
+            for obj in target_objects:
+                for mod in obj.modifiers:
+                    if mod.type == 'NODES' and mod.node_group == override.parent_group_ptr:
+                        matching_mods.append(mod)
+                        
+            if not matching_mods:
+                continue
+
             for inp in override.inputs:
                 ident = get_modifier_socket_identifier(override.parent_group_ptr, inp.input_name)
                 if not ident: continue
@@ -346,13 +363,11 @@ def apply_overrides(overrides, target_objects, dry_run=False):
                 val = get_input_value(inp)
                 if val is None: continue
 
-                for obj in target_objects:
-                    for mod in obj.modifiers:
-                        if mod.type == 'NODES' and mod.node_group == override.parent_group_ptr:
-                            orig_val, is_set = get_modifier_input(mod, ident)
-                            mod_states.append((mod, ident, is_set, orig_val, default_val))
-                            if not dry_run:
-                                set_modifier_input(mod, ident, val)
+                for mod in matching_mods:
+                    orig_val, is_set = get_modifier_input(mod, ident)
+                    mod_states.append((mod, ident, is_set, orig_val, default_val))
+                    if not dry_run:
+                        set_modifier_input(mod, ident, val)
 
     if not dry_run:
         # Flag all affected graphs to recalculate
