@@ -242,7 +242,8 @@ def run_headless_export(preset_index):
                             if mesh:
                                 base_tag = c.tag if getattr(c, "use_tag", False) and c.tag else ""
                                 final_tag = base_tag + combo_suffix
-                                filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{final_tag}.stl")
+                                base_name = f"{obj.name}{final_tag}"
+                                filepath = os.path.join(out_dir, f"{bpy.path.clean_name(base_name)}.stl")
                                 write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=True)
 
                                 # Clear immediately from RAM to prevent leaks on dense meshes
@@ -257,9 +258,8 @@ def run_headless_export(preset_index):
                 print(f"  │    │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
 
             t_purge = time.perf_counter()
-            # Force outliner purge of orphaned mesh datablocks left over from `to_mesh()` calls
-            bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
-            print(f"  │    │    ├─ RAM Purge: {time.perf_counter() - t_purge:.4f}s")
+            # No longer need heavy orphans_purge as meshes are removed directly
+            print(f"  │    │    ├─ RAM Purge [Optimized]: {time.perf_counter() - t_purge:.4f}s")
 
         print(f"  │    => Batch Iteration Total Time: {time.perf_counter() - t_batch_start:.4f}s\n")
         batch_counter += 1

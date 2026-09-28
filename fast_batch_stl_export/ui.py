@@ -107,9 +107,9 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
         if not ng.nodes:
             continue
 
-        n_split = ng_layout.split(factor=0.03)
-        n_split.column()
-        nodes_col = n_split.column()
+        n_indent = ng_layout.row()
+        n_indent.separator(factor=1.0)
+        nodes_col = n_indent.column()
         nodes_box = nodes_col.box() if len(ng.nodes) > 1 else nodes_col
         nodes_layout = nodes_box.column()
 
@@ -129,9 +129,9 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
             if not node.inputs:
                 continue
 
-            i_split = node_layout.split(factor=0.03)
-            i_split.column()
-            inputs_col = i_split.column()
+            i_indent = node_layout.row()
+            i_indent.separator(factor=1.0)
+            inputs_col = i_indent.column()
             inputs_box = inputs_col.box()
             inputs_layout = inputs_box.column()
 
@@ -242,7 +242,7 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
     if toggled_list is None:
         try:
             toggled_list = json.loads(bpy.context.scene.batch_stl_collapsed_dirs)
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             toggled_list = []
     if duplicates is None:
         duplicates = set()
@@ -261,9 +261,9 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
 
         is_collapsed = not is_expanded
 
-        split = layout.split(factor=0.005)
-        split.column()
-        col = split.column()
+        indent = layout.row()
+        indent.separator(factor=0.5)
+        col = indent.column()
 
         box = col.box()
         row = box.row()
@@ -278,9 +278,9 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
             draw_tree_dict(box, tree_node[k], dir_path, toggled_list, duplicates, next_actual)
 
     for f in files:
-        split = layout.split(factor=0.025)
-        split.column()
-        col = split.column()
+        indent = layout.row()
+        indent.separator(factor=1.5)
+        col = indent.column()
 
         row = col.row()
         row.scale_y = 0.4

@@ -402,7 +402,7 @@ class BATCH_STL_OT_toggle_dir_tree(bpy.types.Operator):
         try:
             collapsed = json.loads(scene.batch_stl_collapsed_dirs)
             if not isinstance(collapsed, list): collapsed = []
-        except Exception:
+        except (json.JSONDecodeError, TypeError, ValueError):
             collapsed = []
 
         if self.dir_path in collapsed:
@@ -510,7 +510,8 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
                         if mesh:
                             base_tag = c.tag if c.use_tag and c.tag else ""
-                            filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{base_tag}.stl")
+                            base_name = f"{obj.name}{base_tag}"
+                            filepath = os.path.join(out_dir, f"{bpy.path.clean_name(base_name)}.stl")
                             write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=verbose)
                             obj_eval.to_mesh_clear()
                             exported_count += 1
@@ -541,7 +542,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         init_file = os.path.join(addon_dir, "__init__.py")
 
         cmd = [
-            bpy.app.binary_path, "--factory-startup", "-b", self.temp_blend,
+            bpy.app.binary_path, "-b", self.temp_blend,
             "-P", init_file, "--", "--batch-stl-headless", str(self.preset_idx)
         ]
 
@@ -597,12 +598,12 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                         # Listen for progress markers dumped by headless print statements
                         if line.startswith("BATCH_STL_TOTAL:"):
                             try: self.total_operations = int(line.split(":")[1])
-                            except Exception: pass
+                            except (ValueError, IndexError): pass
                         elif line.startswith("BATCH_STL_PROGRESS:"):
                             try:
                                 self.current_op = int(line.split(":")[1])
                                 self.preset.export_progress = self.current_op / max(1, self.total_operations)
-                            except Exception: pass
+                            except (ValueError, IndexError): pass
                         elif line.startswith("BATCH_STL_DONE"):
                             self.cleanup(context)
                             total_time = time.perf_counter() - self.export_start_time
@@ -661,13 +662,13 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         if getattr(self, 'process', None):
             try:
                 if self.process.poll() is None: self.process.kill()
-            except Exception: pass
+            except OSError: pass
 
         # Clean up temporary duplicate file
         try:
             if hasattr(self, 'temp_blend') and os.path.exists(self.temp_blend): os.remove(self.temp_blend)
             if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir): os.rmdir(self.temp_dir)
-        except Exception: pass
+        except OSError: pass
 
 classes = (
     BATCH_STL_OT_clear_console,

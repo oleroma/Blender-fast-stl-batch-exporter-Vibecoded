@@ -43,7 +43,7 @@ def reset_batch_stl_state(scene_dummy):
                 p.cancel_export = False
                 p.export_progress = 0.0
                 p.export_status = ""
-    except Exception:
+    except (ReferenceError, AttributeError):
         pass
 
 def update_show_tree(self, context):

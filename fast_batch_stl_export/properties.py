@@ -63,7 +63,7 @@ def on_input_name_update(self, context):
             self.override_type = infer_input_type(found_ng.group_ptr, found_node.name, self.name)
             # Reset sweep settings as they might be incompatible with the new type
             for v in self.values: v.use_sweep = False
-    except Exception: pass
+    except (AttributeError, KeyError, ReferenceError): pass
 
 def search_target_node_cb(self, context, edit_text):
     # Callback providing an autocomplete dropdown list of available nodes in the target Group

@@ -58,7 +58,7 @@ def get_modifier_input(mod, ident):
     try:
         if mod.is_property_set(ident):
             return mod[ident], True
-    except (KeyError, TypeError, Exception):
+    except (KeyError, TypeError, AttributeError):
         pass
 
     # Fallback to RNA properties struct
@@ -74,7 +74,7 @@ def set_modifier_input(mod, ident, value):
     try:
         mod[ident] = value
         return
-    except (TypeError, KeyError, Exception):
+    except (TypeError, KeyError, AttributeError):
         pass
 
     if hasattr(mod, "properties") and hasattr(mod.properties, "inputs"):
@@ -87,7 +87,7 @@ def unset_modifier_input(mod, ident, default_val):
     try:
         mod.property_unset(ident)
         return
-    except (AttributeError, KeyError, Exception):
+    except (AttributeError, KeyError, TypeError):
         pass
 
     if hasattr(mod, "properties") and hasattr(mod.properties, "inputs"):
@@ -382,7 +382,7 @@ def revert_overrides(global_states, mod_states, target_objects):
                     already_linked = any(l.from_socket == link_from for l in socket.links)
                     if not already_linked: parent_tree.links.new(link_from, socket)
                 trees_to_update.add(parent_tree)
-            except Exception: pass
+            except (ReferenceError, AttributeError, ValueError): pass
 
     for tree in trees_to_update:
         try: tree.update_tag()
@@ -505,7 +505,8 @@ def build_tree_dict(scene, preset):
 
             # Store computed file names for collision detection
             for obj in valid_objs:
-                filename = f"{bpy.path.clean_name(obj.name)}{final_tag}.stl"
+                base_name = f"{obj.name}{final_tag}"
+                filename = f"{bpy.path.clean_name(base_name)}.stl"
                 combo_root['_files'].append(filename)
                 full_path = os.path.join(dir_path_str, filename)
                 if full_path in all_filepaths: duplicates.add(full_path)
