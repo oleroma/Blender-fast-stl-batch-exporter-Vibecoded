@@ -51,6 +51,7 @@ Sweep mode allows automatic iteration through a range or list of values for a si
 - **Floats/Ints**: Displays a field to specify the Sweep Range (e.g., start, step, count).
 - **Booleans**: Automatically iterates through `True` and `False`.
 - **Menus**: Automatically iterates through all available enum items for that socket.
+- **Populating Sweep Values**: If you `Shift`-click the sweep button while it is active, it will turn off Sweep Mode and automatically populate all the evaluated sweep values into individual, editable value iterations.
 - *Note: To maintain visual alignment without rendering artifacts, sweep labels ("True & False", "All values") are drawn as disabled buttons rather than standard text labels.*
 
 ### Directory and Tagging

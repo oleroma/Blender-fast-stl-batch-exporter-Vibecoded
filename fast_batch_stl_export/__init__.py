@@ -1002,6 +1002,7 @@ class BatchSTLExportPreset(bpy.types.PropertyGroup):
 class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
     bl_idname = "batch_stl.export_presets_json"
     bl_label = "Export JSON"
+    bl_description = "Export all presets to a JSON file"
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
@@ -1012,6 +1013,7 @@ class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
 class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     bl_idname = "batch_stl.import_presets_json"
     bl_label = "Import JSON"
+    bl_description = "Import presets from a JSON file"
     bl_options = {'REGISTER', 'UNDO'}
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
@@ -1024,6 +1026,7 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
 class BATCH_STL_OT_clear_console(bpy.types.Operator):
     bl_idname = "batch_stl.clear_console"
     bl_label = "Clear Console"
+    bl_description = "Clear all console logs for the active preset"
 
     def execute(self, context):
         preset = get_active_preset(context.scene)
@@ -1036,6 +1039,16 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     bl_options = {'REGISTER', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.action == 'ADD': return "Create a new preset"
+        elif properties.action == 'REMOVE': return "Remove the active preset"
+        elif properties.action == 'UP': return "Move preset up (Shift-Click: Move to top)"
+        elif properties.action == 'DOWN': return "Move preset down (Shift-Click: Move to bottom)"
+        elif properties.action == 'COPY': return "Copy preset to clipboard"
+        elif properties.action == 'PASTE': return "Paste preset from clipboard"
+        return "Preset Actions"
 
     def invoke(self, context, event):
         self.shift_pressed = event.shift
@@ -1067,6 +1080,16 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
     bl_options = {'REGISTER', 'INTERNAL'}
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        if properties.action == 'ADD': return "Add a new collection"
+        elif properties.action == 'REMOVE': return "Remove the active collection"
+        elif properties.action == 'UP': return "Move collection up (Shift-Click: Move to top)"
+        elif properties.action == 'DOWN': return "Move collection down (Shift-Click: Move to bottom)"
+        elif properties.action == 'COPY': return "Copy collection to clipboard"
+        elif properties.action == 'PASTE': return "Paste collection from clipboard"
+        return "Collection Actions"
 
     def invoke(self, context, event):
         self.shift_pressed = event.shift
@@ -1104,6 +1127,34 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
     i_idx: bpy.props.IntProperty(default=-1)
     v_idx: bpy.props.IntProperty(default=-1)
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
+
+    @classmethod
+    def description(cls, context, properties):
+        action = properties.action
+        if action == 'ADD_GROUP': return "Add a new Node Group override"
+        elif action == 'DEL_GROUP': return "Delete this Node Group override"
+        elif action == 'PIN_GROUP': return "Pin Group to Global Overrides (Shared across collections)"
+        elif action == 'UNPIN_GROUP': return "Unpin Group to Local Overrides (Specific to collection)"
+        elif action == 'COPY_GROUP': return "Copy Node Group to clipboard"
+        elif action == 'PASTE_GROUP': return "Paste Node Group from clipboard"
+        elif action == 'ADD_NODE': return "Add a new Node to override"
+        elif action == 'DEL_NODE': return "Delete this Node"
+        elif action == 'MOVE_GROUP_UP': return "Move Group Up"
+        elif action == 'MOVE_GROUP_DOWN': return "Move Group Down"
+        elif action == 'MOVE_NODE_UP': return "Move Node Up"
+        elif action == 'MOVE_NODE_DOWN': return "Move Node Down"
+        elif action == 'ADD_INPUT': return "Add an Input (Shift-Click: Auto-populate all inputs from Node/Modifier)"
+        elif action == 'DEL_INPUT': return "Delete this Input"
+        elif action == 'MOVE_INPUT_UP': return "Move Input Up"
+        elif action == 'MOVE_INPUT_DOWN': return "Move Input Down"
+        elif action == 'DEL_VALUE_OR_INPUT': return "Delete this Value or Input"
+        elif action == 'DEL_VALUE': return "Delete this Value iteration"
+        elif action == 'MOVE_VALUE_UP': return "Move Value Up"
+        elif action == 'MOVE_VALUE_DOWN': return "Move Value Down"
+        elif action == 'VALUE_ACTION': 
+            if properties.v_idx < 0: return "Add a Value iteration (Shift-Click: Toggle Sweep Mode)"
+            else: return "Add a Value iteration (Shift-Click: Toggle Sweep / Populate values)"
+        return "Table action"
 
     def invoke(self, context, event):
         self.shift_pressed = event.shift
@@ -1268,6 +1319,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
 class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
     bl_idname = "batch_stl.toggle_exclusion"
     bl_label = "Toggle Object Exclusion"
+    bl_description = "Toggle whether this object is excluded from export"
     bl_options = {'REGISTER', 'INTERNAL'}
     object_name: bpy.props.StringProperty()
 
@@ -1290,6 +1342,7 @@ class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
 class BATCH_STL_OT_toggle_dir_tree(bpy.types.Operator):
     bl_idname = "batch_stl.toggle_dir_tree"
     bl_label = "Toggle Directory Tree"
+    bl_description = "Expand or collapse this directory in the preview tree"
     bl_options = {'INTERNAL'}
 
     dir_path: bpy.props.StringProperty()
@@ -1313,6 +1366,7 @@ class BATCH_STL_OT_toggle_dir_tree(bpy.types.Operator):
 class BATCH_STL_OT_cancel_export(bpy.types.Operator):
     bl_idname = "batch_stl.cancel_export"
     bl_label = "Cancel Export"
+    bl_description = "Cancel the ongoing background export"
     preset_index: bpy.props.IntProperty(default=-1)
 
     def execute(self, context):
@@ -1903,16 +1957,20 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 col = tip_box.column()
                 col.label(text="Hierarchy: NodeGroup > Node > Input > Value.", icon='BLANK1')
                 col.label(text="For modifier targets, leave Node blank or set as <Modifier Interface>", icon='BLANK1')
-                col.label(text="Types are auto-assigned when inputs are selected.", icon='BLANK1')
-                col.label(text="Use Sweep button to iterate through values automatically:", icon='FILE_REFRESH')
-                col.label(text="  • Floats/Ints: Specify start value, step size, and step count", icon='BLANK1')
-                col.label(text="  • Menus/Bools: Automatically iterates through all values", icon='BLANK1')
-
                 col.separator()
-                col.label(text="Tag String Formatting:", icon='BLANK1')
-                col.label(text="  • [ tag ] replaces input value with the tag", icon='BLANK1')
-                col.label(text="  • [ _tag ] appends the tag to the input value", icon='BLANK1')
-                col.label(text="  • [ tag_ ] prepends the tag to the input value", icon='BLANK1')
+
+                col.label(text="Sweep Mode (Shift-Click '+' button to toggle):", icon='FILE_REFRESH')
+                col.label(text="  • Floats/Ints: Define start, step, and count", icon='BLANK1')
+                col.label(text="  • Menus/Bools: Auto-iterates all values", icon='BLANK1')
+                col.label(text="  • Shift-Click when active to populate all sweep values", icon='BLANK1')
+                col.separator()
+
+                col.label(text="Export Tools (Per Value):", icon='BLANK1')
+                col.label(text="  • Folder Icon: Save this value's exports into a subfolder", icon='FILE_FOLDER')
+                col.label(text="  • Bookmark Icon: Append/Prepend a tag to filename", icon='BOOKMARKS')
+                
+                col.label(text="Tag Formatting:", icon='BLANK1')
+                col.label(text="  • [ tag ] replaces input value, [ _tag ] appends, [ tag_ ] prepends", icon='BLANK1')
 
         layout.separator()
         t_box = layout.box()
