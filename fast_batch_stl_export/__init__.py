@@ -27,7 +27,14 @@ from bpy.app.handlers import persistent
 
 _clipboard = {
     "preset": None,
-    "collection": None
+    "collection": None,
+    "nodegroup": None
+}
+
+_ui_cache = {
+    "metrics": {"ptr": None, "time": 0, "data": {}},
+    "tree": {"ptr": None, "time": 0, "data": ({}, set())},
+    "active_col_metrics": {"ptr": None, "time": 0, "data": {}}
 }
 
 
@@ -37,16 +44,29 @@ _clipboard = {
 
 # --- STATE-HASH & OVERRIDE LOGIC ---
 def is_collection_excluded(context, target_collection):
-    def traverse(layer_collection):
+    if not target_collection:
+        return True
+
+    found_any_visible = False
+    found_any = False
+
+    def traverse(layer_collection, parent_excluded=False):
+        nonlocal found_any_visible, found_any
+        current_excluded = parent_excluded or layer_collection.exclude
+
         if layer_collection.collection == target_collection:
-            return layer_collection.exclude
+            found_any = True
+            if not current_excluded:
+                found_any_visible = True
+
         for child in layer_collection.children:
-            result = traverse(child)
-            if result is not None:
-                return result
-        return None
-    result = traverse(context.view_layer.layer_collection)
-    return result if result is not None else True
+            traverse(child, current_excluded)
+
+    traverse(context.view_layer.layer_collection)
+
+    if not found_any:
+        return True
+    return not found_any_visible
 
 def get_modifier_socket_identifier(node_group, socket_name):
     if hasattr(node_group, "interface"):
@@ -152,6 +172,7 @@ class TempMockOverride:
 def get_flat_overrides(nodegroups):
     overrides = []
     for ng in nodegroups:
+        ng_ptr = bpy.data.node_groups.get(ng.group_name)
         for node in ng.nodes:
             target = 'MODIFIER' if not node.name or node.name == "<Modifier Interface>" else 'NODE'
             temp_inputs = []
@@ -159,7 +180,7 @@ def get_flat_overrides(nodegroups):
                 for val in inp.values:
                     temp_inputs.append(TempMockInput(inp.name, inp.override_type, val))
             if temp_inputs:
-                overrides.append(TempMockOverride(target, ng.group_ptr, node.name, temp_inputs))
+                overrides.append(TempMockOverride(target, ng_ptr, node.name, temp_inputs))
     return overrides
 
 class MockInput:
@@ -442,11 +463,11 @@ def copy_node_to_dict(n):
     return {"name": n.name, "inputs": [copy_input_to_dict(i) for i in n.inputs]}
 
 def copy_ng_to_dict(ng):
-    return {"group": ng.group_ptr.name if ng.group_ptr else "", "nodes": [copy_node_to_dict(n) for n in ng.nodes]}
+    return {"group": ng.group_name, "nodes": [copy_node_to_dict(n) for n in ng.nodes]}
 
 def copy_collection_to_dict(c):
     return {
-        "collection_name": c.collection_ptr.name if c.collection_ptr else "",
+        "collection_name": c.collection_name,
         "use_tag": c.use_tag, "tag": c.tag, "sub_path": c.sub_path,
         "use_filter": getattr(c, "use_filter", False),
         "excluded_objects": [e.name for e in c.excluded_objects],
@@ -473,13 +494,11 @@ def paste_node_from_dict(new_n, data):
     for i_data in data.get("inputs", []): paste_input_from_dict(new_n.inputs.add(), i_data)
 
 def paste_ng_from_dict(new_ng, data):
-    g_name = data.get("group", "")
-    new_ng.group_ptr = bpy.data.node_groups.get(g_name) if g_name else None
+    new_ng.group_name = data.get("group", "")
     for n_data in data.get("nodes", []): paste_node_from_dict(new_ng.nodes.add(), n_data)
 
 def paste_collection_from_dict(new_c, data):
-    c_name = data.get("collection_name", "")
-    new_c.collection_ptr = bpy.data.collections.get(c_name) if c_name else None
+    new_c.collection_name = data.get("collection_name", "")
     new_c.use_tag = data.get("use_tag", True)
     new_c.tag = data.get("tag", "")
     new_c.sub_path = data.get("sub_path", "")
@@ -493,8 +512,101 @@ def paste_preset_from_dict(new_p, data):
     for ng_data in data.get("nodegroups", []): paste_ng_from_dict(new_p.nodegroups.add(), ng_data)
     for c_data in data.get("collections", []): paste_collection_from_dict(new_p.collections.add(), c_data)
 
+
+# --- UI CACHE LOGIC ---
+def get_cached_metrics(context, preset):
+    current_time = time.time()
+    ptr = preset.as_pointer()
+    if _ui_cache["metrics"]["ptr"] == ptr and (current_time - _ui_cache["metrics"]["time"] < 0.25):
+        return _ui_cache["metrics"]["data"]
+
+    total_collections = len(preset.collections)
+    total_objects = 0
+    total_preset_combos = 0
+
+    for c in preset.collections:
+        c_ptr = bpy.data.collections.get(c.collection_name)
+        if c_ptr and is_collection_excluded(context, c_ptr):
+            continue
+        c_combos = len(generate_override_combinations(get_flat_overrides(preset.nodegroups) + get_flat_overrides(c.nodegroups)))
+        total_preset_combos += c_combos
+        obj_count = 0
+        if c_ptr:
+            excluded_names = {e.name for e in c.excluded_objects} if getattr(c, "use_filter", False) else set()
+            for obj in c_ptr.all_objects:
+                if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
+                    if obj.name not in excluded_names: obj_count += 1
+        total_objects += (obj_count * c_combos)
+
+    data = {
+        "total_collections": total_collections,
+        "total_preset_combos": total_preset_combos,
+        "total_objects": total_objects
+    }
+    _ui_cache["metrics"]["ptr"] = ptr
+    _ui_cache["metrics"]["time"] = current_time
+    _ui_cache["metrics"]["data"] = data
+    return data
+
+def get_cached_active_col_metrics(context, preset, active_col):
+    current_time = time.time()
+    ptr = active_col.as_pointer()
+    if _ui_cache["active_col_metrics"]["ptr"] == ptr and (current_time - _ui_cache["active_col_metrics"]["time"] < 0.25):
+        return _ui_cache["active_col_metrics"]["data"]
+
+    all_ovrs = get_flat_overrides(preset.nodegroups) + get_flat_overrides(active_col.nodegroups)
+    unique_targets = set()
+    total_inputs = 0
+
+    for o in all_ovrs:
+        total_inputs += len(o.inputs)
+        for i in o.inputs:
+            key = (o.override_target, o.node_name, i.input_name)
+            unique_targets.add(key)
+
+    num_targets = len(unique_targets)
+    num_combos = len(generate_override_combinations(all_ovrs))
+    active_obj_count = 0
+
+    c_ptr = bpy.data.collections.get(active_col.collection_name)
+    if c_ptr and not is_collection_excluded(context, c_ptr):
+        excluded_names = {e.name for e in active_col.excluded_objects} if getattr(active_col, "use_filter", False) else set()
+        for obj in c_ptr.all_objects:
+            if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
+                if obj.name not in excluded_names: active_obj_count += 1
+
+    mapping_total_objects = active_obj_count * num_combos
+    c_name = active_col.collection_name if active_col.collection_name else "Unassigned"
+    if active_col.tag: c_name += f" [{active_col.tag}]"
+
+    data = {
+        "c_name": c_name,
+        "num_targets": num_targets,
+        "total_inputs": total_inputs,
+        "num_combos": num_combos,
+        "mapping_total_objects": mapping_total_objects
+    }
+    _ui_cache["active_col_metrics"]["ptr"] = ptr
+    _ui_cache["active_col_metrics"]["time"] = current_time
+    _ui_cache["active_col_metrics"]["data"] = data
+    return data
+
+def get_cached_tree_dict(context, preset):
+    current_time = time.time()
+    ptr = preset.as_pointer()
+    if _ui_cache["tree"]["ptr"] == ptr and (current_time - _ui_cache["tree"]["time"] < 0.25):
+        return _ui_cache["tree"]["data"]
+
+    tree, duplicates = build_tree_dict(context, preset)
+    _ui_cache["tree"]["ptr"] = ptr
+    _ui_cache["tree"]["time"] = current_time
+    _ui_cache["tree"]["data"] = (tree, duplicates)
+    return tree, duplicates
+
+
 # --- TREE VISUALIZER LOGIC ---
-def build_tree_dict(scene, preset):
+def build_tree_dict(context, preset):
+    scene = context.scene
     root_name = bpy.path.abspath(scene.batch_stl_root_dir) if scene.batch_stl_root_dir else "//"
     tree = {}
     all_filepaths = set()
@@ -506,6 +618,10 @@ def build_tree_dict(scene, preset):
         current_root = current_root[preset.preset_prefix]
 
     for c in preset.collections:
+        c_ptr = bpy.data.collections.get(c.collection_name)
+        if c_ptr and is_collection_excluded(context, c_ptr):
+            continue
+
         c_root = current_root
         c_root_path = []
         if c.sub_path:
@@ -527,10 +643,10 @@ def build_tree_dict(scene, preset):
 
         combinations = generate_override_combinations(all_overrides)
         valid_objs = []
-        if c.collection_ptr:
+        if c_ptr:
             excluded_names = {e.name for e in c.excluded_objects} if getattr(c, "use_filter", False) else set()
-            for obj in c.collection_ptr.all_objects:
-                if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+            for obj in c_ptr.all_objects:
+                if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
                     if obj.name not in excluded_names: valid_objs.append(obj)
 
         if not valid_objs: continue
@@ -652,8 +768,9 @@ def run_headless_export(preset_index):
 
     active_export_objects = set()
     for c in preset.collections:
-        if c.collection_ptr and not is_collection_excluded(bpy.context, c.collection_ptr):
-            active_export_objects.update(c.collection_ptr.all_objects)
+        c_ptr = bpy.data.collections.get(c.collection_name)
+        if c_ptr and not is_collection_excluded(bpy.context, c_ptr):
+            active_export_objects.update(c_ptr.all_objects)
 
     muted_count = 0
     for obj in bpy.context.view_layer.objects:
@@ -669,8 +786,9 @@ def run_headless_export(preset_index):
     sig_pinned = get_override_signature(get_flat_overrides(preset.nodegroups))
 
     for c in preset.collections:
-        if not c.collection_ptr: continue
-        if is_collection_excluded(bpy.context, c.collection_ptr): continue
+        c_ptr = bpy.data.collections.get(c.collection_name)
+        if not c_ptr: continue
+        if is_collection_excluded(bpy.context, c_ptr): continue
         sig_local = get_override_signature(get_flat_overrides(c.nodegroups))
         full_sig = sig_pinned + sig_local
         if full_sig not in execution_batches: execution_batches[full_sig] = []
@@ -688,9 +806,10 @@ def run_headless_export(preset_index):
         combinations = generate_override_combinations(all_overrides)
         batch_obj_count = 0
         for m in c_in_batch:
+            m_ptr = bpy.data.collections.get(m.collection_name)
             excluded_names = {e.name for e in m.excluded_objects} if getattr(m, "use_filter", False) else set()
-            for obj in m.collection_ptr.all_objects:
-                if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+            for obj in m_ptr.all_objects:
+                if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
                     if obj.name not in excluded_names:
                         batch_obj_count += 1
         total_operations += (batch_obj_count * len(combinations))
@@ -716,11 +835,13 @@ def run_headless_export(preset_index):
 
         is_clean_batch = len(get_flat_overrides(first_c.nodegroups)) == 0
         batch_type = "Clean (Pinned Only)" if is_clean_batch else f"Dirty ({len(get_flat_overrides(first_c.nodegroups))} Local Overrides)"
-        c_names = [f"{m.collection_ptr.name} [{m.tag}]" for m in c_in_batch]
+        c_names = [f"{m.collection_name} [{m.tag}]" for m in c_in_batch]
         print(f"  ├─ Batch {batch_counter}/{len(execution_batches)} [{batch_type}]: Processing {len(c_names)} mapped instances with {len(combinations)} permutation(s)")
 
         batch_objects = set()
-        for m in c_in_batch: batch_objects.update(m.collection_ptr.all_objects)
+        for m in c_in_batch:
+            m_ptr = bpy.data.collections.get(m.collection_name)
+            batch_objects.update(m_ptr.all_objects)
 
         for combo_idx, combo in enumerate(combinations):
             print(f"  │    ├─ Permutation {combo_idx + 1}/{len(combinations)}")
@@ -754,13 +875,14 @@ def run_headless_export(preset_index):
                 print(f"  │    │    ├─ Applied & Synced Graph: {time.perf_counter() - t_ovr:.4f}s")
 
                 for c in c_in_batch:
+                    c_ptr = bpy.data.collections.get(c.collection_name)
                     out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path, combo_subpath))
                     os.makedirs(out_dir, exist_ok=True)
-                    print(f"  │    │    ├─ Exporting: {c.collection_ptr.name}{' ['+c.tag+']' if c.tag else ''}")
+                    print(f"  │    │    ├─ Exporting: {c.collection_name}{' ['+c.tag+']' if c.tag else ''}")
 
                     excluded_names = {e.name for e in c.excluded_objects} if getattr(c, "use_filter", False) else set()
-                    for obj in c.collection_ptr.all_objects:
-                        if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+                    for obj in c_ptr.all_objects:
+                        if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
                             if obj.name in excluded_names: continue
                             t_eval = time.perf_counter()
                             obj_eval = obj.evaluated_get(depsgraph)
@@ -848,7 +970,8 @@ def on_input_name_update(self, context):
                 if found_ng: break
 
         if found_ng and found_node:
-            self.override_type = infer_input_type(found_ng.group_ptr, found_node.name, self.name)
+            ng_ptr = bpy.data.node_groups.get(found_ng.group_name)
+            self.override_type = infer_input_type(ng_ptr, found_node.name, self.name)
             for v in self.values: v.use_sweep = False
     except Exception: pass
 
@@ -865,8 +988,9 @@ def search_target_node_cb(self, context, edit_text):
                 if self in ng.nodes.values(): found_ng = ng; break
             if found_ng: break
 
-    if found_ng and found_ng.group_ptr:
-        for node in found_ng.group_ptr.nodes:
+    ng_ptr = bpy.data.node_groups.get(found_ng.group_name) if found_ng else None
+    if ng_ptr:
+        for node in ng_ptr.nodes:
             name = node.name
             if node.type == 'GROUP' and getattr(node, "node_tree", None):
                 val = f"{name} [{node.node_tree.name}]"
@@ -897,10 +1021,12 @@ def search_menu_items_cb(self, context, edit_text):
             if found_inp: break
 
     items = []
-    if found_ng and found_ng.group_ptr and found_inp:
+    ng_ptr = bpy.data.node_groups.get(found_ng.group_name) if found_ng else None
+
+    if ng_ptr and found_inp:
         is_mod = not found_n.name or found_n.name == "<Modifier Interface>"
         if is_mod:
-            for node in found_ng.group_ptr.nodes:
+            for node in ng_ptr.nodes:
                 if node.type == 'MENU_SWITCH' and hasattr(node, 'enum_items'):
                     for sock in node.inputs:
                         for link in sock.links:
@@ -911,7 +1037,7 @@ def search_menu_items_cb(self, context, edit_text):
                 if items: break
         else:
             n_name = found_n.name.split(" [")[0].strip()
-            node = found_ng.group_ptr.nodes.get(n_name)
+            node = ng_ptr.nodes.get(n_name)
             if node:
                 if node.type == 'MENU_SWITCH' and hasattr(node, 'enum_items'):
                     items = [getattr(item, 'identifier', getattr(item, 'name', '')) for item in node.enum_items]
@@ -963,14 +1089,14 @@ class BatchSTLNode(bpy.types.PropertyGroup):
     inputs: bpy.props.CollectionProperty(type=BatchSTLInput)
 
 class BatchSTLNodeGroup(bpy.types.PropertyGroup):
-    group_ptr: bpy.props.PointerProperty(type=bpy.types.NodeTree, name="Node Group")
+    group_name: bpy.props.StringProperty(name="Node Group", default="")
     nodes: bpy.props.CollectionProperty(type=BatchSTLNode)
 
 class BatchSTLExcludedObject(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
 
 class BatchSTLCollection(bpy.types.PropertyGroup):
-    collection_ptr: bpy.props.PointerProperty(type=bpy.types.Collection, name="Collection")
+    collection_name: bpy.props.StringProperty(name="Collection", default="")
     use_tag: bpy.props.BoolProperty(name="Use Tag", default=True)
     tag: bpy.props.StringProperty(name="Tag", default="")
     sub_path: bpy.props.StringProperty(name="Sub-folder", default="")
@@ -1113,8 +1239,6 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
         if self.action != 'COPY': bpy.ops.ed.undo_push(message="Collection Action")
         return {'FINISHED'}
 
-_clipboard = {}
-
 class BATCH_STL_OT_table_action(bpy.types.Operator):
     bl_idname = "batch_stl.table_action"
     bl_label = "Table Action"
@@ -1151,7 +1275,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         elif action == 'DEL_VALUE': return "Delete this Value iteration"
         elif action == 'MOVE_VALUE_UP': return "Move Value Up"
         elif action == 'MOVE_VALUE_DOWN': return "Move Value Down"
-        elif action == 'VALUE_ACTION': 
+        elif action == 'VALUE_ACTION':
             if properties.v_idx < 0: return "Add a Value iteration (Shift-Click: Toggle Sweep Mode)"
             else: return "Add a Value iteration (Shift-Click: Toggle Sweep / Populate values)"
         return "Table action"
@@ -1206,15 +1330,17 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         elif self.action == 'ADD_INPUT':
             ng = ng_list[self.ng_idx]
             node = ng.nodes[self.n_idx]
-            if self.shift_pressed and ng.group_ptr:
+            ng_ptr = bpy.data.node_groups.get(ng.group_name)
+
+            if self.shift_pressed and ng_ptr:
                 is_mod = not node.name or node.name == "<Modifier Interface>"
                 source_inputs = []
-                if is_mod and hasattr(ng.group_ptr, "interface"):
-                    for item in ng.group_ptr.interface.items_tree:
+                if is_mod and hasattr(ng_ptr, "interface"):
+                    for item in ng_ptr.interface.items_tree:
                         if getattr(item, "item_type", "SOCKET") == 'SOCKET' and getattr(item, "in_out", "INPUT") == 'INPUT':
                             source_inputs.append(item.name)
                 elif not is_mod and node.name:
-                    target_n = ng.group_ptr.nodes.get(node.name.split(" [")[0].strip())
+                    target_n = ng_ptr.nodes.get(node.name.split(" [")[0].strip())
                     if target_n:
                         for i in target_n.inputs:
                             if not getattr(i, "is_unavailable", False) and not getattr(i, "hide", False):
@@ -1267,11 +1393,12 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                         inp_obj = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
                         if inp_obj.override_type in ['FLOAT', 'INT', 'MENU']:
                             ng_obj = ng_list[self.ng_idx]
+                            ng_ptr = bpy.data.node_groups.get(ng_obj.group_name)
                             node_obj = ng_obj.nodes[self.n_idx]
                             target = 'MODIFIER' if not node_obj.name or node_obj.name == "<Modifier Interface>" else 'NODE'
 
                             temp_inp = TempMockInput(inp_obj.name, inp_obj.override_type, val)
-                            temp_ovr = TempMockOverride(target, ng_obj.group_ptr, node_obj.name, [temp_inp])
+                            temp_ovr = TempMockOverride(target, ng_ptr, node_obj.name, [temp_inp])
 
                             parsed_vals = parse_sweep_values(temp_ovr, temp_inp)
                             if parsed_vals:
@@ -1419,11 +1546,12 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
             total_objs = 0
             for c in self.preset.collections:
-                if not c.collection_ptr: continue
-                if is_collection_excluded(context, c.collection_ptr): continue
+                c_ptr = bpy.data.collections.get(c.collection_name)
+                if not c_ptr: continue
+                if is_collection_excluded(context, c_ptr): continue
                 excluded_names = {e.name for e in c.excluded_objects} if c.use_filter else set()
-                for obj in c.collection_ptr.all_objects:
-                    if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+                for obj in c_ptr.all_objects:
+                    if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
                         if obj.name not in excluded_names: total_objs += 1
 
             context.window_manager.progress_begin(0, max(1, total_objs))
@@ -1435,14 +1563,15 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             log_to_console(self.preset, log_msg)
 
             for c in self.preset.collections:
-                if not c.collection_ptr: continue
-                if is_collection_excluded(context, c.collection_ptr): continue
+                c_ptr = bpy.data.collections.get(c.collection_name)
+                if not c_ptr: continue
+                if is_collection_excluded(context, c_ptr): continue
                 out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path))
                 os.makedirs(out_dir, exist_ok=True)
                 excluded_names = {e.name for e in c.excluded_objects} if c.use_filter else set()
 
-                for obj in c.collection_ptr.all_objects:
-                    if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
+                for obj in c_ptr.all_objects:
+                    if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
                         if obj.name in excluded_names: continue
                         t_eval_start = time.perf_counter()
                         obj_eval = obj.evaluated_get(depsgraph)
@@ -1617,7 +1746,7 @@ class BATCH_STL_UL_collections(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
         row.prop(item, "use_filter", text="", icon='FILTER')
-        row.prop(item, "collection_ptr", text="")
+        row.prop_search(item, "collection_name", bpy.data, "collections", text="")
         row.separator(factor=0.5)
         sub_row = row.row(align=True)
         sub_row.prop(item, "use_tag", text="", icon='BOOKMARKS')
@@ -1668,15 +1797,16 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
         ng_layout = ng_box.column()
         ng_row = ng_layout.row(align=True)
         op = ng_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
-        ng_row.prop(ng, "group_ptr", text="")
-        
+
+        ng_row.prop_search(ng, "group_name", bpy.data, "node_groups", text="")
+
         if len(nodegroups) > 1:
             op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
             op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
         op = ng_row.operator("batch_stl.table_action", text="", icon='PINNED' if is_pinned else 'UNPINNED'); op.action = 'UNPIN_GROUP' if is_pinned else 'PIN_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
         op = ng_row.operator("batch_stl.table_action", text="", icon='COPYDOWN'); op.action = 'COPY_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
         op = ng_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
-        
+
         if not ng.nodes:
             continue
 
@@ -1693,7 +1823,7 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
             n_row = node_layout.row(align=True)
             op = n_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
             n_row.prop(node, "name", text="", icon='NODETREE')
-            
+
             if len(ng.nodes) > 1:
                 op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_NODE_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
                 op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_NODE_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
@@ -1710,25 +1840,26 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
 
             for i_idx, inp in enumerate(node.inputs):
                 input_layout = inputs_layout.column()
-                
+
                 if not inp.values:
                     i_row = input_layout.row(align=True)
                     s_main = i_row.split(factor=0.35, align=False)
                     c_inp = s_main.row(align=True)
-                    
+
                     op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
                     op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = -1
 
+                    ng_ptr = bpy.data.node_groups.get(ng.group_name)
                     is_mod = not node.name or node.name == "<Modifier Interface>"
-                    if is_mod and ng.group_ptr and hasattr(ng.group_ptr, "interface"):
-                        c_inp.prop_search(inp, "name", ng.group_ptr.interface, "items_tree", text="")
-                    elif not is_mod and ng.group_ptr and node.name:
-                        target_n = ng.group_ptr.nodes.get(node.name.split(" [")[0].strip())
+                    if is_mod and ng_ptr and hasattr(ng_ptr, "interface"):
+                        c_inp.prop_search(inp, "name", ng_ptr.interface, "items_tree", text="")
+                    elif not is_mod and ng_ptr and node.name:
+                        target_n = ng_ptr.nodes.get(node.name.split(" [")[0].strip())
                         if target_n: c_inp.prop_search(inp, "name", target_n, "inputs", text="")
                         else: c_inp.prop(inp, "name", text="")
                     else:
                         c_inp.prop(inp, "name", text="")
-                        
+
                     s_val = s_main.split(factor=0.5, align=False)
                     c_val = s_val.row(align=True)
                     c_dir = s_val.row(align=True)
@@ -1743,7 +1874,7 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                 for v_idx, val in enumerate(inp.values):
                     i_first = (v_idx == 0)
                     i_row = input_layout.row(align=True)
-                    
+
                     s_main = i_row.split(factor=0.35, align=False)
                     c_inp = s_main.row(align=True)
 
@@ -1754,11 +1885,12 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                             op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
                         op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
 
+                        ng_ptr = bpy.data.node_groups.get(ng.group_name)
                         is_mod = not node.name or node.name == "<Modifier Interface>"
-                        if is_mod and ng.group_ptr and hasattr(ng.group_ptr, "interface"):
-                            c_inp.prop_search(inp, "name", ng.group_ptr.interface, "items_tree", text="")
-                        elif not is_mod and ng.group_ptr and node.name:
-                            target_n = ng.group_ptr.nodes.get(node.name.split(" [")[0].strip())
+                        if is_mod and ng_ptr and hasattr(ng_ptr, "interface"):
+                            c_inp.prop_search(inp, "name", ng_ptr.interface, "items_tree", text="")
+                        elif not is_mod and ng_ptr and node.name:
+                            target_n = ng_ptr.nodes.get(node.name.split(" [")[0].strip())
                             if target_n: c_inp.prop_search(inp, "name", target_n, "inputs", text="")
                             else: c_inp.prop(inp, "name", text="")
                         else:
@@ -1768,7 +1900,7 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
 
                     s_val = s_main.split(factor=0.5, align=False)
                     c_val = s_val.row(align=True)
-                    
+
                     if getattr(val, "use_sweep", False):
                         if inp.override_type in ['INT', 'FLOAT', 'STRING']:
                             c_val.prop(val, "sweep_range", text="")
@@ -1801,15 +1933,13 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                         if len(node.inputs) > 1:
                             op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
                             op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                        
+
                         op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE_OR_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
                     else:
                         if len(inp.values) > 1:
                             op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_VALUE_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
                             op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
                         op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-
-                    # Removed ADD/Sweep button from children
 
 
 class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
@@ -1858,20 +1988,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
             return
 
-        total_collections = len(active_preset.collections)
-        total_objects = 0
-        total_preset_combos = 0
-
-        for c in active_preset.collections:
-            c_combos = len(generate_override_combinations(get_flat_overrides(active_preset.nodegroups) + get_flat_overrides(c.nodegroups)))
-            total_preset_combos += c_combos
-            obj_count = 0
-            if c.collection_ptr:
-                excluded_names = {e.name for e in c.excluded_objects} if getattr(c, "use_filter", False) else set()
-                for obj in c.collection_ptr.all_objects:
-                    if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
-                        if obj.name not in excluded_names: obj_count += 1
-            total_objects += (obj_count * c_combos)
+        metrics = get_cached_metrics(context, active_preset)
 
         layout.separator(factor=0.5)
         m_box = layout.box()
@@ -1879,62 +1996,40 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         icon_m = 'TRIA_DOWN' if scene.batch_stl_ui_collections else 'TRIA_RIGHT'
         m_header.prop(scene, "batch_stl_ui_collections", text="", icon=icon_m, emboss=False)
 
-        m_title = f"{active_preset.name} | {total_collections} collections | {total_preset_combos} combos | {total_objects} objects total"
+        m_title = f"{active_preset.name} | {metrics['total_collections']} collections | {metrics['total_preset_combos']} combos | {metrics['total_objects']} objects total"
         m_header.label(text=m_title, icon='OUTLINER_COLLECTION')
         draw_inline_controls(m_header, "batch_stl.collection_actions", use_clipboard=True)
 
         if scene.batch_stl_ui_collections:
             m_box.template_list("BATCH_STL_UL_collections", "", active_preset, "collections", active_preset, "collection_index", rows=5)
             active_col = get_active_collection(active_preset)
-            if active_col and active_col.collection_ptr:
-                m_box.separator()
-                if active_col.use_filter:
-                    filter_box = m_box.box()
-                    f_header = filter_box.row()
-                    icon_f = 'TRIA_DOWN' if scene.batch_stl_ui_exclude else 'TRIA_RIGHT'
-                    f_header.prop(scene, "batch_stl_ui_exclude", text="", icon=icon_f, emboss=False)
-                    f_header.label(text="Exclude Objects:", icon='FILTER')
 
-                    if scene.batch_stl_ui_exclude:
-                        col = filter_box.column(align=True)
-                        for obj in active_col.collection_ptr.all_objects:
-                            if obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}: continue
-                            is_excl = any(e.name == obj.name for e in active_col.excluded_objects)
-                            icon_btn = 'CHECKBOX_DEHLT' if is_excl else 'CHECKBOX_HLT'
-                            op = col.operator("batch_stl.toggle_exclusion", text=obj.name, icon=icon_btn, depress=not is_excl)
-                            op.object_name = obj.name
+            if active_col:
+                c_ptr = bpy.data.collections.get(active_col.collection_name)
+                if c_ptr:
+                    m_box.separator()
+                    if active_col.use_filter:
+                        filter_box = m_box.box()
+                        f_header = filter_box.row()
+                        icon_f = 'TRIA_DOWN' if scene.batch_stl_ui_exclude else 'TRIA_RIGHT'
+                        f_header.prop(scene, "batch_stl_ui_exclude", text="", icon=icon_f, emboss=False)
+                        f_header.label(text="Exclude Objects:", icon='FILTER')
+
+                        if scene.batch_stl_ui_exclude:
+                            col = filter_box.column(align=True)
+                            for obj in c_ptr.all_objects:
+                                if obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}: continue
+                                is_excl = any(e.name == obj.name for e in active_col.excluded_objects)
+                                icon_btn = 'CHECKBOX_DEHLT' if is_excl else 'CHECKBOX_HLT'
+                                op = col.operator("batch_stl.toggle_exclusion", text=obj.name, icon=icon_btn, depress=not is_excl)
+                                op.object_name = obj.name
 
         layout.separator()
 
-        if get_active_collection(active_preset):
-            active_col = get_active_collection(active_preset)
-            all_ovrs = get_flat_overrides(active_preset.nodegroups) + get_flat_overrides(active_col.nodegroups)
-            freq_dict = {}
-            unique_targets = set()
-            total_inputs = 0
-
-            for o in all_ovrs:
-                total_inputs += len(o.inputs)
-                for i in o.inputs:
-                    key = (o.override_target, o.node_name, i.input_name)
-                    weight = 2 if getattr(i, "use_sweep", False) else 1
-                    freq_dict[key] = freq_dict.get(key, 0) + weight
-                    unique_targets.add(key)
-
-            num_targets = len(unique_targets)
-            num_combos = len(generate_override_combinations(all_ovrs))
-            active_obj_count = 0
-            if active_col.collection_ptr:
-                excluded_names = {e.name for e in active_col.excluded_objects} if getattr(active_col, "use_filter", False) else set()
-                for obj in active_col.collection_ptr.all_objects:
-                    if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_get() and not obj.hide_viewport:
-                        if obj.name not in excluded_names: active_obj_count += 1
-
-            mapping_total_objects = active_obj_count * num_combos
-            c_name = active_col.collection_ptr.name if active_col.collection_ptr else "Unassigned"
-            if active_col.tag: c_name += f" [{active_col.tag}]"
-
-            metric_str = f"{c_name} | {num_targets} targets | {total_inputs} inputs | {num_combos} combos | {mapping_total_objects} objects"
+        active_col = get_active_collection(active_preset)
+        if active_col:
+            col_metrics = get_cached_active_col_metrics(context, active_preset, active_col)
+            metric_str = f"{col_metrics['c_name']} | {col_metrics['num_targets']} targets | {col_metrics['total_inputs']} inputs | {col_metrics['num_combos']} combos | {col_metrics['mapping_total_objects']} objects"
             header = layout.row()
             header.label(text=metric_str, icon='MODIFIER')
             layout.separator()
@@ -1968,7 +2063,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 col.label(text="Export Tools (Per Value):", icon='BLANK1')
                 col.label(text="  • Folder Icon: Save this value's exports into a subfolder", icon='FILE_FOLDER')
                 col.label(text="  • Bookmark Icon: Append/Prepend a tag to filename", icon='BOOKMARKS')
-                
+
                 col.label(text="Tag Formatting:", icon='BLANK1')
                 col.label(text="  • [ tag ] replaces input value, [ _tag ] appends, [ tag_ ] prepends", icon='BLANK1')
 
@@ -1980,7 +2075,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         t_header.label(text="Export Structure & Files", icon='OUTLINER_OB_EMPTY')
 
         if scene.batch_stl_show_tree and active_preset:
-            tree_dict, duplicates = build_tree_dict(scene, active_preset)
+            tree_dict, duplicates = get_cached_tree_dict(context, active_preset)
             if duplicates:
                 warn_box = t_box.box()
                 warn_row = warn_box.row()
