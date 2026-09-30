@@ -53,15 +53,19 @@ def is_collection_excluded(context, target_collection):
 
     def traverse(layer_collection, parent_excluded=False):
         nonlocal found_any_visible, found_any
+        if found_any_visible: return  # OPTIMIZED: Early exit
+
         current_excluded = parent_excluded or layer_collection.exclude
 
         if layer_collection.collection == target_collection:
             found_any = True
             if not current_excluded:
                 found_any_visible = True
+                return
 
         for child in layer_collection.children:
             traverse(child, current_excluded)
+            if found_any_visible: return
 
     traverse(context.view_layer.layer_collection)
 
@@ -175,7 +179,7 @@ def get_flat_overrides(nodegroups):
     for ng in nodegroups:
         ng_ptr = bpy.data.node_groups.get(ng.group_name)
         if not ng_ptr:
-            continue  # Critical fix: Prevent crashes if node group was deleted
+            continue
         for node in ng.nodes:
             target = 'MODIFIER' if not node.name or node.name == "<Modifier Interface>" else 'NODE'
             temp_inputs = []
@@ -231,7 +235,6 @@ def parse_sweep_values(ovr, inp):
                     v = start + i * step
                     vals.append(int(v) if inp.override_type == 'INT' else v)
             except ValueError:
-                # Robust parsing fallback
                 try: vals.append(int(parts[0]) if inp.override_type == 'INT' else float(parts[0]))
                 except ValueError: vals.append(0 if inp.override_type == 'INT' else 0.0)
         else:
@@ -414,9 +417,11 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
 
     verts = np.empty((len(mesh.vertices), 3), dtype=np.float32)
     mesh.vertices.foreach_get("co", verts.ravel())
-    mat = np.array(matrix_world, dtype=np.float32)
-    verts_vec4 = np.c_[verts, np.ones(len(verts), dtype=np.float32)]
-    verts = np.dot(verts_vec4, mat.T)[:, :3]
+
+    # OPTIMIZED: 3x3 Multiplication avoids memory allocation of homogenous N x 4 array
+    mat_3x3 = np.array(matrix_world.to_3x3(), dtype=np.float32)
+    trans = np.array(matrix_world.translation, dtype=np.float32)
+    verts = np.dot(verts, mat_3x3.T) + trans
 
     tri_verts = np.empty((num_tris, 3), dtype=np.int32)
     mesh.loop_triangles.foreach_get("vertices", tri_verts.ravel())
@@ -426,7 +431,9 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
 
     mat_norm = np.array(matrix_world.to_3x3().inverted_safe().transposed(), dtype=np.float32)
     tri_normals = np.dot(tri_normals, mat_norm.T)
-    norms = np.linalg.norm(tri_normals, axis=1, keepdims=True)
+
+    # OPTIMIZED: Manual normalization scales faster than np.linalg.norm overhead
+    norms = np.sqrt(np.sum(tri_normals**2, axis=1, keepdims=True))
     norms[norms == 0] = 1.0
     tri_normals /= norms
 
@@ -650,12 +657,15 @@ def build_tree_dict(context, preset):
                 freq_dict[key] = freq_dict.get(key, 0) + weight
 
         combinations = generate_override_combinations(all_overrides)
+
+        # OPTIMIZED: Pre-filter clean_name resolution directly in loop definition
         valid_objs = []
         if c_ptr:
             excluded_names = {e.name for e in c.excluded_objects} if getattr(c, "use_filter", False) else set()
             for obj in c_ptr.all_objects:
                 if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
-                    if obj.name not in excluded_names: valid_objs.append(obj)
+                    if obj.name not in excluded_names:
+                        valid_objs.append((obj, bpy.path.clean_name(obj.name)))
 
         if not valid_objs: continue
         if not combinations: combinations = [[]]
@@ -694,8 +704,8 @@ def build_tree_dict(context, preset):
             full_dir_parts.extend(combo_subpath)
             dir_path_str = os.path.normpath(os.path.join(root_name, *full_dir_parts))
 
-            for obj in valid_objs:
-                filename = f"{bpy.path.clean_name(obj.name)}{final_tag}.stl"
+            for obj, safe_name in valid_objs:
+                filename = f"{safe_name}{final_tag}.stl"
                 combo_root['_files'].append(filename)
                 full_path = os.path.join(dir_path_str, filename)
                 if full_path in all_filepaths: duplicates.add(full_path)
@@ -847,9 +857,20 @@ def run_headless_export(preset_index):
         print(f"  ├─ Batch {batch_counter}/{len(execution_batches)} [{batch_type}]: Processing {len(c_names)} mapped instances with {len(combinations)} permutation(s)")
 
         batch_objects = set()
+        batch_export_targets = []
+
+        # OPTIMIZED: Pre-calculated Export Objects to prevent querying c_ptr.all_objects per permutation
         for m in c_in_batch:
             m_ptr = bpy.data.collections.get(m.collection_name)
             batch_objects.update(m_ptr.all_objects)
+
+            excluded_names = {e.name for e in m.excluded_objects} if getattr(m, "use_filter", False) else set()
+            valid_objs = []
+            for obj in m_ptr.all_objects:
+                if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
+                    if obj.name not in excluded_names:
+                        valid_objs.append((obj, bpy.path.clean_name(obj.name)))
+            batch_export_targets.append((m, valid_objs))
 
         for combo_idx, combo in enumerate(combinations):
             print(f"  │    ├─ Permutation {combo_idx + 1}/{len(combinations)}")
@@ -882,30 +903,26 @@ def run_headless_export(preset_index):
                 depsgraph = bpy.context.evaluated_depsgraph_get()
                 print(f"  │    │    ├─ Applied & Synced Graph: {time.perf_counter() - t_ovr:.4f}s")
 
-                for c in c_in_batch:
-                    c_ptr = bpy.data.collections.get(c.collection_name)
+                for c, valid_objs in batch_export_targets:
                     out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path, combo_subpath))
                     os.makedirs(out_dir, exist_ok=True)
                     print(f"  │    │    ├─ Exporting: {c.collection_name}{' ['+c.tag+']' if c.tag else ''}")
 
-                    excluded_names = {e.name for e in c.excluded_objects} if getattr(c, "use_filter", False) else set()
-                    for obj in c_ptr.all_objects:
-                        if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
-                            if obj.name in excluded_names: continue
-                            t_eval = time.perf_counter()
-                            obj_eval = obj.evaluated_get(depsgraph)
-                            try: mesh = obj_eval.to_mesh()
-                            except RuntimeError: mesh = None
-                            print(f"  │         ├─ Evaluated Mesh [{obj.name}]: {time.perf_counter() - t_eval:.4f}s")
+                    for obj, safe_name in valid_objs:
+                        t_eval = time.perf_counter()
+                        obj_eval = obj.evaluated_get(depsgraph)
+                        try: mesh = obj_eval.to_mesh()
+                        except RuntimeError: mesh = None
+                        print(f"  │         ├─ Evaluated Mesh [{obj.name}]: {time.perf_counter() - t_eval:.4f}s")
 
-                            if mesh:
-                                base_tag = c.tag if getattr(c, "use_tag", False) and c.tag else ""
-                                final_tag = base_tag + combo_suffix
-                                filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{final_tag}.stl")
-                                write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=True)
-                                obj_eval.to_mesh_clear()
-                                current_op_step += 1
-                                print(f"BATCH_STL_PROGRESS:{current_op_step}", flush=True)
+                        if mesh:
+                            base_tag = c.tag if getattr(c, "use_tag", False) and c.tag else ""
+                            final_tag = base_tag + combo_suffix
+                            filepath = os.path.join(out_dir, f"{safe_name}{final_tag}.stl")
+                            write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=True)
+                            obj_eval.to_mesh_clear()
+                            current_op_step += 1
+                            print(f"BATCH_STL_PROGRESS:{current_op_step}", flush=True)
 
             finally:
                 t_rev = time.perf_counter()
@@ -913,9 +930,10 @@ def run_headless_export(preset_index):
                 bpy.context.view_layer.update()
                 print(f"  │    │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
 
-            t_purge = time.perf_counter()
-            bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
-            print(f"  │    │    ├─ RAM Purge: {time.perf_counter() - t_purge:.4f}s")
+        # OPTIMIZED: Moved RAM Purge completely out of permutation loop to run per-batch
+        t_purge = time.perf_counter()
+        bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
+        print(f"  │    ├─ Batch RAM Purge: {time.perf_counter() - t_purge:.4f}s")
 
         print(f"  │    => Batch Iteration Total Time: {time.perf_counter() - t_batch_start:.4f}s\n")
         batch_counter += 1
@@ -1574,28 +1592,37 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 c_ptr = bpy.data.collections.get(c.collection_name)
                 if not c_ptr: continue
                 if is_collection_excluded(context, c_ptr): continue
-                out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path))
-                os.makedirs(out_dir, exist_ok=True)
+
                 excluded_names = {e.name for e in c.excluded_objects} if c.use_filter else set()
 
+                # OPTIMIZED: Pre-filtering to avoid redundant loop evaluations
+                valid_objs = []
                 for obj in c_ptr.all_objects:
                     if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
-                        if obj.name in excluded_names: continue
-                        t_eval_start = time.perf_counter()
-                        obj_eval = obj.evaluated_get(depsgraph)
-                        try: mesh = obj_eval.to_mesh()
-                        except RuntimeError: mesh = None
-                        perf_msg = f"  ├─ Evaluated {obj.name} in {time.perf_counter()-t_eval_start:.4f}s"
-                        if verbose: print(perf_msg)
-                        log_to_console(self.preset, perf_msg)
+                        if obj.name not in excluded_names:
+                            valid_objs.append((obj, bpy.path.clean_name(obj.name)))
 
-                        if mesh:
-                            base_tag = c.tag if c.use_tag and c.tag else ""
-                            filepath = os.path.join(out_dir, f"{bpy.path.clean_name(obj.name)}{base_tag}.stl")
-                            write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=verbose)
-                            obj_eval.to_mesh_clear()
-                            exported_count += 1
-                            context.window_manager.progress_update(exported_count)
+                if not valid_objs: continue
+
+                out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path))
+                os.makedirs(out_dir, exist_ok=True)
+
+                for obj, safe_name in valid_objs:
+                    t_eval_start = time.perf_counter()
+                    obj_eval = obj.evaluated_get(depsgraph)
+                    try: mesh = obj_eval.to_mesh()
+                    except RuntimeError: mesh = None
+                    perf_msg = f"  ├─ Evaluated {obj.name} in {time.perf_counter()-t_eval_start:.4f}s"
+                    if verbose: print(perf_msg)
+                    log_to_console(self.preset, perf_msg)
+
+                    if mesh:
+                        base_tag = c.tag if c.use_tag and c.tag else ""
+                        filepath = os.path.join(out_dir, f"{safe_name}{base_tag}.stl")
+                        write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=verbose)
+                        obj_eval.to_mesh_clear()
+                        exported_count += 1
+                        context.window_manager.progress_update(exported_count)
 
             context.window_manager.progress_end()
             total_time = time.perf_counter() - self.export_start_time
@@ -1727,7 +1754,6 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 if self.process.poll() is None: self.process.kill()
             except Exception: pass
         try:
-            # Using shutil.rmtree ignores lock exceptions allowing safe disposal without crashes
             if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
                 shutil.rmtree(self.temp_dir, ignore_errors=True)
         except Exception: pass
