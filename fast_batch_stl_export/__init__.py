@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import sys
 import struct
+import shutil
 import numpy as np
 
 import bpy
@@ -173,6 +174,8 @@ def get_flat_overrides(nodegroups):
     overrides = []
     for ng in nodegroups:
         ng_ptr = bpy.data.node_groups.get(ng.group_name)
+        if not ng_ptr:
+            continue  # Critical fix: Prevent crashes if node group was deleted
         for node in ng.nodes:
             target = 'MODIFIER' if not node.name or node.name == "<Modifier Interface>" else 'NODE'
             temp_inputs = []
@@ -227,8 +230,13 @@ def parse_sweep_values(ovr, inp):
                 for i in range(count):
                     v = start + i * step
                     vals.append(int(v) if inp.override_type == 'INT' else v)
-            except ValueError: vals.append(0 if inp.override_type == 'INT' else 0.0)
-        else: vals.append(0 if inp.override_type == 'INT' else 0.0)
+            except ValueError:
+                # Robust parsing fallback
+                try: vals.append(int(parts[0]) if inp.override_type == 'INT' else float(parts[0]))
+                except ValueError: vals.append(0 if inp.override_type == 'INT' else 0.0)
+        else:
+            try: vals.append(int(parts[0]) if parts and inp.override_type == 'INT' else float(parts[0]) if parts else 0.0)
+            except: vals.append(0 if inp.override_type == 'INT' else 0.0)
         return vals
     elif inp.override_type == 'MENU':
         items = []
@@ -1023,7 +1031,7 @@ def search_menu_items_cb(self, context, edit_text):
     items = []
     ng_ptr = bpy.data.node_groups.get(found_ng.group_name) if found_ng else None
 
-    if ng_ptr and found_inp:
+    if ng_ptr and found_inp and found_n:
         is_mod = not found_n.name or found_n.name == "<Modifier Interface>"
         if is_mod:
             for node in ng_ptr.nodes:
@@ -1719,8 +1727,9 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 if self.process.poll() is None: self.process.kill()
             except Exception: pass
         try:
-            if hasattr(self, 'temp_blend') and os.path.exists(self.temp_blend): os.remove(self.temp_blend)
-            if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir): os.rmdir(self.temp_dir)
+            # Using shutil.rmtree ignores lock exceptions allowing safe disposal without crashes
+            if hasattr(self, 'temp_dir') and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
         except Exception: pass
 
 
