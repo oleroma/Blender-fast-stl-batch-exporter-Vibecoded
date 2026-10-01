@@ -40,13 +40,19 @@ _clipboard = {
     "nodegroup": None
 }
 
-# Caches (temporarily saves) heavy calculations for the UI.
-# If the UI asks for data 60 times a second, we just give it the cached data to prevent lag.
+# Persistent cache populated asynchronously by property updates and depsgraph handlers
 _ui_cache = {
-    "metrics": {"ptr": None, "time": 0, "data": {}},
-    "tree": {"ptr": None, "time": 0, "data": ({}, set())},
-    "active_col_metrics": {"ptr": None, "time": 0, "data": {}}
+    "is_dirty": True,
+    "visibility": {},
+    "metrics": {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0},
+    "active_col_metrics": {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0},
+    "active_col_filter_objects": [],
+    "tree": ({}, set())
 }
+
+def mark_dirty(self=None, context=None):
+    """Flags the UI cache to be rebuilt by the background timer."""
+    _ui_cache["is_dirty"] = True
 
 
 # ==============================================================================
@@ -596,25 +602,56 @@ def paste_preset_from_dict(new_p, data):
     for c_data in data.get("collections", []): paste_collection_from_dict(new_p.collections.add(), c_data)
 
 
-# --- UI CACHE LOGIC ---
-# Blender re-draws its User Interface panels continuously. If we calculate file paths
-# and object counts on every frame, Blender will freeze. We "cache" (save) the result for a quarter of a second.
-def get_cached_metrics(context, preset):
-    current_time = time.time()
-    ptr = preset.as_pointer()
-    # Check if the cache is younger than 0.25 seconds. If yes, just return the saved data immediately.
-    if _ui_cache["metrics"]["ptr"] == ptr and (current_time - _ui_cache["metrics"]["time"] < 0.25):
-        return _ui_cache["metrics"]["data"]
+# --- UI CACHE ENGINE ---
+# Background timer executes heavy calculation outside of `draw()`
+def rebuild_ui_cache_if_dirty():
+    if not _ui_cache.get("is_dirty", False):
+        return 0.25 # Wait 0.25s before checking the dirty flag again
 
-    # Heavy calculations run here only if the cache expired...
+    _ui_cache["is_dirty"] = False
+    context = bpy.context
+    if not hasattr(context, "scene"):
+        _ui_cache["is_dirty"] = True
+        return 0.25
+
+    scene = context.scene
+
+    # 1. Evaluate explicit visibility to prevent recursive outliner walks on redraw
+    visibility = {}
+    if hasattr(context, "view_layer") and context.view_layer:
+        def traverse(layer_collection, parent_excluded=False):
+            current_excluded = parent_excluded or layer_collection.exclude
+            if layer_collection.collection:
+                visibility[layer_collection.collection.name] = current_excluded
+            for child in layer_collection.children:
+                traverse(child, current_excluded)
+        traverse(context.view_layer.layer_collection)
+    _ui_cache["visibility"] = visibility
+
+    preset = get_active_preset(scene)
+    if not preset:
+        _ui_cache["metrics"] = {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0}
+        _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0}
+        _ui_cache["active_col_filter_objects"] = []
+        _ui_cache["tree"] = ({}, set())
+
+        if getattr(context, "window_manager", None):
+            for window in context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        area.tag_redraw()
+        return 0.25
+
+    # 2. Re-calculate metrics fully decoupled from UI
     total_collections = len(preset.collections)
     total_objects = 0
     total_preset_combos = 0
 
     for c in preset.collections:
         c_ptr = bpy.data.collections.get(c.collection_name)
-        if c_ptr and is_collection_excluded(context, c_ptr):
+        if c_ptr and visibility.get(c.collection_name, True):
             continue
+
         c_combos = len(generate_override_combinations(get_flat_overrides(preset.nodegroups) + get_flat_overrides(c.nodegroups)))
         total_preset_combos += c_combos
         obj_count = 0
@@ -625,77 +662,74 @@ def get_cached_metrics(context, preset):
                     if obj.name not in excluded_names: obj_count += 1
         total_objects += (obj_count * c_combos)
 
-    data = {
+    _ui_cache["metrics"] = {
         "total_collections": total_collections,
         "total_preset_combos": total_preset_combos,
         "total_objects": total_objects
     }
-    # Save the new calculations back into the dictionary for next time
-    _ui_cache["metrics"]["ptr"] = ptr
-    _ui_cache["metrics"]["time"] = current_time
-    _ui_cache["metrics"]["data"] = data
-    return data
 
-def get_cached_active_col_metrics(context, preset, active_col):
-    current_time = time.time()
-    ptr = active_col.as_pointer()
-    if _ui_cache["active_col_metrics"]["ptr"] == ptr and (current_time - _ui_cache["active_col_metrics"]["time"] < 0.25):
-        return _ui_cache["active_col_metrics"]["data"]
+    # 3. Active collection metrics & filter pre-computation
+    active_col = get_active_collection(preset)
+    if active_col:
+        all_ovrs = get_flat_overrides(preset.nodegroups) + get_flat_overrides(active_col.nodegroups)
+        unique_targets = set()
+        total_inputs = 0
 
-    all_ovrs = get_flat_overrides(preset.nodegroups) + get_flat_overrides(active_col.nodegroups)
-    unique_targets = set()
-    total_inputs = 0
+        for o in all_ovrs:
+            total_inputs += len(o.inputs)
+            for i in o.inputs:
+                unique_targets.add((o.override_target, o.node_name, i.input_name))
 
-    for o in all_ovrs:
-        total_inputs += len(o.inputs)
-        for i in o.inputs:
-            key = (o.override_target, o.node_name, i.input_name)
-            unique_targets.add(key)
+        num_targets = len(unique_targets)
+        num_combos = len(generate_override_combinations(all_ovrs))
+        active_obj_count = 0
 
-    num_targets = len(unique_targets)
-    num_combos = len(generate_override_combinations(all_ovrs))
-    active_obj_count = 0
+        filter_objects = []
+        c_ptr = bpy.data.collections.get(active_col.collection_name)
+        if c_ptr and not visibility.get(active_col.collection_name, True):
+            excluded_names = {e.name for e in active_col.excluded_objects} if getattr(active_col, "use_filter", False) else set()
+            for obj in c_ptr.all_objects:
+                if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
+                    if active_col.use_filter:
+                        filter_objects.append({"name": obj.name, "is_excl": obj.name in excluded_names})
+                    if obj.name not in excluded_names:
+                        active_obj_count += 1
 
-    c_ptr = bpy.data.collections.get(active_col.collection_name)
-    if c_ptr and not is_collection_excluded(context, c_ptr):
-        excluded_names = {e.name for e in active_col.excluded_objects} if getattr(active_col, "use_filter", False) else set()
-        for obj in c_ptr.all_objects:
-            if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
-                if obj.name not in excluded_names: active_obj_count += 1
+        c_name = active_col.collection_name if active_col.collection_name else "Unassigned"
+        if active_col.tag: c_name += f" [{active_col.tag}]"
 
-    mapping_total_objects = active_obj_count * num_combos
-    c_name = active_col.collection_name if active_col.collection_name else "Unassigned"
-    if active_col.tag: c_name += f" [{active_col.tag}]"
+        _ui_cache["active_col_metrics"] = {
+            "c_name": c_name, "num_targets": num_targets,
+            "total_inputs": total_inputs, "num_combos": num_combos,
+            "mapping_total_objects": active_obj_count * num_combos
+        }
+        _ui_cache["active_col_filter_objects"] = filter_objects
+    else:
+        _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0}
+        _ui_cache["active_col_filter_objects"] = []
 
-    data = {
-        "c_name": c_name,
-        "num_targets": num_targets,
-        "total_inputs": total_inputs,
-        "num_combos": num_combos,
-        "mapping_total_objects": mapping_total_objects
-    }
-    _ui_cache["active_col_metrics"]["ptr"] = ptr
-    _ui_cache["active_col_metrics"]["time"] = current_time
-    _ui_cache["active_col_metrics"]["data"] = data
-    return data
+    # 4. Build visualization tree
+    tree_dict, duplicates = build_tree_dict(context, preset, visibility)
+    _ui_cache["tree"] = (tree_dict, duplicates)
 
-def get_cached_tree_dict(context, preset):
-    current_time = time.time()
-    ptr = preset.as_pointer()
-    if _ui_cache["tree"]["ptr"] == ptr and (current_time - _ui_cache["tree"]["time"] < 0.25):
-        return _ui_cache["tree"]["data"]
+    if getattr(context, "window_manager", None):
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
 
-    tree, duplicates = build_tree_dict(context, preset)
-    _ui_cache["tree"]["ptr"] = ptr
-    _ui_cache["tree"]["time"] = current_time
-    _ui_cache["tree"]["data"] = (tree, duplicates)
-    return tree, duplicates
+    return 0.25
+
+@persistent
+def batch_stl_depsgraph_handler(scene, depsgraph):
+    """Triggers the cache timer dynamically upon scene state or object visibility updates"""
+    mark_dirty()
 
 
 # --- TREE VISUALIZER LOGIC ---
 # This builds an artificial file-folder structure in memory so the script can
 # visually show you what files will be created and where, before you actually click export.
-def build_tree_dict(context, preset):
+def build_tree_dict(context, preset, visibility_cache=None):
     scene = context.scene
     root_name = bpy.path.abspath(scene.batch_stl_root_dir) if scene.batch_stl_root_dir else "//"
     tree = {}
@@ -709,7 +743,12 @@ def build_tree_dict(context, preset):
 
     for c in preset.collections:
         c_ptr = bpy.data.collections.get(c.collection_name)
-        if c_ptr and is_collection_excluded(context, c_ptr):
+        if c_ptr:
+            if visibility_cache is not None:
+                if visibility_cache.get(c.collection_name, True): continue
+            else:
+                if is_collection_excluded(context, c_ptr): continue
+        else:
             continue
 
         c_root = current_root
@@ -1078,20 +1117,23 @@ def infer_input_type(group_ptr, node_name, input_name):
 
 # Callback function (event listener) that fires whenever an input name is updated by the user in the UI.
 def on_input_name_update(self, context):
+    mark_dirty()
     try:
         found_ng, found_node = None, None
-        for p in context.scene.batch_stl_presets:
-            for ng in p.nodegroups:
+        preset = get_active_preset(context.scene)
+
+        if preset:
+            for ng in preset.nodegroups:
                 for n in ng.nodes:
                     if self in n.inputs.values(): found_ng, found_node = ng, n; break
                 if found_ng: break
-            if found_ng: break
-            for c in p.collections:
-                for ng in c.nodegroups:
-                    for n in ng.nodes:
-                        if self in n.inputs.values(): found_ng, found_node = ng, n; break
-                    if found_ng: break
-                if found_ng: break
+            if not found_ng:
+                active_col = get_active_collection(preset)
+                if active_col:
+                    for ng in active_col.nodegroups:
+                        for n in ng.nodes:
+                            if self in n.inputs.values(): found_ng, found_node = ng, n; break
+                        if found_ng: break
 
         if found_ng and found_node:
             ng_ptr = bpy.data.node_groups.get(found_ng.group_name)
@@ -1104,14 +1146,17 @@ def search_target_node_cb(self, context, edit_text):
     if edit_text == self.name: edit_text = ""
     res = ["<Modifier Interface>"]
     found_ng = None
-    for p in context.scene.batch_stl_presets:
-        for ng in p.nodegroups:
+    preset = get_active_preset(context.scene)
+
+    # OPTIMIZED: Restrict search exclusively to active preset and collection
+    if preset:
+        for ng in preset.nodegroups:
             if self in ng.nodes.values(): found_ng = ng; break
-        if found_ng: break
-        for c in p.collections:
-            for ng in c.nodegroups:
-                if self in ng.nodes.values(): found_ng = ng; break
-            if found_ng: break
+        if not found_ng:
+            active_col = get_active_collection(preset)
+            if active_col:
+                for ng in active_col.nodegroups:
+                    if self in ng.nodes.values(): found_ng = ng; break
 
     ng_ptr = bpy.data.node_groups.get(found_ng.group_name) if found_ng else None
     if ng_ptr:
@@ -1128,22 +1173,25 @@ def search_target_node_cb(self, context, edit_text):
 
 def search_menu_items_cb(self, context, edit_text):
     found_inp, found_n, found_ng = None, None, None
-    for p in context.scene.batch_stl_presets:
-        for ng in p.nodegroups:
+    preset = get_active_preset(context.scene)
+
+    # OPTIMIZED: Restrict enum_items search to active contexts only
+    if preset:
+        for ng in preset.nodegroups:
             for n in ng.nodes:
                 for i in n.inputs:
                     if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
                 if found_inp: break
             if found_inp: break
-        if found_inp: break
-        for c in p.collections:
-            for ng in c.nodegroups:
-                for n in ng.nodes:
-                    for i in n.inputs:
-                        if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
+        if not found_inp:
+            active_col = get_active_collection(preset)
+            if active_col:
+                for ng in active_col.nodegroups:
+                    for n in ng.nodes:
+                        for i in n.inputs:
+                            if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
+                        if found_inp: break
                     if found_inp: break
-                if found_inp: break
-            if found_inp: break
 
     items = []
     ng_ptr = bpy.data.node_groups.get(found_ng.group_name) if found_ng else None
@@ -1186,61 +1234,63 @@ class BatchSTLLogLine(bpy.types.PropertyGroup):
 
 def update_val_use_tag(self, context):
     if not self.use_tag and not self.use_dir: self.use_dir = True
+    mark_dirty()
 
 def update_val_use_dir(self, context):
     if not self.use_dir and not self.use_tag: self.use_tag = True
+    mark_dirty()
 
 # These classes define the exact variables Blender will track.
 # bpy.props.FloatProperty is Blender's special way of enforcing a decimal number inside its interface.
 class BatchSTLValue(bpy.types.PropertyGroup):
-    value_bool: bpy.props.BoolProperty(name="Value", default=True)
-    value_int: bpy.props.IntProperty(name="Value", default=0)
-    value_float: bpy.props.FloatProperty(name="Value", default=0.0)
-    value_string: bpy.props.StringProperty(name="Value", default="")
-    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb)
+    value_bool: bpy.props.BoolProperty(name="Value", default=True, update=mark_dirty)
+    value_int: bpy.props.IntProperty(name="Value", default=0, update=mark_dirty)
+    value_float: bpy.props.FloatProperty(name="Value", default=0.0, update=mark_dirty)
+    value_string: bpy.props.StringProperty(name="Value", default="", update=mark_dirty)
+    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=mark_dirty)
 
     use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=update_val_use_tag)
-    tag: bpy.props.StringProperty(name="Tag", default="")
+    tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
     use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=update_val_use_dir)
 
-    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False)
-    sweep_range: bpy.props.StringProperty(name="Sweep Range", default="")
+    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, update=mark_dirty)
+    sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", update=mark_dirty)
 
 # A single variable can be part of an Input, which is part of a Node, which is part of a NodeGroup.
 # 'CollectionProperty' means "create a list of these items".
 class BatchSTLInput(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Input Socket", default="", update=on_input_name_update)
-    override_type: bpy.props.StringProperty(default='FLOAT')
+    override_type: bpy.props.StringProperty(default='FLOAT', update=mark_dirty)
     values: bpy.props.CollectionProperty(type=BatchSTLValue)
 
 class BatchSTLNode(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Target Node", default="", search=search_target_node_cb, description="Select <Modifier Interface> to target the modifier directly")
+    name: bpy.props.StringProperty(name="Target Node", default="", search=search_target_node_cb, update=mark_dirty, description="Select <Modifier Interface> to target the modifier directly")
     inputs: bpy.props.CollectionProperty(type=BatchSTLInput)
 
 class BatchSTLNodeGroup(bpy.types.PropertyGroup):
-    group_name: bpy.props.StringProperty(name="Node Group", default="")
+    group_name: bpy.props.StringProperty(name="Node Group", default="", update=mark_dirty)
     nodes: bpy.props.CollectionProperty(type=BatchSTLNode)
 
 class BatchSTLExcludedObject(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
 
 class BatchSTLCollection(bpy.types.PropertyGroup):
-    collection_name: bpy.props.StringProperty(name="Collection", default="")
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True)
-    tag: bpy.props.StringProperty(name="Tag", default="")
-    sub_path: bpy.props.StringProperty(name="Sub-folder", default="")
-    use_filter: bpy.props.BoolProperty(name="Filter Objects", default=False)
+    collection_name: bpy.props.StringProperty(name="Collection", default="", update=mark_dirty)
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, update=mark_dirty)
+    tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
+    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=mark_dirty)
+    use_filter: bpy.props.BoolProperty(name="Filter Objects", default=False, update=mark_dirty)
     excluded_objects: bpy.props.CollectionProperty(type=BatchSTLExcludedObject)
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
 
 class BatchSTLExportPreset(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Preset Name", default="New Preset")
-    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="")
+    name: bpy.props.StringProperty(name="Preset Name", default="New Preset", update=mark_dirty)
+    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", update=mark_dirty)
     last_export_time: bpy.props.FloatProperty(name="Last Export Time", default=0.0)
 
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
     collections: bpy.props.CollectionProperty(type=BatchSTLCollection)
-    collection_index: bpy.props.IntProperty(name="Collection Index", default=0)
+    collection_index: bpy.props.IntProperty(name="Collection Index", default=0, update=mark_dirty)
 
     is_exporting: bpy.props.BoolProperty(default=False)
     cancel_export: bpy.props.BoolProperty(default=False)
@@ -1279,6 +1329,7 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         with open(self.filepath, 'r') as f: data = json.load(f)
         for p_data in data: paste_preset_from_dict(context.scene.batch_stl_presets.add(), p_data)
+        mark_dirty()
         return {'FINISHED'}
 
 class BATCH_STL_OT_clear_console(bpy.types.Operator):
@@ -1337,6 +1388,7 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
         elif self.action == 'PASTE' and _clipboard.get("preset"): paste_preset_from_dict(lst.add(), _clipboard["preset"]); context.scene.batch_stl_preset_index = len(lst) - 1
 
         if self.action != 'COPY': bpy.ops.ed.undo_push(message="Preset Action")
+        mark_dirty()
         return {'FINISHED'}
 
 class BATCH_STL_OT_collection_actions(bpy.types.Operator):
@@ -1377,6 +1429,7 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
         elif self.action == 'PASTE' and _clipboard.get("collection"): paste_collection_from_dict(lst.add(), _clipboard["collection"]); preset.collection_index = len(lst) - 1
 
         if self.action != 'COPY': bpy.ops.ed.undo_push(message="Collection Action")
+        mark_dirty()
         return {'FINISHED'}
 
 class BATCH_STL_OT_table_action(bpy.types.Operator):
@@ -1501,6 +1554,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                             inp.values.add()
                             added = True
                     if added:
+                        mark_dirty()
                         return {'FINISHED'}
 
             inp = node.inputs.add()
@@ -1585,6 +1639,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
             vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
             if self.v_idx < len(vals) - 1: vals.move(self.v_idx, self.v_idx + 1)
 
+        mark_dirty()
         return {'FINISHED'}
 
 
@@ -1609,6 +1664,8 @@ class BATCH_STL_OT_toggle_exclusion(bpy.types.Operator):
             else:
                 collection.excluded_objects.add().name = self.object_name
                 bpy.ops.ed.undo_push(message=f"Exclude '{self.object_name}' from Export")
+
+        mark_dirty()
         return {'FINISHED'}
 
 class BATCH_STL_OT_toggle_dir_tree(bpy.types.Operator):
@@ -2161,7 +2218,8 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
             return
 
-        metrics = get_cached_metrics(context, active_preset)
+        # OPTIMIZED: UI data explicitly provided by the background UI Timer Cache
+        metrics = _ui_cache.get("metrics", {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0})
 
         layout.separator(factor=0.5)
         m_box = layout.box()
@@ -2190,18 +2248,19 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
                         if scene.batch_stl_ui_exclude:
                             col = filter_box.column(align=True)
-                            for obj in c_ptr.all_objects:
-                                if obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}: continue
-                                is_excl = any(e.name == obj.name for e in active_col.excluded_objects)
+
+                            # OPTIMIZED: Utilizing Pre-Cached objects to prevent all_objects loop in draw thread
+                            for obj_data in _ui_cache.get("active_col_filter_objects", []):
+                                is_excl = obj_data["is_excl"]
                                 icon_btn = 'CHECKBOX_DEHLT' if is_excl else 'CHECKBOX_HLT'
-                                op = col.operator("batch_stl.toggle_exclusion", text=obj.name, icon=icon_btn, depress=not is_excl)
-                                op.object_name = obj.name
+                                op = col.operator("batch_stl.toggle_exclusion", text=obj_data["name"], icon=icon_btn, depress=not is_excl)
+                                op.object_name = obj_data["name"]
 
         layout.separator()
 
         active_col = get_active_collection(active_preset)
         if active_col:
-            col_metrics = get_cached_active_col_metrics(context, active_preset, active_col)
+            col_metrics = _ui_cache.get("active_col_metrics", {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0})
             metric_str = f"{col_metrics['c_name']} | {col_metrics['num_targets']} targets | {col_metrics['total_inputs']} inputs | {col_metrics['num_combos']} combos | {col_metrics['mapping_total_objects']} objects"
             header = layout.row()
             header.label(text=metric_str, icon='MODIFIER')
@@ -2248,7 +2307,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         t_header.label(text="Export Structure & Files", icon='OUTLINER_OB_EMPTY')
 
         if scene.batch_stl_show_tree and active_preset:
-            tree_dict, duplicates = get_cached_tree_dict(context, active_preset)
+            tree_dict, duplicates = _ui_cache.get("tree", ({}, set()))
             if duplicates:
                 warn_box = t_box.box()
                 warn_row = warn_box.row()
@@ -2321,9 +2380,9 @@ def register():
         bpy.utils.register_class(cls)
 
     # Attach our custom variables directly to Blender's Scene object so they are saved per-file.
-    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH")
+    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH", update=mark_dirty)
     bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
-    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0)
+    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0, update=mark_dirty)
     bpy.types.Scene.batch_stl_verbose_console = bpy.props.BoolProperty(name="Verbose Console Output", default=False)
 
     bpy.types.Scene.batch_stl_ui_presets = bpy.props.BoolProperty(default=True)
@@ -2342,10 +2401,22 @@ def register():
     if reset_batch_stl_state not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(reset_batch_stl_state)
 
+    if batch_stl_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(batch_stl_depsgraph_handler)
+
+    if not bpy.app.timers.is_registered(rebuild_ui_cache_if_dirty):
+        bpy.app.timers.register(rebuild_ui_cache_if_dirty)
+
 # Triggers when the user un-checks the add-on box in preferences. It deletes all the data.
 def unregister():
     if reset_batch_stl_state in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(reset_batch_stl_state)
+
+    if batch_stl_depsgraph_handler in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(batch_stl_depsgraph_handler)
+
+    if bpy.app.timers.is_registered(rebuild_ui_cache_if_dirty):
+        bpy.app.timers.unregister(rebuild_ui_cache_if_dirty)
 
     for cls in reversed(classes):
         try: bpy.utils.unregister_class(cls)
