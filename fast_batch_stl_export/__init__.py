@@ -956,14 +956,25 @@ def run_headless_export(preset_index):
                     if bl_obj: active_export_objects.add(bl_obj)
 
     muted_count = 0
+    batch_isolation_map = {} # Tracks modifiers to toggle per-batch to guarantee strict batch isolation
+
     for obj in bpy.context.view_layer.objects:
         if obj not in active_export_objects:
+            # Permanently mute non-export objects
             for mod in getattr(obj, 'modifiers', []):
                 if mod.type == 'NODES' and mod.show_viewport:
                     mod.show_viewport = False
                     muted_count += 1
+        else:
+            # Temporarily mute active export objects, to be unmuted ONLY during their specific batch
+            batch_isolation_map[obj] = []
+            for mod in getattr(obj, 'modifiers', []):
+                if mod.type == 'NODES' and mod.show_viewport:
+                    batch_isolation_map[obj].append(mod)
+                    mod.show_viewport = False
+                    muted_count += 1
 
-    print(f"    ├─ Permanently Muted {muted_count} unused GN modifiers to accelerate Graph evaluation in {time.perf_counter() - t_phase0_start:.4f}s")
+    print(f"    ├─ Muted {muted_count} GN modifiers for strict batch isolation in {time.perf_counter() - t_phase0_start:.4f}s")
 
     execution_batches = {}
 
@@ -1023,6 +1034,13 @@ def run_headless_export(preset_index):
 
         batch_objects = {item[2] for item in batch_items}
         batch_export_targets = batch_items
+
+        # --- STRICT BATCH ISOLATION START ---
+        # Unmute GN Modifiers for ONLY the objects in this specific batch
+        for obj in batch_objects:
+            for mod in batch_isolation_map.get(obj, []):
+                mod.show_viewport = True
+        # ------------------------------------
 
         # This loop walks through every mathematical combination (permutation) we created and runs the export
         for combo_idx, combo in enumerate(combinations):
@@ -1096,6 +1114,13 @@ def run_headless_export(preset_index):
                 revert_overrides(global_states, mod_states, batch_objects)
                 bpy.context.view_layer.update()
                 print(f"  │    │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
+
+        # --- STRICT BATCH ISOLATION END ---
+        # Mute GN Modifiers again so they are ignored by the depsgraph in the next batch
+        for obj in batch_objects:
+            for mod in batch_isolation_map.get(obj, []):
+                mod.show_viewport = False
+        # ----------------------------------
 
         # OPTIMIZED: Moved RAM Purge completely out of permutation loop to run per-batch
         # This tells Blender to take out the garbage (free up unused memory).
@@ -1275,14 +1300,6 @@ def search_menu_items_cb(self, context, edit_text):
 class BatchSTLLogLine(bpy.types.PropertyGroup):
     text: bpy.props.StringProperty()
 
-def update_val_use_tag(self, context):
-    if not self.use_tag and not self.use_dir: self.use_dir = True
-    mark_dirty()
-
-def update_val_use_dir(self, context):
-    if not self.use_dir and not self.use_tag: self.use_tag = True
-    mark_dirty()
-
 # These classes define the exact variables Blender will track.
 # bpy.props.FloatProperty is Blender's special way of enforcing a decimal number inside its interface.
 class BatchSTLValue(bpy.types.PropertyGroup):
@@ -1292,9 +1309,9 @@ class BatchSTLValue(bpy.types.PropertyGroup):
     value_string: bpy.props.StringProperty(name="Value", default="", update=mark_dirty)
     value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=mark_dirty)
 
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=update_val_use_tag)
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=mark_dirty)
     tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
-    use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=update_val_use_dir)
+    use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=mark_dirty)
 
     use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, update=mark_dirty)
     sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", update=mark_dirty)
@@ -1647,7 +1664,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                     val.use_sweep = False
                     if self.shift_pressed:
                         inp_obj = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
-                        if inp_obj.override_type in ['FLOAT', 'INT', 'MENU']:
+                        if inp_obj.override_type in ['FLOAT', 'INT', 'MENU', 'BOOLEAN']:
                             ng_obj = ng_list[self.ng_idx]
                             ng_ptr = bpy.data.node_groups.get(ng_obj.group_name)
                             node_obj = ng_obj.nodes[self.n_idx]
@@ -1662,6 +1679,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                                 if inp_obj.override_type == 'FLOAT': val.value_float = first_val
                                 elif inp_obj.override_type == 'INT': val.value_int = first_val
                                 elif inp_obj.override_type == 'MENU': val.value_menu = str(first_val)
+                                elif inp_obj.override_type == 'BOOLEAN': val.value_bool = bool(first_val)
 
                                 for p_val in parsed_vals[1:]:
                                     new_val = vals.add()
@@ -1669,6 +1687,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                                     if inp_obj.override_type == 'FLOAT': new_val.value_float = p_val
                                     elif inp_obj.override_type == 'INT': new_val.value_int = p_val
                                     elif inp_obj.override_type == 'MENU': new_val.value_menu = str(p_val)
+                                    elif inp_obj.override_type == 'BOOLEAN': new_val.value_bool = bool(p_val)
 
         elif self.action == 'MOVE_GROUP_UP':
             if self.ng_idx > 0: ng_list.move(self.ng_idx, self.ng_idx - 1)
@@ -2211,9 +2230,11 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                             c_val.prop(val, "value_menu", text="")
 
                     c_dir = s_val.row(align=True)
-                    c_dir.prop(val, "use_dir", text="", icon='FILE_FOLDER')
-                    c_dir.prop(val, "use_tag", text="", icon='BOOKMARKS')
-                    c_dir.prop(val, "tag", text="")
+                    is_permutation = len(inp.values) > 1 or any(getattr(v, "use_sweep", False) for v in inp.values)
+                    if is_permutation:
+                        c_dir.prop(val, "use_dir", text="", icon='FILE_FOLDER')
+                        c_dir.prop(val, "use_tag", text="", icon='BOOKMARKS')
+                        c_dir.prop(val, "tag", text="")
 
                     if i_first:
                         if len(node.inputs) > 1:
