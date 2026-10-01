@@ -4,34 +4,44 @@ Architecture: Single-File Monolithic (Optimized for Agentic Environments)
 Data Hierarchy: Preset > Collection > NodeGroup > Node > Input > Value
 """
 
-import os
-import json
-import time
-import itertools
-import threading
-import queue
-import subprocess
-import tempfile
-import sys
-import struct
-import shutil
-import numpy as np
+# ==============================================================================
+# === MODULE IMPORTS ===
+# In Python, 'import' brings in code from other files (libraries) so we don't
+# have to write everything from scratch.
+# ==============================================================================
+import os          # Helps interact with the Operating System (like making folders, joining file paths)
+import json        # Helps read and write data in JSON format (a standard text format for data)
+import time        # Used for keeping track of time, measuring how long things take
+import itertools   # Provides tools for advanced loops (like creating all possible combinations of lists)
+import threading   # Allows the program to run multiple tasks at the same time (in the background)
+import queue       # A thread-safe way to pass messages between different background tasks
+import subprocess  # Allows this Python script to launch other programs (like another instance of Blender)
+import tempfile    # Creates temporary files and folders that get cleaned up later
+import sys         # Interacts with the Python interpreter itself (like forcing the program to exit)
+import struct      # Converts Python values (like floats/ints) into raw binary data bytes
+import shutil      # High-level file operations (like deleting an entire folder with files inside)
+import numpy as np # A math library that handles huge lists of numbers extremely fast using C under the hood
 
-import bpy
-from bpy_extras.io_utils import ExportHelper, ImportHelper
-from bpy.app.handlers import persistent
+import bpy                                 # The main Blender Python API (Application Programming Interface)
+from bpy_extras.io_utils import ExportHelper, ImportHelper # Pre-made Blender tools for file browser windows
+from bpy.app.handlers import persistent    # A "decorator" that tells Blender to keep a function active even after loading a new file
 
 
 # ==============================================================================
 # === [ 1. GLOBALS & STATE ] ===
+# Globals are variables that exist outside of any specific function.
+# They hold "state" (memory) while the program runs. Dictionaries ({}) hold key-value pairs.
 # ==============================================================================
 
+# Stores copied presets and collections so the user can paste them elsewhere in the UI.
 _clipboard = {
     "preset": None,
     "collection": None,
     "nodegroup": None
 }
 
+# Caches (temporarily saves) heavy calculations for the UI.
+# If the UI asks for data 60 times a second, we just give it the cached data to prevent lag.
 _ui_cache = {
     "metrics": {"ptr": None, "time": 0, "data": {}},
     "tree": {"ptr": None, "time": 0, "data": ({}, set())},
@@ -41,19 +51,25 @@ _ui_cache = {
 
 # ==============================================================================
 # === [ 2. CORE LOGIC & ENGINE ] ===
+# This section contains standard Python functions (defined with 'def') that do the heavy lifting.
 # ==============================================================================
 
 # --- STATE-HASH & OVERRIDE LOGIC ---
+
+# Checks if a Blender "Collection" (like a folder for 3D objects) is hidden or excluded from the scene.
 def is_collection_excluded(context, target_collection):
     if not target_collection:
-        return True
+        return True # If it doesn't exist, treat it as excluded.
 
+    # These boolean (True/False) variables track what we find as we search.
     found_any_visible = False
     found_any = False
 
+    # A nested function (a function inside a function). It can access variables from the outer function.
+    # This is a recursive function, meaning it calls itself to dig deeper into folders within folders.
     def traverse(layer_collection, parent_excluded=False):
-        nonlocal found_any_visible, found_any
-        if found_any_visible: return  # OPTIMIZED: Early exit
+        nonlocal found_any_visible, found_any # 'nonlocal' lets us modify the variables defined above this nested function.
+        if found_any_visible: return  # OPTIMIZED: Early exit. If we already found a visible one, stop searching.
 
         current_excluded = parent_excluded or layer_collection.exclude
 
@@ -63,27 +79,33 @@ def is_collection_excluded(context, target_collection):
                 found_any_visible = True
                 return
 
+        # Loop through all child collections (sub-folders) and run this function on them too.
         for child in layer_collection.children:
             traverse(child, current_excluded)
             if found_any_visible: return
 
-    traverse(context.view_layer.layer_collection)
+    traverse(context.view_layer.layer_collection) # Start the search at the very top of the scene
 
     if not found_any:
         return True
-    return not found_any_visible
+    return not found_any_visible # Returns True if excluded, False if visible.
 
+# Finds the unique internal ID name of a socket (input dot) on a Geometry Nodes modifier.
 def get_modifier_socket_identifier(node_group, socket_name):
+    # 'hasattr' checks if an object has a specific property (attribute) without crashing if it doesn't.
     if hasattr(node_group, "interface"):
         for item in node_group.interface.items_tree:
+            # We look for a socket that matches the name the user wants to change.
             if getattr(item, "item_type", "") == 'SOCKET' and item.name == socket_name:
                 return item.identifier
     else:
+        # Fallback for older versions of Blender that used a different property structure.
         for inp in node_group.inputs:
             if inp.name == socket_name:
                 return inp.identifier
     return None
 
+# Retrieves the default value of a modifier socket so we can reset it later.
 def get_modifier_socket_default(node_group, socket_name):
     if hasattr(node_group, "interface"):
         for item in node_group.interface.items_tree:
@@ -95,26 +117,33 @@ def get_modifier_socket_default(node_group, socket_name):
                 return getattr(inp, "default_value", None)
     return None
 
+# Tries multiple ways to get the current input value of a modifier.
+# Blender's API can be picky, so the 'try...except Exception: pass' block attempts an action,
+# and if an error happens, it just ignores the error and tries the next method.
 def get_modifier_input(mod, ident):
     try:
         if mod.is_property_set(ident): return mod[ident], True
     except Exception: pass
+
     if hasattr(mod, "properties") and hasattr(mod.properties, "inputs"):
         prop_input = getattr(mod.properties.inputs, ident, None)
         if prop_input is not None and hasattr(prop_input, "value"):
             return prop_input.value, True
     return None, False
 
+# Overwrites a Geometry Node modifier input with our custom batch value.
 def set_modifier_input(mod, ident, value):
     try:
         mod[ident] = value
         return
     except (TypeError, Exception): pass
+
     if hasattr(mod, "properties") and hasattr(mod.properties, "inputs"):
         prop_input = getattr(mod.properties.inputs, ident, None)
         if prop_input is not None and hasattr(prop_input, "value"):
             prop_input.value = value
 
+# Removes our temporary batch value and restores the default state.
 def unset_modifier_input(mod, ident, default_val):
     try:
         mod.property_unset(ident)
@@ -125,6 +154,7 @@ def unset_modifier_input(mod, ident, default_val):
         if prop_input is not None and hasattr(prop_input, "value") and default_val is not None:
             prop_input.value = default_val
 
+# Looks at the data type (string, int, float, boolean) and grabs the correct value property.
 def get_input_value(inp):
     if inp.override_type == 'BOOLEAN': return inp.value_bool
     elif inp.override_type == 'INT': return inp.value_int
@@ -133,6 +163,7 @@ def get_input_value(inp):
     elif inp.override_type == 'MENU': return inp.value_menu
     return None
 
+# Generates a unique "fingerprint" (signature) of all overrides so we can group similar tasks together.
 def get_override_signature(overrides):
     sig = []
     for ovr in overrides:
@@ -141,13 +172,18 @@ def get_override_signature(overrides):
         node_name = ovr.node_name
         inputs_sig = []
         for inp in ovr.inputs:
+            # We store the data as a 'tuple' (an unchangeable list in parentheses). Tuples are fast to compare.
             inputs_sig.append((inp.input_name, inp.override_type, get_input_value(inp)))
         sig.append((target, pg_name, node_name, tuple(inputs_sig)))
     return tuple(sig)
 
 # --- PERMUTATION ENGINE (Adapters) ---
+# Classes are blueprints for creating objects. These "Mock" classes create fake, temporary copies
+# of Blender properties so we can do math on them without altering the user's actual saved data.
 class TempMockInput:
+    # __init__ is the constructor. It runs automatically when you create a new TempMockInput object.
     def __init__(self, name, o_type, val_obj):
+        # 'self' refers to the specific object being created right now.
         self.input_name = name
         self.override_type = o_type
         self.use_tag = val_obj.use_tag
@@ -156,6 +192,8 @@ class TempMockInput:
         self.use_sweep = val_obj.use_sweep
         self.sweep_range = val_obj.sweep_range
         self._val_obj = val_obj
+
+    # @property makes a function act like a regular variable. You can say 'obj.value_bool' instead of 'obj.value_bool()'.
     @property
     def value_bool(self): return self._val_obj.value_bool
     @property
@@ -174,6 +212,7 @@ class TempMockOverride:
         self.node_name = node_name
         self.inputs = temp_inputs
 
+# Grabs every override requested by the user and flattens them into one big list.
 def get_flat_overrides(nodegroups):
     overrides = []
     for ng in nodegroups:
@@ -218,10 +257,13 @@ class MockOverride:
         self.node_name = node_name
         self.inputs = inputs
 
+# If the user sets a "Sweep" (e.g., test sizes from 1 to 10), this parses their text string into actual numbers.
 def parse_sweep_values(ovr, inp):
     if inp.override_type == 'BOOLEAN': return [True, False]
     elif inp.override_type == 'STRING':
         if not inp.sweep_range: return [""]
+        # .split(',') chops a string into a list wherever there is a comma.
+        # [s.strip() for s in ...] is a List Comprehension: a fast way to loop and clean spaces off strings in one line.
         return [s.strip() for s in inp.sweep_range.split(',') if s.strip()]
     elif inp.override_type in ['INT', 'FLOAT']:
         vals = []
@@ -235,6 +277,7 @@ def parse_sweep_values(ovr, inp):
                     v = start + i * step
                     vals.append(int(v) if inp.override_type == 'INT' else v)
             except ValueError:
+                # 'ValueError' happens if they typed letters instead of numbers. We just default to 0 if that happens.
                 try: vals.append(int(parts[0]) if inp.override_type == 'INT' else float(parts[0]))
                 except ValueError: vals.append(0 if inp.override_type == 'INT' else 0.0)
         else:
@@ -243,6 +286,7 @@ def parse_sweep_values(ovr, inp):
         return vals
     elif inp.override_type == 'MENU':
         items = []
+        # If it's a dropdown menu, we dig through Blender's internal node links to find all the valid dropdown choices.
         if ovr.parent_group_ptr:
             if ovr.override_target == 'MODIFIER':
                 for node in ovr.parent_group_ptr.nodes:
@@ -273,6 +317,8 @@ def parse_sweep_values(ovr, inp):
         return items if items else [""]
     return []
 
+# Combines different variable sweeps together using `itertools.product`.
+# If you have sizes [1, 2] and colors [Red, Blue], it creates [[1, Red], [1, Blue], [2, Red], [2, Blue]].
 def generate_override_combinations(overrides):
     grouped_inputs = {}
     for ovr in overrides:
@@ -304,7 +350,7 @@ def generate_override_combinations(overrides):
             pools.append(list(value_groups.values()))
 
     if not pools: return [[]]
-    combinations = list(itertools.product(*pools))
+    combinations = list(itertools.product(*pools)) # Mathematically crosses the lists to get every combination
 
     flattened = []
     for combo in combinations:
@@ -324,12 +370,14 @@ def reconstruct_overrides_for_combo(combo):
         active_overrides.append(MockOverride(target, group_ptr, node_name, inputs))
     return active_overrides
 
+# Modifies Blender's live scene by applying the parameters we generated above.
 def apply_overrides(overrides, target_objects, dry_run=False):
     global_states = []
     mod_states = []
-    trees_to_update = set()
+    trees_to_update = set() # A 'set' is like a list, but guarantees every item is unique.
 
     for override in overrides:
+        # If we are changing an internal node inside the node graph...
         if override.override_target == 'NODE' and override.parent_group_ptr and override.node_name:
             parent_tree = override.parent_group_ptr
             n_name = override.node_name.split(" [")[0].strip()
@@ -338,6 +386,7 @@ def apply_overrides(overrides, target_objects, dry_run=False):
             for inp in override.inputs:
                 socket = target_node.inputs.get(inp.input_name)
                 if not socket: continue
+                # We save the original state (what was connected to the socket) so we can put it back later.
                 link_from = socket.links[0].from_socket if socket.is_linked else None
                 global_states.append(('SOCKET', socket, socket.default_value, link_from, parent_tree))
                 if not dry_run:
@@ -346,6 +395,7 @@ def apply_overrides(overrides, target_objects, dry_run=False):
                     if val is not None: socket.default_value = val
             if not dry_run: trees_to_update.add(parent_tree)
 
+        # If we are just changing the modifier sliders on the side menu...
         elif override.override_target == 'MODIFIER' and override.parent_group_ptr:
             for inp in override.inputs:
                 ident = get_modifier_socket_identifier(override.parent_group_ptr, inp.input_name)
@@ -361,10 +411,12 @@ def apply_overrides(overrides, target_objects, dry_run=False):
                             if not dry_run: set_modifier_input(mod, ident, val)
 
     if not dry_run:
+        # 'update_tag()' tells Blender that data changed and it needs to recalculate the 3D models before exporting.
         for tree in trees_to_update: tree.update_tag()
         for obj in target_objects: obj.update_tag()
     return global_states, mod_states
 
+# Takes the original states we saved in `apply_overrides` and puts Blender exactly back how we found it.
 def revert_overrides(global_states, mod_states, target_objects):
     for mod, ident, is_set, orig_val, default_val in mod_states:
         try:
@@ -379,7 +431,7 @@ def revert_overrides(global_states, mod_states, target_objects):
                 socket.default_value = original_val
                 if link_from:
                     already_linked = any(l.from_socket == link_from for l in socket.links)
-                    if not already_linked: parent_tree.links.new(link_from, socket)
+                    if not already_linked: parent_tree.links.new(link_from, socket) # reconnect wires
                 trees_to_update.add(parent_tree)
             except Exception: pass
     for tree in trees_to_update:
@@ -404,24 +456,30 @@ def log_to_console(preset, text):
     log = preset.console_logs.add()
     log.text = text
     preset.console_index = len(preset.console_logs) - 1
+    # Keep the log list small so we don't run out of memory.
     if len(preset.console_logs) > 300:
-        preset.console_logs.remove(0)
+        preset.console_logs.remove(0) # delete oldest
         preset.console_index = len(preset.console_logs) - 1
 
 # --- BINARY STL WRITER ---
+# This is a highly optimized custom exporter. Standard Blender Python looping is slow.
+# This method uses 'numpy' to calculate all vertices and triangles at the same time in memory.
 def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
-    t_start = time.perf_counter()
-    mesh.calc_loop_triangles()
+    t_start = time.perf_counter() # Marks the starting time
+    mesh.calc_loop_triangles() # Asks Blender to convert any squares (quads) to triangles
     num_tris = len(mesh.loop_triangles)
     if num_tris == 0: return
 
+    # Creates an empty block of raw memory the exact size we need for all our 3D points (vertices).
     verts = np.empty((len(mesh.vertices), 3), dtype=np.float32)
+    # Blender's 'foreach_get' pushes all its internal C-data instantly into our numpy array. Super fast!
     mesh.vertices.foreach_get("co", verts.ravel())
 
     # OPTIMIZED: 3x3 Multiplication avoids memory allocation of homogenous N x 4 array
+    # Matrix math applies the object's position, rotation, and scale to the raw vertex points.
     mat_3x3 = np.array(matrix_world.to_3x3(), dtype=np.float32)
     trans = np.array(matrix_world.translation, dtype=np.float32)
-    verts = np.dot(verts, mat_3x3.T) + trans
+    verts = np.dot(verts, mat_3x3.T) + trans # dot-product performs multiplication across millions of points at once
 
     tri_verts = np.empty((num_tris, 3), dtype=np.int32)
     mesh.loop_triangles.foreach_get("vertices", tri_verts.ravel())
@@ -433,10 +491,12 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
     tri_normals = np.dot(tri_normals, mat_norm.T)
 
     # OPTIMIZED: Manual normalization scales faster than np.linalg.norm overhead
+    # Math to make sure every normal vector has a length of exactly 1.0 (required by the STL format).
     norms = np.sqrt(np.sum(tri_normals**2, axis=1, keepdims=True))
     norms[norms == 0] = 1.0
     tri_normals /= norms
 
+    # Define the exact byte-structure an STL file expects for every triangle.
     stl_dtype = np.dtype([
         ('normals', np.float32, (3,)), ('v0', np.float32, (3,)),
         ('v1', np.float32, (3,)), ('v2', np.float32, (3,)),
@@ -444,6 +504,7 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
     ])
     data = np.zeros(num_tris, dtype=stl_dtype)
     data['normals'] = tri_normals
+    # Uses 'fancy indexing' in numpy to map the final positions to the exact triangle corners (v0, v1, v2)
     data['v0'] = verts[tri_verts[:, 0]]
     data['v1'] = verts[tri_verts[:, 1]]
     data['v2'] = verts[tri_verts[:, 2]]
@@ -453,9 +514,13 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
         mb_size = (84 + (num_tris * 50)) / (1024 * 1024)
         print(f"  │         │    ├─ STL Memory Map: {num_tris} Tris | {mb_size:.2f} MB | Matrix T-Form: {t_format-t_start:.4f}s")
 
+    # Opens the file in 'wb' (Write Binary) mode.
     with open(filepath, 'wb') as f:
+        # Standard STL header is exactly 80 bytes.
         f.write(b'Batch STL Fast Export' + b'\x00' * 59)
+        # Writes a 4-byte unsigned integer ('<I') representing how many triangles we have.
         f.write(struct.pack('<I', num_tris))
+        # Dumps the entire numpy array into the file instantly as raw bytes.
         f.write(data.tobytes())
 
     t_write = time.perf_counter()
@@ -463,6 +528,8 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
         print(f"  │         │    ├─ Disk I/O Write: {t_write-t_format:.4f}s | Path: {os.path.basename(filepath)}")
 
 # --- JSON UTILS ---
+# The functions below convert complex Blender property collections into plain Python Dictionaries.
+# This makes it easy to save the user's setup to a standard .json file so they can share it or back it up.
 def copy_val_to_dict(v):
     return {
         "value_bool": v.value_bool, "value_int": v.value_int, "value_float": v.value_float,
@@ -496,8 +563,9 @@ def copy_preset_to_dict(src):
         "collections": [copy_collection_to_dict(c) for c in src.collections]
     }
 
+# The Paste functions do the exact reverse. They read a JSON dictionary and assign the values back to Blender.
 def paste_val_from_dict(new_v, data):
-    for k, v in data.items(): setattr(new_v, k, v)
+    for k, v in data.items(): setattr(new_v, k, v) # 'setattr' assigns the variable dynamically using the text name 'k'.
 
 def paste_input_from_dict(new_i, data):
     new_i.name = data["name"]
@@ -529,12 +597,16 @@ def paste_preset_from_dict(new_p, data):
 
 
 # --- UI CACHE LOGIC ---
+# Blender re-draws its User Interface panels continuously. If we calculate file paths
+# and object counts on every frame, Blender will freeze. We "cache" (save) the result for a quarter of a second.
 def get_cached_metrics(context, preset):
     current_time = time.time()
     ptr = preset.as_pointer()
+    # Check if the cache is younger than 0.25 seconds. If yes, just return the saved data immediately.
     if _ui_cache["metrics"]["ptr"] == ptr and (current_time - _ui_cache["metrics"]["time"] < 0.25):
         return _ui_cache["metrics"]["data"]
 
+    # Heavy calculations run here only if the cache expired...
     total_collections = len(preset.collections)
     total_objects = 0
     total_preset_combos = 0
@@ -558,6 +630,7 @@ def get_cached_metrics(context, preset):
         "total_preset_combos": total_preset_combos,
         "total_objects": total_objects
     }
+    # Save the new calculations back into the dictionary for next time
     _ui_cache["metrics"]["ptr"] = ptr
     _ui_cache["metrics"]["time"] = current_time
     _ui_cache["metrics"]["data"] = data
@@ -620,6 +693,8 @@ def get_cached_tree_dict(context, preset):
 
 
 # --- TREE VISUALIZER LOGIC ---
+# This builds an artificial file-folder structure in memory so the script can
+# visually show you what files will be created and where, before you actually click export.
 def build_tree_dict(context, preset):
     scene = context.scene
     root_name = bpy.path.abspath(scene.batch_stl_root_dir) if scene.batch_stl_root_dir else "//"
@@ -659,6 +734,7 @@ def build_tree_dict(context, preset):
         combinations = generate_override_combinations(all_overrides)
 
         # OPTIMIZED: Pre-filter clean_name resolution directly in loop definition
+        # bpy.path.clean_name() makes sure object names don't contain illegal characters for filenames (like / or \).
         valid_objs = []
         if c_ptr:
             excluded_names = {e.name for e in c.excluded_objects} if getattr(c, "use_filter", False) else set()
@@ -679,6 +755,7 @@ def build_tree_dict(context, preset):
                 param_key = (ovr.override_target, ovr.node_name, inp.input_name)
                 if param_key not in processed_params:
                     val = get_input_value(inp)
+                    # Formats floats nicely. The ":g" string format removes trailing zeros (e.g., 2.0 -> 2).
                     val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
                     if inp.tag:
                         if inp.tag.startswith("_"): naming_str = val_str + inp.tag
@@ -702,17 +779,20 @@ def build_tree_dict(context, preset):
             full_dir_parts = [preset.preset_prefix] if preset.preset_prefix else []
             full_dir_parts.extend(c_root_path)
             full_dir_parts.extend(combo_subpath)
+            # os.path.normpath cleans up messy slashes like 'folder//subfolder/./file' to 'folder/subfolder/file'.
             dir_path_str = os.path.normpath(os.path.join(root_name, *full_dir_parts))
 
             for obj, safe_name in valid_objs:
                 filename = f"{safe_name}{final_tag}.stl"
                 combo_root['_files'].append(filename)
                 full_path = os.path.join(dir_path_str, filename)
+                # If a file path is created twice, we add it to 'duplicates' so we can warn the user.
                 if full_path in all_filepaths: duplicates.add(full_path)
                 else: all_filepaths.add(full_path)
 
     return {root_name: tree}, duplicates
 
+# This takes the dictionary `build_tree_dict` generated and draws it nicely in the Blender UI panel.
 def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplicates=None, actual_path=""):
     if toggled_list is None:
         try:
@@ -750,6 +830,7 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
         row.scale_y = 0.4
         row.label(text=str(k))
         if not is_collapsed and isinstance(tree_node[k], dict):
+            # Recursion again! It calls itself to draw sub-folders.
             draw_tree_dict(box, tree_node[k], dir_path, toggled_list, duplicates, next_actual)
 
     for f in files:
@@ -762,18 +843,21 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
 
         f_path = os.path.join(actual_path, f) if actual_path else f
         if f_path in duplicates:
-            row.alert = True
+            row.alert = True # Turns the text red to alert the user of an issue.
 
         row.label(text=str(f))
 
 # --- HEADLESS EXPORT EXECUTION ROUTINE ---
+# "Headless" means running the software without a screen or graphical window.
+# This is used for massive background exports, so the user can keep working on other things.
 def run_headless_export(preset_index):
     total_time_start = time.perf_counter()
     scene = bpy.context.scene
 
+    # Error handling to make sure the program exits safely if bad data is given.
     if preset_index < 0 or preset_index >= len(scene.batch_stl_presets):
         print("ERROR: Invalid preset index")
-        sys.exit(1)
+        sys.exit(1) # system exit code 1 means an error occurred
 
     preset = scene.batch_stl_presets[preset_index]
     root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
@@ -784,6 +868,8 @@ def run_headless_export(preset_index):
     print("\n  [Phase 0] Aggressive Global Depsgraph Culling...")
     t_phase0_start = time.perf_counter()
 
+    # The 'Depsgraph' is Blender's internal system that tracks what depends on what.
+    # Here, we figure out what isn't exporting, and mute it so the computer doesn't waste time thinking about it.
     active_export_objects = set()
     for c in preset.collections:
         c_ptr = bpy.data.collections.get(c.collection_name)
@@ -809,13 +895,14 @@ def run_headless_export(preset_index):
         if is_collection_excluded(bpy.context, c_ptr): continue
         sig_local = get_override_signature(get_flat_overrides(c.nodegroups))
         full_sig = sig_pinned + sig_local
+        # Groups items with identical required steps together in 'execution_batches'
         if full_sig not in execution_batches: execution_batches[full_sig] = []
         execution_batches[full_sig].append(c)
 
     if not execution_batches:
         print("  └─ No active collections to export.")
-        print("BATCH_STL_DONE", flush=True)
-        sys.exit(0)
+        print("BATCH_STL_DONE", flush=True) # flush=True forces Python to print immediately, without waiting
+        sys.exit(0) # Exit code 0 means successful completion
 
     total_operations = 0
     for signature, c_in_batch in execution_batches.items():
@@ -859,7 +946,7 @@ def run_headless_export(preset_index):
         batch_objects = set()
         batch_export_targets = []
 
-        # OPTIMIZED: Pre-calculated Export Objects to prevent querying c_ptr.all_objects per permutation
+        # OPTIMIZED: Pre-calculated Export Objects to prevent querying c_ptr.all_objects inside the permutation loop over and over
         for m in c_in_batch:
             m_ptr = bpy.data.collections.get(m.collection_name)
             batch_objects.update(m_ptr.all_objects)
@@ -872,6 +959,7 @@ def run_headless_export(preset_index):
                         valid_objs.append((obj, bpy.path.clean_name(obj.name)))
             batch_export_targets.append((m, valid_objs))
 
+        # This loop walks through every mathematical combination (permutation) we created and runs the export
         for combo_idx, combo in enumerate(combinations):
             print(f"  │    ├─ Permutation {combo_idx + 1}/{len(combinations)}")
             combo_suffix = ""
@@ -897,6 +985,7 @@ def run_headless_export(preset_index):
             global_states, mod_states = [], []
 
             try:
+                # Apply the current setup iteration and ask Blender to evaluate what the 3D scene looks like now
                 active_overrides = reconstruct_overrides_for_combo(combo)
                 global_states, mod_states = apply_overrides(active_overrides, batch_objects)
                 bpy.context.view_layer.update()
@@ -905,12 +994,12 @@ def run_headless_export(preset_index):
 
                 for c, valid_objs in batch_export_targets:
                     out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path, combo_subpath))
-                    os.makedirs(out_dir, exist_ok=True)
+                    os.makedirs(out_dir, exist_ok=True) # Makes the folder safely if it doesn't already exist
                     print(f"  │    │    ├─ Exporting: {c.collection_name}{' ['+c.tag+']' if c.tag else ''}")
 
                     for obj, safe_name in valid_objs:
                         t_eval = time.perf_counter()
-                        obj_eval = obj.evaluated_get(depsgraph)
+                        obj_eval = obj.evaluated_get(depsgraph) # Asks Blender to resolve all modifiers to get the final mesh
                         try: mesh = obj_eval.to_mesh()
                         except RuntimeError: mesh = None
                         print(f"  │         ├─ Evaluated Mesh [{obj.name}]: {time.perf_counter() - t_eval:.4f}s")
@@ -919,18 +1008,22 @@ def run_headless_export(preset_index):
                             base_tag = c.tag if getattr(c, "use_tag", False) and c.tag else ""
                             final_tag = base_tag + combo_suffix
                             filepath = os.path.join(out_dir, f"{safe_name}{final_tag}.stl")
+                            # Our custom fast function is called right here!
                             write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=True)
-                            obj_eval.to_mesh_clear()
+                            obj_eval.to_mesh_clear() # Very important to throw away data so we don't leak memory.
                             current_op_step += 1
                             print(f"BATCH_STL_PROGRESS:{current_op_step}", flush=True)
 
             finally:
+                # A 'finally' block *always* executes, even if the 'try' block crashed.
+                # This guarantees we don't leave Blender broken after an error.
                 t_rev = time.perf_counter()
                 revert_overrides(global_states, mod_states, batch_objects)
                 bpy.context.view_layer.update()
                 print(f"  │    │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
 
         # OPTIMIZED: Moved RAM Purge completely out of permutation loop to run per-batch
+        # This tells Blender to take out the garbage (free up unused memory).
         t_purge = time.perf_counter()
         bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
         print(f"  │    ├─ Batch RAM Purge: {time.perf_counter() - t_purge:.4f}s")
@@ -945,8 +1038,12 @@ def run_headless_export(preset_index):
 
 # ==============================================================================
 # === [ 3. PROPERTY GROUPS ] ===
+# PropertyGroups are classes provided by Blender. When you inherit from them
+# (e.g., class Name(bpy.types.PropertyGroup):), Blender knows it should save these
+# variables inside your .blend file automatically.
 # ==============================================================================
 
+# Guesses the data type from the text name or socket type.
 def infer_input_type(group_ptr, node_name, input_name):
     if not group_ptr or not input_name: return 'FLOAT'
     if not node_name or node_name == "<Modifier Interface>":
@@ -979,6 +1076,7 @@ def infer_input_type(group_ptr, node_name, input_name):
             elif s_type == 'MENU': return 'MENU'
     return 'FLOAT'
 
+# Callback function (event listener) that fires whenever an input name is updated by the user in the UI.
 def on_input_name_update(self, context):
     try:
         found_ng, found_node = None, None
@@ -1001,6 +1099,7 @@ def on_input_name_update(self, context):
             for v in self.values: v.use_sweep = False
     except Exception: pass
 
+# Creates the dynamic list of search results when you type in a Node field.
 def search_target_node_cb(self, context, edit_text):
     if edit_text == self.name: edit_text = ""
     res = ["<Modifier Interface>"]
@@ -1091,6 +1190,8 @@ def update_val_use_tag(self, context):
 def update_val_use_dir(self, context):
     if not self.use_dir and not self.use_tag: self.use_tag = True
 
+# These classes define the exact variables Blender will track.
+# bpy.props.FloatProperty is Blender's special way of enforcing a decimal number inside its interface.
 class BatchSTLValue(bpy.types.PropertyGroup):
     value_bool: bpy.props.BoolProperty(name="Value", default=True)
     value_int: bpy.props.IntProperty(name="Value", default=0)
@@ -1105,6 +1206,8 @@ class BatchSTLValue(bpy.types.PropertyGroup):
     use_sweep: bpy.props.BoolProperty(name="Sweep", default=False)
     sweep_range: bpy.props.StringProperty(name="Sweep Range", default="")
 
+# A single variable can be part of an Input, which is part of a Node, which is part of a NodeGroup.
+# 'CollectionProperty' means "create a list of these items".
 class BatchSTLInput(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Input Socket", default="", update=on_input_name_update)
     override_type: bpy.props.StringProperty(default='FLOAT')
@@ -1149,24 +1252,27 @@ class BatchSTLExportPreset(bpy.types.PropertyGroup):
 
 # ==============================================================================
 # === [ 4. OPERATORS ] ===
+# Operators in Blender represent "actions". When you click a button in Blender,
+# it usually triggers an Operator class, which runs its 'execute()' function.
 # ==============================================================================
 
 class BATCH_STL_OT_export_presets_json(bpy.types.Operator, ExportHelper):
-    bl_idname = "batch_stl.export_presets_json"
-    bl_label = "Export JSON"
+    bl_idname = "batch_stl.export_presets_json" # The internal ID used by Blender to call this
+    bl_label = "Export JSON"                    # The readable name on the button
     bl_description = "Export all presets to a JSON file"
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
     def execute(self, context):
+        # Open file in 'w' (write) mode, then convert Blender properties to a dictionary and save as JSON.
         with open(self.filepath, 'w') as f: json.dump([copy_preset_to_dict(p) for p in context.scene.batch_stl_presets], f, indent=4)
-        return {'FINISHED'}
+        return {'FINISHED'} # Operators must return a dictionary telling Blender what happened
 
 class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     bl_idname = "batch_stl.import_presets_json"
     bl_label = "Import JSON"
     bl_description = "Import presets from a JSON file"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {'REGISTER', 'UNDO'} # Telling Blender the user is allowed to hit Ctrl+Z on this action.
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
@@ -1185,15 +1291,19 @@ class BATCH_STL_OT_clear_console(bpy.types.Operator):
         if preset: preset.console_logs.clear()
         return {'FINISHED'}
 
+# A multi-purpose operator that can handle moving lists up, down, deleting, and copying.
 class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     bl_idname = "batch_stl.preset_actions"
     bl_label = "Preset Actions"
     bl_options = {'REGISTER', 'INTERNAL'}
+
+    # We pass an 'action' string to this operator when we click the button so it knows which branch to run.
     action: bpy.props.EnumProperty(items=(('ADD', "", ""), ('REMOVE', "", ""), ('UP', "", ""), ('DOWN', "", ""), ('COPY', "", ""), ('PASTE', "", "")))
     shift_pressed: bpy.props.BoolProperty(options={'HIDDEN', 'SKIP_SAVE'}, default=False)
 
-    @classmethod
+    @classmethod # A classmethod belongs to the class itself, not a specific instance.
     def description(cls, context, properties):
+        # Dynamic hover tooltips based on what action is selected!
         if properties.action == 'ADD': return "Create a new preset"
         elif properties.action == 'REMOVE': return "Remove the active preset"
         elif properties.action == 'UP': return "Move preset up (Shift-Click: Move to top)"
@@ -1202,6 +1312,7 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
         elif properties.action == 'PASTE': return "Paste preset from clipboard"
         return "Preset Actions"
 
+    # 'invoke' intercepts the button click *before* 'execute', allowing us to check things like whether the user held down Shift.
     def invoke(self, context, event):
         self.shift_pressed = event.shift
         return self.execute(context)
@@ -1209,6 +1320,8 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     def execute(self, context):
         lst = context.scene.batch_stl_presets
         idx = context.scene.batch_stl_preset_index
+
+        # Based on the action provided, modify the lists inside Blender.
         if self.action == 'ADD': lst.add(); context.scene.batch_stl_preset_index = len(lst) - 1
         elif self.action == 'REMOVE' and lst:
             if not lst[idx].is_exporting:
@@ -1227,6 +1340,7 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
         return {'FINISHED'}
 
 class BATCH_STL_OT_collection_actions(bpy.types.Operator):
+    # (Similar layout to preset_actions, but affects collections instead).
     bl_idname = "batch_stl.collection_actions"
     bl_label = "Collection Actions"
     bl_options = {'REGISTER', 'INTERNAL'}
@@ -1270,6 +1384,8 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
     bl_label = "Table Action"
     bl_options = {'REGISTER', 'UNDO'}
 
+    # Operators can have variables passed into them to specify their target!
+    # By taking indices for group (ng), node (n), input (i) and value (v), one operator controls the entire table.
     action: bpy.props.StringProperty()
     is_pinned: bpy.props.BoolProperty()
     ng_idx: bpy.props.IntProperty(default=-1)
@@ -1280,6 +1396,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
 
     @classmethod
     def description(cls, context, properties):
+        # A very large dynamic tooltip generator
         action = properties.action
         if action == 'ADD_GROUP': return "Add a new Node Group override"
         elif action == 'DEL_GROUP': return "Delete this Node Group override"
@@ -1316,6 +1433,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
 
         ng_list = preset.nodegroups if self.is_pinned else get_active_collection(preset).nodegroups
 
+        # Big branching tree to modify the data arrays properly based on user clicking '+' or '-' icons
         if self.action == 'ADD_GROUP':
             ng = ng_list.add()
             node = ng.nodes.add()
@@ -1339,7 +1457,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                     paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
                     ng_list.remove(self.ng_idx)
         elif self.action == 'COPY_GROUP':
-            global _clipboard
+            global _clipboard # Must define global if we intend to change a variable declared outside this scope.
             _clipboard["nodegroup"] = copy_ng_to_dict(ng_list[self.ng_idx])
         elif self.action == 'PASTE_GROUP':
             if _clipboard.get("nodegroup"):
@@ -1358,6 +1476,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
             node = ng.nodes[self.n_idx]
             ng_ptr = bpy.data.node_groups.get(ng.group_name)
 
+            # Auto-populates all available inputs automatically if the user holds SHIFT
             if self.shift_pressed and ng_ptr:
                 is_mod = not node.name or node.name == "<Modifier Interface>"
                 source_inputs = []
@@ -1531,6 +1650,11 @@ class BATCH_STL_OT_cancel_export(bpy.types.Operator):
             preset.console_index = len(preset.console_logs) - 1
         return {'FINISHED'}
 
+# -------------------------------------------------------------------------
+# Modal Operator: This is the engine for the actual export.
+# Normal operators freeze Blender while running. 'Modal' operators keep running
+# continuously in the background, listening to a timer or mouse events.
+# -------------------------------------------------------------------------
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
     bl_label = "Export"
@@ -1540,6 +1664,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
+        # Poll prevents the user from clicking the button if it shouldn't be active (e.g., if there are 0 presets)
         return len(context.scene.batch_stl_presets) > 0
 
     def invoke(self, context, event):
@@ -1556,7 +1681,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
         if self.preset.is_exporting: return {'CANCELLED'}
         if not scene.batch_stl_root_dir:
-            self.report({'ERROR'}, "Missing Root Directory")
+            self.report({'ERROR'}, "Missing Root Directory") # Shows error popups at the bottom of Blender
             return {"CANCELLED"}
 
         self.preset.console_logs.clear()
@@ -1565,6 +1690,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         has_overrides = bool(self.preset.nodegroups) or any(bool(c.nodegroups) for c in self.preset.collections)
         verbose = scene.batch_stl_verbose_console
 
+        # If there are no complex modifications needed, just export synchronously (freeze Blender for a moment)
         if not has_overrides:
             root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
             if self.preset.preset_prefix:
@@ -1580,7 +1706,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                     if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
                         if obj.name not in excluded_names: total_objs += 1
 
-            context.window_manager.progress_begin(0, max(1, total_objs))
+            context.window_manager.progress_begin(0, max(1, total_objs)) # Shows progress bar on bottom cursor
             depsgraph = context.evaluated_depsgraph_get()
             exported_count = 0
 
@@ -1595,7 +1721,6 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
                 excluded_names = {e.name for e in c.excluded_objects} if c.use_filter else set()
 
-                # OPTIMIZED: Pre-filtering to avoid redundant loop evaluations
                 valid_objs = []
                 for obj in c_ptr.all_objects:
                     if obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not obj.hide_viewport:
@@ -1634,13 +1759,16 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             self.report({'INFO'}, f"Exported {exported_count} objects directly in {total_time:.2f}s.")
             return {'FINISHED'}
 
+        # BUT... If there are overrides, they take too long. We have to spawn a background worker using 'subprocess'.
         self.preset.export_status = f"Spawning Worker... (0.0s)"
         t_spawn_start = time.perf_counter()
 
         self.temp_dir = tempfile.mkdtemp(prefix="fast_batch_stl_")
         self.temp_blend = os.path.join(self.temp_dir, "batch_stl_export_temp.blend")
+        # Save a copy of the scene to a temporary folder
         bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True, compress=False)
 
+        # Build the terminal command that launches a hidden ('headless') Blender
         cmd = [
             bpy.app.binary_path, "--factory-startup", "-b", self.temp_blend,
             "-P", __file__, "--", "--batch-stl-headless", str(self.preset_idx)
@@ -1658,12 +1786,14 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         if verbose: print(f"\n{spawn_msg}")
         log_to_console(self.preset, spawn_msg)
 
+        # Queues let our background thread safely send text lines back to the main UI without crashing.
         self.q = queue.Queue()
         def enqueue_output(out, q):
             for line in iter(out.readline, ''):
                 q.put(line)
             out.close()
 
+        # Creates a background 'thread' to listen to the headless Blender without pausing the active Blender
         self.t = threading.Thread(target=enqueue_output, args=(self.process.stdout, self.q))
         self.t.daemon = True
         self.t.start()
@@ -1672,9 +1802,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         self.preset.cancel_export = False
         self.preset.export_progress = 0.0
 
+        # Create a timer that "wakes up" this operator every 0.05 seconds to check if there is new text
         self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
         context.window_manager.modal_handler_add(self)
-        return {'RUNNING_MODAL'}
+        return {'RUNNING_MODAL'} # RUNNING_MODAL keeps the operator alive!
 
     def modal(self, context, event):
         try:
@@ -1684,10 +1815,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                 log_to_console(self.preset, f"[!] Export cancelled manually for '{self.preset.name}'.")
                 return {'CANCELLED'}
 
-            if event.type == 'TIMER':
+            if event.type == 'TIMER': # Every 0.05s when the timer ticks...
                 elapsed = time.perf_counter() - self.export_start_time
                 while True:
-                    try: line = self.q.get_nowait()
+                    try: line = self.q.get_nowait() # Get text from the background worker
                     except queue.Empty: break
                     else:
                         line = line.rstrip('\r\n')
@@ -1719,8 +1850,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                     else:
                         self.preset.export_status = f"Spawning Worker... ({elapsed:.1f}s)"
 
+                # Tag redraw forces the Blender UI to refresh and show our updated progress bars
                 for area in context.screen.areas: area.tag_redraw()
 
+                # Safety check: if the process crashed, we stop listening
                 if self.process and self.process.poll() is not None:
                     self.cleanup(context)
                     log_to_console(self.preset, f"[!] CRASH DETECTED: Worker died unexpectedly.")
@@ -1736,8 +1869,9 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             self.cleanup(context)
             self.report({'ERROR'}, "Unexpected error during batch export.")
             return {'CANCELLED'}
-        return {'PASS_THROUGH'}
+        return {'PASS_THROUGH'} # We return PASS_THROUGH so the user can still click around Blender normally!
 
+    # This deletes all temporary files, stops the timer, and cleans up memory
     def cleanup(self, context=None):
         if context:
             if getattr(self, '_timer', None):
@@ -1761,12 +1895,15 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
 # ==============================================================================
 # === [ 5. UI LISTS & PANELS ] ===
+# These classes only describe the visual layout (rows, columns, buttons)
+# you see in Blender. They do NO actual math or exporting logic.
 # ==============================================================================
 
 class BATCH_STL_UL_presets(bpy.types.UIList):
+    # 'draw_item' tells Blender how to format a single row in the visual list.
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        row = layout.row(align=True)
-        row.prop(item, "name", text="", emboss=False)
+        row = layout.row(align=True) # row(align=True) snaps buttons together without spacing
+        row.prop(item, "name", text="", emboss=False) # 'emboss=False' makes it look like plain text, not a button
         row.prop(item, "preset_prefix", text="", emboss=False, icon='FILE_FOLDER')
 
         if item.is_exporting:
@@ -1794,6 +1931,7 @@ class BATCH_STL_UL_console_logs(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         layout.label(text=item.text)
 
+# A helper function that stamps down the same 4 or 6 arrow buttons wherever needed.
 def draw_inline_controls(layout, operator_id, use_clipboard=False):
     row = layout.row(align=True)
     row.operator(operator_id, icon='ADD', text="").action = 'ADD'
@@ -1976,11 +2114,11 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                             op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
                         op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
-
+# This class defines the massive main panel in the 3D Viewport Toolbar ('N' panel).
 class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
-    bl_space_type = "VIEW_3D"
-    bl_region_type = "UI"
-    bl_category = "Export"
+    bl_space_type = "VIEW_3D" # Appears in the 3D window
+    bl_region_type = "UI"     # Specifically the sidebar UI
+    bl_category = "Export"    # Name of the tab
     bl_label = "Fast Batch STL Export"
 
     def draw(self, context):
@@ -2125,8 +2263,11 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
 # ==============================================================================
 # === [ 6. REGISTRATION & LIFECYCLE ] ===
+# Every Blender Add-on must have a register() and unregister() function to hook
+# its classes into Blender's core system when enabled, and remove them when disabled.
 # ==============================================================================
 
+# @persistent means this runs every time you open a .blend file, fixing any stuck UI states.
 @persistent
 def reset_batch_stl_state(scene):
     try:
@@ -2137,6 +2278,7 @@ def reset_batch_stl_state(scene):
             p.export_status = ""
     except Exception: pass
 
+# A list of everything Blender needs to load.
 classes = (
     # 1. Properties
     BatchSTLLogLine,
@@ -2173,10 +2315,12 @@ def update_show_tree(self, context):
     if not self.batch_stl_show_tree:
         self.batch_stl_collapsed_dirs = "[]"
 
+# Tells Blender this add-on exists and gives it the list of classes to initialize.
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    # Attach our custom variables directly to Blender's Scene object so they are saved per-file.
     bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH")
     bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
     bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0)
@@ -2198,6 +2342,7 @@ def register():
     if reset_batch_stl_state not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(reset_batch_stl_state)
 
+# Triggers when the user un-checks the add-on box in preferences. It deletes all the data.
 def unregister():
     if reset_batch_stl_state in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(reset_batch_stl_state)
@@ -2221,16 +2366,21 @@ def unregister():
 
 # ==============================================================================
 # === [ 7. CLI EXECUTION BINDING ] ===
+# This checks if the file is being run directly from the command line/terminal
+# instead of being imported into Blender's UI normally.
 # ==============================================================================
 
 if __name__ == "__main__":
+    # If the user typed "--batch-stl-headless" in the terminal window:
     if "--batch-stl-headless" in sys.argv:
         if not hasattr(bpy.types.Scene, "batch_stl_root_dir"):
             register()
 
+        # Find the preset number from the command line arguments and launch the headless exporter.
         idx = sys.argv.index("--batch-stl-headless")
         p_index = int(sys.argv[idx + 1])
         run_headless_export(p_index)
     else:
+        # Standard fallback just in case the file is executed without parameters
         if not hasattr(bpy.types.Scene, "batch_stl_root_dir"):
             register()
