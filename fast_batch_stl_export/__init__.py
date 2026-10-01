@@ -337,8 +337,6 @@ def generate_override_combinations(overrides):
     pools = []
     for param_key, pairs in grouped_inputs.items():
         value_groups = {}
-        has_sweep = any(getattr(inp, "use_sweep", False) for ovr, inp in pairs)
-
         for ovr, inp in pairs:
             if getattr(inp, "use_sweep", False):
                 sweep_vals = parse_sweep_values(ovr, inp)
@@ -346,12 +344,11 @@ def generate_override_combinations(overrides):
                     mock_inp = MockInput(inp, val)
                     if val not in value_groups: value_groups[val] = []
                     value_groups[val].append((ovr, mock_inp))
-            elif not has_sweep:
+            else:
                 val = get_input_value(inp)
                 mock_inp = MockInput(inp, val)
                 if val not in value_groups: value_groups[val] = []
                 value_groups[val].append((ovr, mock_inp))
-
         if value_groups:
             pools.append(list(value_groups.values()))
 
