@@ -373,10 +373,47 @@ def reconstruct_overrides_for_combo(combo):
         active_overrides.append(MockOverride(target, group_ptr, node_name, inputs))
     return active_overrides
 
-# Modifies Blender's live scene by applying the parameters we generated above.
-def apply_overrides(overrides, target_objects, dry_run=False):
+# OPTIMIZED: Captures the initial state of the scene before applying any permutations,
+# allowing us to do one single revert at the end of the batch instead of thrashing the depsgraph.
+def capture_baseline_states(overrides, target_objects):
     global_states = []
     mod_states = []
+    processed_node_sockets = set()
+    processed_mod_sockets = set()
+
+    for override in overrides:
+        if override.override_target == 'NODE' and override.parent_group_ptr and override.node_name:
+            parent_tree = override.parent_group_ptr
+            n_name = override.node_name.split(" [")[0].strip()
+            target_node = parent_tree.nodes.get(n_name)
+            if not target_node: continue
+            for inp in override.inputs:
+                socket = target_node.inputs.get(inp.input_name)
+                if not socket: continue
+                key = (parent_tree, target_node.name, inp.input_name)
+                if key not in processed_node_sockets:
+                    link_from = socket.links[0].from_socket if socket.is_linked else None
+                    global_states.append(('SOCKET', socket, socket.default_value, link_from, parent_tree))
+                    processed_node_sockets.add(key)
+
+        elif override.override_target == 'MODIFIER' and override.parent_group_ptr:
+            for inp in override.inputs:
+                ident = get_modifier_socket_identifier(override.parent_group_ptr, inp.input_name)
+                if not ident: continue
+                default_val = get_modifier_socket_default(override.parent_group_ptr, inp.input_name)
+                for obj in target_objects:
+                    for mod in obj.modifiers:
+                        if mod.type == 'NODES' and mod.node_group == override.parent_group_ptr:
+                            key = (mod.name, ident)
+                            if key not in processed_mod_sockets:
+                                orig_val, is_set = get_modifier_input(mod, ident)
+                                mod_states.append((mod, ident, is_set, orig_val, default_val))
+                                processed_mod_sockets.add(key)
+
+    return global_states, mod_states
+
+# Modifies Blender's live scene by applying the parameters we generated above.
+def apply_overrides(overrides, target_objects, dry_run=False):
     trees_to_update = set() # A 'set' is like a list, but guarantees every item is unique.
 
     for override in overrides:
@@ -389,60 +426,70 @@ def apply_overrides(overrides, target_objects, dry_run=False):
             for inp in override.inputs:
                 socket = target_node.inputs.get(inp.input_name)
                 if not socket: continue
-                # We save the original state (what was connected to the socket) so we can put it back later.
-                link_from = socket.links[0].from_socket if socket.is_linked else None
-                global_states.append(('SOCKET', socket, socket.default_value, link_from, parent_tree))
+
                 if not dry_run:
                     if socket.is_linked: parent_tree.links.remove(socket.links[0])
                     val = get_input_value(inp)
-                    if val is not None: socket.default_value = val
-            if not dry_run: trees_to_update.add(parent_tree)
+                    # OPTIMIZED: Check before setting to avoid redundant node tree invalidation
+                    if val is not None and socket.default_value != val:
+                        socket.default_value = val
+                        trees_to_update.add(parent_tree)
 
         # If we are just changing the modifier sliders on the side menu...
         elif override.override_target == 'MODIFIER' and override.parent_group_ptr:
             for inp in override.inputs:
                 ident = get_modifier_socket_identifier(override.parent_group_ptr, inp.input_name)
                 if not ident: continue
-                default_val = get_modifier_socket_default(override.parent_group_ptr, inp.input_name)
                 val = get_input_value(inp)
                 if val is None: continue
                 for obj in target_objects:
                     for mod in obj.modifiers:
                         if mod.type == 'NODES' and mod.node_group == override.parent_group_ptr:
-                            orig_val, is_set = get_modifier_input(mod, ident)
-                            mod_states.append((mod, ident, is_set, orig_val, default_val))
-                            if not dry_run: set_modifier_input(mod, ident, val)
+                            if not dry_run:
+                                orig_val, is_set = get_modifier_input(mod, ident)
+                                # OPTIMIZED: Avoid setting modifier input if identical to prevent redundant geometry evaluation
+                                if not is_set or orig_val != val:
+                                    set_modifier_input(mod, ident, val)
 
     if not dry_run:
         # 'update_tag()' tells Blender that data changed and it needs to recalculate the 3D models before exporting.
         for tree in trees_to_update: tree.update_tag()
-        for obj in target_objects: obj.update_tag()
-    return global_states, mod_states
+        # OPTIMIZED: Removed explicit obj.update_tag() calls, Blender natively handles updates via modifier properties.
 
-# Takes the original states we saved in `apply_overrides` and puts Blender exactly back how we found it.
+# Takes the original states we saved in `capture_baseline_states` and puts Blender exactly back how we found it.
 def revert_overrides(global_states, mod_states, target_objects):
     for mod, ident, is_set, orig_val, default_val in mod_states:
         try:
-            if is_set and orig_val is not None: set_modifier_input(mod, ident, orig_val)
-            else: unset_modifier_input(mod, ident, default_val)
+            curr_val, curr_is_set = get_modifier_input(mod, ident)
+            if is_set and orig_val is not None:
+                # OPTIMIZED: Only revert if the state actually needs changing
+                if not curr_is_set or curr_val != orig_val:
+                    set_modifier_input(mod, ident, orig_val)
+            else:
+                if curr_is_set:
+                    unset_modifier_input(mod, ident, default_val)
         except ReferenceError: pass
+
     trees_to_update = set()
     for state in global_states:
         if state[0] == 'SOCKET':
             _, socket, original_val, link_from, parent_tree = state
             try:
-                socket.default_value = original_val
+                # OPTIMIZED: Only revert if the state actually needs changing
+                if socket.default_value != original_val:
+                    socket.default_value = original_val
+                    trees_to_update.add(parent_tree)
                 if link_from:
                     already_linked = any(l.from_socket == link_from for l in socket.links)
-                    if not already_linked: parent_tree.links.new(link_from, socket) # reconnect wires
-                trees_to_update.add(parent_tree)
+                    if not already_linked:
+                        parent_tree.links.new(link_from, socket) # reconnect wires
+                        trees_to_update.add(parent_tree)
             except Exception: pass
+
     for tree in trees_to_update:
         try: tree.update_tag()
         except ReferenceError: pass
-    for obj in target_objects:
-        try: obj.update_tag()
-        except ReferenceError: pass
+    # OPTIMIZED: Removed explicit obj.update_tag() calls, API handles modifier updates natively.
 
 def get_active_preset(scene):
     presets = scene.batch_stl_presets
@@ -1042,37 +1089,39 @@ def run_headless_export(preset_index):
                 mod.show_viewport = True
         # ------------------------------------
 
-        # This loop walks through every mathematical combination (permutation) we created and runs the export
-        for combo_idx, combo in enumerate(combinations):
-            print(f"  │    ├─ Permutation {combo_idx + 1}/{len(combinations)}")
-            combo_suffix = ""
-            combo_subpath = ""
-            processed_params = set()
-            for ovr, inp in combo:
-                param_key = (ovr.override_target, ovr.node_name, inp.input_name)
-                if param_key not in processed_params:
-                    val = get_input_value(inp)
-                    val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
-                    if inp.tag:
-                        if inp.tag.startswith("_"): naming_str = val_str + inp.tag
-                        elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
-                        else: naming_str = inp.tag
-                    else: naming_str = val_str
+        # OPTIMIZATION: Capture baseline state once for the entire batch to avoid O(N) depsgraph rebuilds
+        baseline_global_states, baseline_mod_states = capture_baseline_states(all_overrides, batch_objects)
 
-                    is_permutation = freq_dict.get(param_key, 0) > 1
-                    if is_permutation and getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
-                    if is_permutation and getattr(inp, "use_dir", False): combo_subpath = os.path.join(combo_subpath, naming_str)
-                    processed_params.add(param_key)
+        try:
+            # This loop walks through every mathematical combination (permutation) we created and runs the export
+            for combo_idx, combo in enumerate(combinations):
+                print(f"  │    ├─ Permutation {combo_idx + 1}/{len(combinations)}")
+                combo_suffix = ""
+                combo_subpath = ""
+                processed_params = set()
+                for ovr, inp in combo:
+                    param_key = (ovr.override_target, ovr.node_name, inp.input_name)
+                    if param_key not in processed_params:
+                        val = get_input_value(inp)
+                        val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
+                        if inp.tag:
+                            if inp.tag.startswith("_"): naming_str = val_str + inp.tag
+                            elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
+                            else: naming_str = inp.tag
+                        else: naming_str = val_str
 
-            t_ovr = time.perf_counter()
-            global_states, mod_states = [], []
+                        is_permutation = freq_dict.get(param_key, 0) > 1
+                        if is_permutation and getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
+                        if is_permutation and getattr(inp, "use_dir", False): combo_subpath = os.path.join(combo_subpath, naming_str)
+                        processed_params.add(param_key)
 
-            try:
+                t_ovr = time.perf_counter()
+
                 # Apply the current setup iteration and ask Blender to evaluate what the 3D scene looks like now
                 active_overrides = reconstruct_overrides_for_combo(combo)
-                global_states, mod_states = apply_overrides(active_overrides, batch_objects)
+                apply_overrides(active_overrides, batch_objects)
                 bpy.context.view_layer.update()
-                depsgraph = bpy.context.evaluated_depsgraph_get()
+                depsgraph = bpy.context.evaluated_depsgraph_get() # Added back missing depsgraph assignment
                 print(f"  │    │    ├─ Applied & Synced Graph: {time.perf_counter() - t_ovr:.4f}s")
 
                 for c, obj_prop, bl_obj in batch_export_targets:
@@ -1107,13 +1156,14 @@ def run_headless_export(preset_index):
                         current_op_step += 1
                         print(f"BATCH_STL_PROGRESS:{current_op_step}", flush=True)
 
-            finally:
-                # A 'finally' block *always* executes, even if the 'try' block crashed.
-                # This guarantees we don't leave Blender broken after an error.
-                t_rev = time.perf_counter()
-                revert_overrides(global_states, mod_states, batch_objects)
-                bpy.context.view_layer.update()
-                print(f"  │    │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
+        finally:
+            # A 'finally' block *always* executes, even if the 'try' block crashed.
+            # This guarantees we don't leave Blender broken after an error.
+            # OPTIMIZATION: Revert states ONCE after all permutations complete, breaking the Revert-Update trap
+            t_rev = time.perf_counter()
+            revert_overrides(baseline_global_states, baseline_mod_states, batch_objects)
+            bpy.context.view_layer.update()
+            print(f"  │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
 
         # --- STRICT BATCH ISOLATION END ---
         # Mute GN Modifiers again so they are ignored by the depsgraph in the next batch
@@ -2468,15 +2518,19 @@ def register():
     bpy.types.Scene.batch_stl_show_console = bpy.props.BoolProperty(default=False)
     bpy.types.Scene.batch_stl_collapsed_dirs = bpy.props.StringProperty(default="[]")
 
+    is_headless = "--batch-stl-headless" in sys.argv
+
     reset_batch_stl_state(None)
     if reset_batch_stl_state not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(reset_batch_stl_state)
 
-    if batch_stl_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(batch_stl_depsgraph_handler)
+    # OPTIMIZED: Skip adding UI rebuilds and depsgraph handlers if we are running in headless export mode
+    if not is_headless:
+        if batch_stl_depsgraph_handler not in bpy.app.handlers.depsgraph_update_post:
+            bpy.app.handlers.depsgraph_update_post.append(batch_stl_depsgraph_handler)
 
-    if not bpy.app.timers.is_registered(rebuild_ui_cache_if_dirty):
-        bpy.app.timers.register(rebuild_ui_cache_if_dirty)
+        if not bpy.app.timers.is_registered(rebuild_ui_cache_if_dirty):
+            bpy.app.timers.register(rebuild_ui_cache_if_dirty)
 
 # Triggers when the user un-checks the add-on box in preferences. It deletes all the data.
 def unregister():
