@@ -1193,6 +1193,54 @@ def run_headless_export(preset_index):
 # variables inside your .blend file automatically.
 # ==============================================================================
 
+# Globals state check for import/pasting to prevent undo floods
+_state = {
+    "is_importing": False,
+    "is_pasting": False
+}
+
+def update_with_undo(action_name):
+    def _updater(self, context):
+        mark_dirty()
+        if _state.get("is_importing", False) or _state.get("is_pasting", False):
+            return
+        try:
+            bpy.ops.ed.undo_push(message=action_name)
+        except Exception:
+            pass
+    return _updater
+
+upd_val_bool = update_with_undo("Toggle Boolean Value")
+upd_val_int = update_with_undo("Update Integer Value")
+upd_val_float = update_with_undo("Update Float Value")
+upd_val_str = update_with_undo("Update String Value")
+upd_val_menu = update_with_undo("Update Menu Value")
+
+upd_val_tag = update_with_undo("Update Value Tag")
+upd_val_use_sweep = update_with_undo("Toggle Value Sweep")
+upd_val_sweep_range = update_with_undo("Update Sweep Range")
+
+upd_inp_override = update_with_undo("Update Override Type")
+
+upd_node_name = update_with_undo("Update Target Node")
+
+upd_ng_name = update_with_undo("Update Node Group Name")
+
+upd_obj_tag = update_with_undo("Update Object Tag")
+upd_obj_sub = update_with_undo("Update Object Sub-folder")
+
+upd_col_name = update_with_undo("Update Collection Name")
+upd_col_tag = update_with_undo("Update Collection Tag")
+upd_col_sub = update_with_undo("Update Collection Sub-folder")
+upd_col_idx = update_with_undo("Change Object Selection")
+
+upd_preset_name = update_with_undo("Update Preset Name")
+upd_preset_prefix = update_with_undo("Update Preset Prefix")
+upd_preset_idx = update_with_undo("Change Active Preset")
+upd_preset_col_idx = update_with_undo("Change Collection Selection")
+
+upd_root_dir = update_with_undo("Update Root Export Directory")
+
 # Guesses the data type from the text name or socket type.
 def infer_input_type(group_ptr, node_name, input_name):
     if not group_ptr or not input_name: return 'FLOAT'
@@ -1254,6 +1302,10 @@ def on_input_name_update(self, context):
             self.override_type = infer_input_type(ng_ptr, found_node.name, self.name)
             for v in self.values: v.use_sweep = False
     except Exception: pass
+
+    if not (_state.get("is_importing", False) or _state.get("is_pasting", False)):
+        try: bpy.ops.ed.undo_push(message="Update Input Socket Name")
+        except Exception: pass
 
 # Creates the dynamic list of search results when you type in a Node field.
 def search_target_node_cb(self, context, edit_text):
@@ -1353,57 +1405,58 @@ class BatchSTLLogLine(bpy.types.PropertyGroup):
 # These classes define the exact variables Blender will track.
 # bpy.props.FloatProperty is Blender's special way of enforcing a decimal number inside its interface.
 class BatchSTLValue(bpy.types.PropertyGroup):
-    value_bool: bpy.props.BoolProperty(name="Value", default=True, update=mark_dirty)
-    value_int: bpy.props.IntProperty(name="Value", default=0, update=mark_dirty)
-    value_float: bpy.props.FloatProperty(name="Value", default=0.0, update=mark_dirty)
-    value_string: bpy.props.StringProperty(name="Value", default="", update=mark_dirty)
-    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=mark_dirty)
+    value_bool: bpy.props.BoolProperty(name="Value", default=True, update=upd_val_bool)
+    value_int: bpy.props.IntProperty(name="Value", default=0, update=upd_val_int)
+    value_float: bpy.props.FloatProperty(name="Value", default=0.0, update=upd_val_float)
+    value_string: bpy.props.StringProperty(name="Value", default="", update=upd_val_str)
+    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=upd_val_menu)
 
+    # Note: These properties bypass the 'update_with_undo' native hook because they are strictly manipulated via our custom Operators now
     use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=mark_dirty)
-    tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
+    tag: bpy.props.StringProperty(name="Tag", default="", update=upd_val_tag)
     use_dir: bpy.props.BoolProperty(name="Use Dir", default=True, update=mark_dirty)
 
-    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, update=mark_dirty)
-    sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", update=mark_dirty)
+    use_sweep: bpy.props.BoolProperty(name="Sweep", default=False, update=upd_val_use_sweep)
+    sweep_range: bpy.props.StringProperty(name="Sweep Range", default="", update=upd_val_sweep_range)
 
 # A single variable can be part of an Input, which is part of a Node, which is part of a NodeGroup.
 # 'CollectionProperty' means "create a list of these items".
 class BatchSTLInput(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty(name="Input Socket", default="", update=on_input_name_update)
-    override_type: bpy.props.StringProperty(default='FLOAT', update=mark_dirty)
+    override_type: bpy.props.StringProperty(default='FLOAT', update=upd_inp_override)
     values: bpy.props.CollectionProperty(type=BatchSTLValue)
 
 class BatchSTLNode(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Target Node", default="", search=search_target_node_cb, update=mark_dirty, description="Select <Modifier Interface> to target the modifier directly")
+    name: bpy.props.StringProperty(name="Target Node", default="", search=search_target_node_cb, update=upd_node_name, description="Select <Modifier Interface> to target the modifier directly")
     inputs: bpy.props.CollectionProperty(type=BatchSTLInput)
 
 class BatchSTLNodeGroup(bpy.types.PropertyGroup):
-    group_name: bpy.props.StringProperty(name="Node Group", default="", update=mark_dirty)
+    group_name: bpy.props.StringProperty(name="Node Group", default="", update=upd_ng_name)
     nodes: bpy.props.CollectionProperty(type=BatchSTLNode)
 
 class BatchSTLObject(bpy.types.PropertyGroup):
     name: bpy.props.StringProperty()
-    export: bpy.props.BoolProperty(default=True, update=mark_dirty)
-    tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
-    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=mark_dirty)
+    export: bpy.props.BoolProperty(default=True, update=mark_dirty) # Handled by Operator to enforce clean Undo History
+    tag: bpy.props.StringProperty(name="Tag", default="", update=upd_obj_tag)
+    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=upd_obj_sub)
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
 
 class BatchSTLCollection(bpy.types.PropertyGroup):
-    collection_name: bpy.props.StringProperty(name="Collection", default="", update=mark_dirty)
-    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, update=mark_dirty)
-    tag: bpy.props.StringProperty(name="Tag", default="", update=mark_dirty)
-    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=mark_dirty)
+    collection_name: bpy.props.StringProperty(name="Collection", default="", update=upd_col_name)
+    use_tag: bpy.props.BoolProperty(name="Use Tag", default=True, update=mark_dirty) # Handled by Operator to enforce clean Undo History
+    tag: bpy.props.StringProperty(name="Tag", default="", update=upd_col_tag)
+    sub_path: bpy.props.StringProperty(name="Sub-folder", default="", update=upd_col_sub)
     objects: bpy.props.CollectionProperty(type=BatchSTLObject)
-    object_index: bpy.props.IntProperty(default=0, update=mark_dirty)
+    object_index: bpy.props.IntProperty(default=0, update=upd_col_idx)
     nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
 
 class BatchSTLExportPreset(bpy.types.PropertyGroup):
-    name: bpy.props.StringProperty(name="Preset Name", default="New Preset", update=mark_dirty)
-    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", update=mark_dirty)
+    name: bpy.props.StringProperty(name="Preset Name", default="New Preset", update=upd_preset_name)
+    preset_prefix: bpy.props.StringProperty(name="Preset Root Directory", default="", update=upd_preset_prefix)
     last_export_time: bpy.props.FloatProperty(name="Last Export Time", default=0.0)
 
     collections: bpy.props.CollectionProperty(type=BatchSTLCollection)
-    collection_index: bpy.props.IntProperty(name="Collection Index", default=0, update=mark_dirty)
+    collection_index: bpy.props.IntProperty(name="Collection Index", default=0, update=upd_preset_col_idx)
 
     is_exporting: bpy.props.BoolProperty(default=False)
     cancel_export: bpy.props.BoolProperty(default=False)
@@ -1435,13 +1488,18 @@ class BATCH_STL_OT_import_presets_json(bpy.types.Operator, ImportHelper):
     bl_idname = "batch_stl.import_presets_json"
     bl_label = "Import JSON"
     bl_description = "Import presets from a JSON file"
-    bl_options = {'REGISTER', 'UNDO'} # Telling Blender the user is allowed to hit Ctrl+Z on this action.
+    bl_options = {'REGISTER'}
     filename_ext = ".json"
     filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
 
     def execute(self, context):
-        with open(self.filepath, 'r') as f: data = json.load(f)
-        for p_data in data: paste_preset_from_dict(context.scene.batch_stl_presets.add(), p_data)
+        global _state
+        _state["is_importing"] = True
+        try:
+            with open(self.filepath, 'r') as f: data = json.load(f)
+            for p_data in data: paste_preset_from_dict(context.scene.batch_stl_presets.add(), p_data)
+        finally:
+            _state["is_importing"] = False
         mark_dirty()
         return {'FINISHED'}
 
@@ -1484,23 +1542,37 @@ class BATCH_STL_OT_preset_actions(bpy.types.Operator):
     def execute(self, context):
         lst = context.scene.batch_stl_presets
         idx = context.scene.batch_stl_preset_index
+        global _state
 
-        # Based on the action provided, modify the lists inside Blender.
-        if self.action == 'ADD': lst.add(); context.scene.batch_stl_preset_index = len(lst) - 1
-        elif self.action == 'REMOVE' and lst:
-            if not lst[idx].is_exporting:
-                lst.remove(idx); context.scene.batch_stl_preset_index = max(0, idx - 1)
-            else: self.report({'WARNING'}, "Cannot remove a preset while it is actively exporting.")
-        elif self.action == 'UP' and idx > 0:
-            lst.move(idx, 0 if self.shift_pressed else idx - 1)
-            context.scene.batch_stl_preset_index = 0 if self.shift_pressed else idx - 1
-        elif self.action == 'DOWN' and idx < len(lst) - 1:
-            lst.move(idx, len(lst) - 1 if self.shift_pressed else idx + 1)
-            context.scene.batch_stl_preset_index = len(lst) - 1 if self.shift_pressed else idx + 1
-        elif self.action == 'COPY' and lst: _clipboard["preset"] = copy_preset_to_dict(lst[idx])
-        elif self.action == 'PASTE' and _clipboard.get("preset"): paste_preset_from_dict(lst.add(), _clipboard["preset"]); context.scene.batch_stl_preset_index = len(lst) - 1
+        if self.action == 'PASTE': _state["is_pasting"] = True
+        try:
+            # Based on the action provided, modify the lists inside Blender.
+            if self.action == 'ADD': lst.add(); context.scene.batch_stl_preset_index = len(lst) - 1
+            elif self.action == 'REMOVE' and lst:
+                if not lst[idx].is_exporting:
+                    lst.remove(idx); context.scene.batch_stl_preset_index = max(0, idx - 1)
+                else: self.report({'WARNING'}, "Cannot remove a preset while it is actively exporting.")
+            elif self.action == 'UP' and idx > 0:
+                lst.move(idx, 0 if self.shift_pressed else idx - 1)
+                context.scene.batch_stl_preset_index = 0 if self.shift_pressed else idx - 1
+            elif self.action == 'DOWN' and idx < len(lst) - 1:
+                lst.move(idx, len(lst) - 1 if self.shift_pressed else idx + 1)
+                context.scene.batch_stl_preset_index = len(lst) - 1 if self.shift_pressed else idx + 1
+            elif self.action == 'COPY' and lst: _clipboard["preset"] = copy_preset_to_dict(lst[idx])
+            elif self.action == 'PASTE' and _clipboard.get("preset"): paste_preset_from_dict(lst.add(), _clipboard["preset"]); context.scene.batch_stl_preset_index = len(lst) - 1
+        finally:
+            if self.action == 'PASTE': _state["is_pasting"] = False
 
-        if self.action != 'COPY': bpy.ops.ed.undo_push(message="Preset Action")
+        if self.action != 'COPY':
+            msg = {
+                'ADD': "Add Export Preset",
+                'REMOVE': "Remove Export Preset",
+                'UP': "Move Preset Up",
+                'DOWN': "Move Preset Down",
+                'PASTE': "Paste Export Preset"
+            }.get(self.action, "Preset Action")
+            bpy.ops.ed.undo_push(message=msg)
+
         mark_dirty()
         return {'FINISHED'}
 
@@ -1530,30 +1602,47 @@ class BATCH_STL_OT_collection_actions(bpy.types.Operator):
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}
         lst, idx = preset.collections, preset.collection_index
-        if self.action == 'ADD': lst.add(); preset.collection_index = len(lst) - 1
-        elif self.action == 'REMOVE' and lst: lst.remove(idx); preset.collection_index = max(0, idx - 1)
-        elif self.action == 'UP' and idx > 0:
-            lst.move(idx, 0 if self.shift_pressed else idx - 1)
-            preset.collection_index = 0 if self.shift_pressed else idx - 1
-        elif self.action == 'DOWN' and idx < len(lst) - 1:
-            lst.move(idx, len(lst) - 1 if self.shift_pressed else idx + 1)
-            preset.collection_index = len(lst) - 1 if self.shift_pressed else idx + 1
-        elif self.action == 'COPY' and lst: _clipboard["collection"] = copy_collection_to_dict(lst[idx])
-        elif self.action == 'PASTE' and _clipboard.get("collection"): paste_collection_from_dict(lst.add(), _clipboard["collection"]); preset.collection_index = len(lst) - 1
+        global _state
 
-        if self.action != 'COPY': bpy.ops.ed.undo_push(message="Collection Action")
+        if self.action == 'PASTE': _state["is_pasting"] = True
+        try:
+            if self.action == 'ADD': lst.add(); preset.collection_index = len(lst) - 1
+            elif self.action == 'REMOVE' and lst: lst.remove(idx); preset.collection_index = max(0, idx - 1)
+            elif self.action == 'UP' and idx > 0:
+                lst.move(idx, 0 if self.shift_pressed else idx - 1)
+                preset.collection_index = 0 if self.shift_pressed else idx - 1
+            elif self.action == 'DOWN' and idx < len(lst) - 1:
+                lst.move(idx, len(lst) - 1 if self.shift_pressed else idx + 1)
+                preset.collection_index = len(lst) - 1 if self.shift_pressed else idx + 1
+            elif self.action == 'COPY' and lst: _clipboard["collection"] = copy_collection_to_dict(lst[idx])
+            elif self.action == 'PASTE' and _clipboard.get("collection"): paste_collection_from_dict(lst.add(), _clipboard["collection"]); preset.collection_index = len(lst) - 1
+        finally:
+            if self.action == 'PASTE': _state["is_pasting"] = False
+
+        if self.action != 'COPY':
+            msg = {
+                'ADD': "Add Target Collection",
+                'REMOVE': "Remove Target Collection",
+                'UP': "Move Collection Up",
+                'DOWN': "Move Collection Down",
+                'PASTE': "Paste Target Collection"
+            }.get(self.action, "Collection Action")
+            bpy.ops.ed.undo_push(message=msg)
+
         mark_dirty()
         return {'FINISHED'}
 
 class BATCH_STL_OT_table_action(bpy.types.Operator):
     bl_idname = "batch_stl.table_action"
     bl_label = "Table Action"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {'REGISTER', 'INTERNAL'}
 
     # Operators can have variables passed into them to specify their target!
     # By taking indices for group (ng), node (n), input (i) and value (v), one operator controls the entire table.
     action: bpy.props.StringProperty()
     is_pinned: bpy.props.BoolProperty()
+    c_idx: bpy.props.IntProperty(default=-1)
+    o_idx: bpy.props.IntProperty(default=-1)
     ng_idx: bpy.props.IntProperty(default=-1)
     n_idx: bpy.props.IntProperty(default=-1)
     i_idx: bpy.props.IntProperty(default=-1)
@@ -1584,6 +1673,10 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         elif action == 'DEL_VALUE': return "Delete this Value iteration"
         elif action == 'MOVE_VALUE_UP': return "Move Value Up"
         elif action == 'MOVE_VALUE_DOWN': return "Move Value Down"
+        elif action == 'TOGGLE_OBJECT_EXPORT': return "Toggle Export Status"
+        elif action == 'TOGGLE_COLLECTION_USE_TAG': return "Toggle Tag Usage for Collection"
+        elif action == 'TOGGLE_VALUE_USE_DIR': return "Toggle Sub-folder Generation for this Value"
+        elif action == 'TOGGLE_VALUE_USE_TAG': return "Toggle Tag Appending for this Value"
         elif action == 'VALUE_ACTION':
             if properties.v_idx < 0: return "Add a Value iteration (Shift-Click: Toggle Sweep Mode)"
             else: return "Add a Value iteration (Shift-Click: Toggle Sweep / Populate values)"
@@ -1594,176 +1687,241 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         return self.execute(context)
 
     def execute(self, context):
+        self._action_msg = ""
         preset = get_active_preset(context.scene)
         if not preset: return {'CANCELLED'}
-        active_col = get_active_collection(preset)
-        if not active_col: return {'CANCELLED'}
 
-        if self.is_pinned:
-            ng_list = active_col.nodegroups
-        else:
-            active_obj = get_active_object(active_col)
-            if not active_obj: return {'CANCELLED'}
-            ng_list = active_obj.nodegroups
+        global _state
+        if self.action in ['PASTE_GROUP', 'PIN_GROUP', 'UNPIN_GROUP']:
+            _state["is_pasting"] = True
 
-        # Big branching tree to modify the data arrays properly based on user clicking '+' or '-' icons
-        if self.action == 'ADD_GROUP':
-            ng = ng_list.add()
-            node = ng.nodes.add()
-            node.name = "<Modifier Interface>"
-            inp = node.inputs.add()
-            inp.values.add()
-        elif self.action == 'DEL_GROUP':
-            ng_list.remove(self.ng_idx)
-        elif self.action == 'PIN_GROUP':
-            if not self.is_pinned:
-                src_ng = ng_list[self.ng_idx]
-                dst_ng = active_col.nodegroups.add()
-                paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
-                ng_list.remove(self.ng_idx)
-        elif self.action == 'UNPIN_GROUP':
-            if self.is_pinned:
-                src_ng = ng_list[self.ng_idx]
-                ng_dict = copy_ng_to_dict(src_ng)
-
-                # Paste the copied override into every object's local list
-                for obj in active_col.objects:
-                    dst_ng = obj.nodegroups.add()
-                    paste_ng_from_dict(dst_ng, ng_dict)
-
-                # Remove the original pinned override from the collection
-                ng_list.remove(self.ng_idx)
-        elif self.action == 'COPY_GROUP':
-            global _clipboard # Must define global if we intend to change a variable declared outside this scope.
-            _clipboard["nodegroup"] = copy_ng_to_dict(ng_list[self.ng_idx])
-        elif self.action == 'PASTE_GROUP':
-            if _clipboard.get("nodegroup"):
-                paste_ng_from_dict(ng_list.add(), _clipboard["nodegroup"])
-
-        elif self.action == 'ADD_NODE':
-            node = ng_list[self.ng_idx].nodes.add()
-            node.name = "<Modifier Interface>"
-            inp = node.inputs.add()
-            inp.values.add()
-        elif self.action == 'DEL_NODE':
-            ng_list[self.ng_idx].nodes.remove(self.n_idx)
-
-        elif self.action == 'ADD_INPUT':
-            ng = ng_list[self.ng_idx]
-            node = ng.nodes[self.n_idx]
-            ng_ptr = bpy.data.node_groups.get(ng.group_name)
-
-            # Auto-populates all available inputs automatically if the user holds SHIFT
-            if self.shift_pressed and ng_ptr:
-                is_mod = not node.name or node.name == "<Modifier Interface>"
-                source_inputs = []
-                if is_mod and hasattr(ng_ptr, "interface"):
-                    for item in ng_ptr.interface.items_tree:
-                        if getattr(item, "item_type", "SOCKET") == 'SOCKET' and getattr(item, "in_out", "INPUT") == 'INPUT':
-                            source_inputs.append(item.name)
-                elif not is_mod and node.name:
-                    target_n = ng_ptr.nodes.get(node.name.split(" [")[0].strip())
-                    if target_n:
-                        for i in target_n.inputs:
-                            if not getattr(i, "is_unavailable", False) and not getattr(i, "hide", False):
-                                source_inputs.append(i.name)
-
-                if source_inputs:
-                    existing_names = {i.name for i in node.inputs}
-                    added = False
-                    for s_name in source_inputs:
-                        if s_name and s_name not in existing_names:
-                            inp = node.inputs.add()
-                            inp.name = s_name
-                            inp.values.add()
-                            added = True
-                    if added:
-                        mark_dirty()
-                        return {'FINISHED'}
-
-            inp = node.inputs.add()
-            inp.values.add()
-        elif self.action == 'DEL_INPUT':
-            ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
-
-        elif self.action == 'DEL_VALUE':
-            ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.remove(self.v_idx)
-
-        elif self.action == 'DEL_VALUE_OR_INPUT':
-            inp = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
-            if len(inp.values) > 1:
-                inp.values.remove(self.v_idx)
+        try:
+            if self.action == 'TOGGLE_COLLECTION_USE_TAG':
+                if 0 <= self.c_idx < len(preset.collections):
+                    c = preset.collections[self.c_idx]
+                    c.use_tag = not c.use_tag
+                    self._action_msg = "Toggle Collection Tagging"
             else:
-                ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
+                active_col = get_active_collection(preset)
+                if not active_col: return {'CANCELLED'}
 
-        elif self.action in ['ADD_VALUE', 'TOGGLE_SWEEP', 'VALUE_ACTION']:
-            vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
-
-            if self.v_idx < 0:
-                vals.add()
-            else:
-                val = vals[self.v_idx]
-                if not val.use_sweep:
-                    if self.shift_pressed:
-                        val.use_sweep = True
-                        for j in reversed(range(len(vals))):
-                            if j != self.v_idx: vals.remove(j)
-                    else:
-                        vals.add()
+                if self.action == 'TOGGLE_OBJECT_EXPORT':
+                    if 0 <= self.o_idx < len(active_col.objects):
+                        obj = active_col.objects[self.o_idx]
+                        obj.export = not obj.export
+                        self._action_msg = "Toggle Object Export"
                 else:
-                    val.use_sweep = False
-                    if self.shift_pressed:
-                        inp_obj = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
-                        if inp_obj.override_type in ['FLOAT', 'INT', 'MENU', 'BOOLEAN']:
-                            ng_obj = ng_list[self.ng_idx]
-                            ng_ptr = bpy.data.node_groups.get(ng_obj.group_name)
-                            node_obj = ng_obj.nodes[self.n_idx]
-                            target = 'MODIFIER' if not node_obj.name or node_obj.name == "<Modifier Interface>" else 'NODE'
+                    if self.is_pinned:
+                        ng_list = active_col.nodegroups
+                    else:
+                        active_obj = get_active_object(active_col)
+                        if not active_obj: return {'CANCELLED'}
+                        ng_list = active_obj.nodegroups
 
-                            temp_inp = TempMockInput(inp_obj.name, inp_obj.override_type, val)
-                            temp_ovr = TempMockOverride(target, ng_ptr, node_obj.name, [temp_inp])
+                    if self.action == 'TOGGLE_VALUE_USE_DIR':
+                        val = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx]
+                        val.use_dir = not val.use_dir
+                        self._action_msg = "Toggle Value Directory Mapping"
+                    elif self.action == 'TOGGLE_VALUE_USE_TAG':
+                        val = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx]
+                        val.use_tag = not val.use_tag
+                        self._action_msg = "Toggle Value Tagging"
 
-                            parsed_vals = parse_sweep_values(temp_ovr, temp_inp)
-                            if parsed_vals:
-                                first_val = parsed_vals[0]
-                                if inp_obj.override_type == 'FLOAT': val.value_float = first_val
-                                elif inp_obj.override_type == 'INT': val.value_int = first_val
-                                elif inp_obj.override_type == 'MENU': val.value_menu = str(first_val)
-                                elif inp_obj.override_type == 'BOOLEAN': val.value_bool = bool(first_val)
+                    elif self.action == 'ADD_GROUP':
+                        ng = ng_list.add()
+                        node = ng.nodes.add()
+                        node.name = "<Modifier Interface>"
+                        inp = node.inputs.add()
+                        inp.values.add()
+                        self._action_msg = "Add Node Group Override"
+                    elif self.action == 'DEL_GROUP':
+                        ng_list.remove(self.ng_idx)
+                    elif self.action == 'PIN_GROUP':
+                        if not self.is_pinned:
+                            src_ng = ng_list[self.ng_idx]
+                            dst_ng = active_col.nodegroups.add()
+                            paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
+                            ng_list.remove(self.ng_idx)
+                    elif self.action == 'UNPIN_GROUP':
+                        if self.is_pinned:
+                            src_ng = ng_list[self.ng_idx]
+                            ng_dict = copy_ng_to_dict(src_ng)
 
-                                for p_val in parsed_vals[1:]:
-                                    new_val = vals.add()
-                                    new_val.use_sweep = False
-                                    if inp_obj.override_type == 'FLOAT': new_val.value_float = p_val
-                                    elif inp_obj.override_type == 'INT': new_val.value_int = p_val
-                                    elif inp_obj.override_type == 'MENU': new_val.value_menu = str(p_val)
-                                    elif inp_obj.override_type == 'BOOLEAN': new_val.value_bool = bool(p_val)
+                            # Paste the copied override into every object's local list
+                            for obj in active_col.objects:
+                                dst_ng = obj.nodegroups.add()
+                                paste_ng_from_dict(dst_ng, ng_dict)
 
-        elif self.action == 'MOVE_GROUP_UP':
-            if self.ng_idx > 0: ng_list.move(self.ng_idx, self.ng_idx - 1)
-        elif self.action == 'MOVE_GROUP_DOWN':
-            if self.ng_idx < len(ng_list) - 1: ng_list.move(self.ng_idx, self.ng_idx + 1)
+                            # Remove the original pinned override from the collection
+                            ng_list.remove(self.ng_idx)
+                    elif self.action == 'COPY_GROUP':
+                        global _clipboard
+                        _clipboard["nodegroup"] = copy_ng_to_dict(ng_list[self.ng_idx])
+                    elif self.action == 'PASTE_GROUP':
+                        if _clipboard.get("nodegroup"):
+                            paste_ng_from_dict(ng_list.add(), _clipboard["nodegroup"])
 
-        elif self.action == 'MOVE_NODE_UP':
-            nodes = ng_list[self.ng_idx].nodes
-            if self.n_idx > 0: nodes.move(self.n_idx, self.n_idx - 1)
-        elif self.action == 'MOVE_NODE_DOWN':
-            nodes = ng_list[self.ng_idx].nodes
-            if self.n_idx < len(nodes) - 1: nodes.move(self.n_idx, self.n_idx + 1)
+                    elif self.action == 'ADD_NODE':
+                        node = ng_list[self.ng_idx].nodes.add()
+                        node.name = "<Modifier Interface>"
+                        inp = node.inputs.add()
+                        inp.values.add()
+                        self._action_msg = "Add Node Target"
+                    elif self.action == 'DEL_NODE':
+                        ng_list[self.ng_idx].nodes.remove(self.n_idx)
 
-        elif self.action == 'MOVE_INPUT_UP':
-            inputs = ng_list[self.ng_idx].nodes[self.n_idx].inputs
-            if self.i_idx > 0: inputs.move(self.i_idx, self.i_idx - 1)
-        elif self.action == 'MOVE_INPUT_DOWN':
-            inputs = ng_list[self.ng_idx].nodes[self.n_idx].inputs
-            if self.i_idx < len(inputs) - 1: inputs.move(self.i_idx, self.i_idx + 1)
+                    elif self.action == 'ADD_INPUT':
+                        ng = ng_list[self.ng_idx]
+                        node = ng.nodes[self.n_idx]
+                        ng_ptr = bpy.data.node_groups.get(ng.group_name)
 
-        elif self.action == 'MOVE_VALUE_UP':
-            vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
-            if self.v_idx > 0: vals.move(self.v_idx, self.v_idx - 1)
-        elif self.action == 'MOVE_VALUE_DOWN':
-            vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
-            if self.v_idx < len(vals) - 1: vals.move(self.v_idx, self.v_idx + 1)
+                        # Auto-populates all available inputs automatically if the user holds SHIFT
+                        if self.shift_pressed and ng_ptr:
+                            is_mod = not node.name or node.name == "<Modifier Interface>"
+                            source_inputs = []
+                            if is_mod and hasattr(ng_ptr, "interface"):
+                                for item in ng_ptr.interface.items_tree:
+                                    if getattr(item, "item_type", "SOCKET") == 'SOCKET' and getattr(item, "in_out", "INPUT") == 'INPUT':
+                                        source_inputs.append(item.name)
+                            elif not is_mod and node.name:
+                                target_n = ng_ptr.nodes.get(node.name.split(" [")[0].strip())
+                                if target_n:
+                                    for i in target_n.inputs:
+                                        if not getattr(i, "is_unavailable", False) and not getattr(i, "hide", False):
+                                            source_inputs.append(i.name)
+
+                            if source_inputs:
+                                existing_names = {i.name for i in node.inputs}
+                                added = False
+                                for s_name in source_inputs:
+                                    if s_name and s_name not in existing_names:
+                                        inp = node.inputs.add()
+                                        inp.name = s_name
+                                        inp.values.add()
+                                        added = True
+                                if added:
+                                    mark_dirty()
+                                    bpy.ops.ed.undo_push(message="Auto-Populate Input Parameters")
+                                    return {'FINISHED'}
+
+                        inp = node.inputs.add()
+                        inp.values.add()
+                        self._action_msg = "Add Input Parameter"
+                    elif self.action == 'DEL_INPUT':
+                        ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
+
+                    elif self.action == 'DEL_VALUE':
+                        ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.remove(self.v_idx)
+
+                    elif self.action == 'DEL_VALUE_OR_INPUT':
+                        inp = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
+                        if len(inp.values) > 1:
+                            inp.values.remove(self.v_idx)
+                        else:
+                            ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
+
+                    elif self.action in ['ADD_VALUE', 'TOGGLE_SWEEP', 'VALUE_ACTION']:
+                        vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
+
+                        if self.v_idx < 0:
+                            vals.add()
+                            self._action_msg = "Add Parameter Value"
+                        else:
+                            val = vals[self.v_idx]
+                            if not val.use_sweep:
+                                if self.shift_pressed:
+                                    val.use_sweep = True
+                                    for j in reversed(range(len(vals))):
+                                        if j != self.v_idx: vals.remove(j)
+                                    self._action_msg = "Enable Sweep Mode"
+                                else:
+                                    vals.add()
+                                    self._action_msg = "Add Parameter Value"
+                            else:
+                                val.use_sweep = False
+                                if self.shift_pressed:
+                                    inp_obj = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
+                                    if inp_obj.override_type in ['FLOAT', 'INT', 'MENU', 'BOOLEAN']:
+                                        ng_obj = ng_list[self.ng_idx]
+                                        ng_ptr = bpy.data.node_groups.get(ng_obj.group_name)
+                                        node_obj = ng_obj.nodes[self.n_idx]
+                                        target = 'MODIFIER' if not node_obj.name or node_obj.name == "<Modifier Interface>" else 'NODE'
+
+                                        temp_inp = TempMockInput(inp_obj.name, inp_obj.override_type, val)
+                                        temp_ovr = TempMockOverride(target, ng_ptr, node_obj.name, [temp_inp])
+
+                                        parsed_vals = parse_sweep_values(temp_ovr, temp_inp)
+                                        if parsed_vals:
+                                            first_val = parsed_vals[0]
+                                            if inp_obj.override_type == 'FLOAT': val.value_float = first_val
+                                            elif inp_obj.override_type == 'INT': val.value_int = first_val
+                                            elif inp_obj.override_type == 'MENU': val.value_menu = str(first_val)
+                                            elif inp_obj.override_type == 'BOOLEAN': val.value_bool = bool(first_val)
+
+                                            for p_val in parsed_vals[1:]:
+                                                new_val = vals.add()
+                                                new_val.use_sweep = False
+                                                if inp_obj.override_type == 'FLOAT': new_val.value_float = p_val
+                                                elif inp_obj.override_type == 'INT': new_val.value_int = p_val
+                                                elif inp_obj.override_type == 'MENU': new_val.value_menu = str(p_val)
+                                                elif inp_obj.override_type == 'BOOLEAN': new_val.value_bool = bool(p_val)
+                                    self._action_msg = "Populate Sweep Values"
+                                else:
+                                    self._action_msg = "Disable Sweep Mode"
+
+                    elif self.action == 'MOVE_GROUP_UP':
+                        if self.ng_idx > 0: ng_list.move(self.ng_idx, self.ng_idx - 1)
+                    elif self.action == 'MOVE_GROUP_DOWN':
+                        if self.ng_idx < len(ng_list) - 1: ng_list.move(self.ng_idx, self.ng_idx + 1)
+
+                    elif self.action == 'MOVE_NODE_UP':
+                        nodes = ng_list[self.ng_idx].nodes
+                        if self.n_idx > 0: nodes.move(self.n_idx, self.n_idx - 1)
+                    elif self.action == 'MOVE_NODE_DOWN':
+                        nodes = ng_list[self.ng_idx].nodes
+                        if self.n_idx < len(nodes) - 1: nodes.move(self.n_idx, self.n_idx + 1)
+
+                    elif self.action == 'MOVE_INPUT_UP':
+                        inputs = ng_list[self.ng_idx].nodes[self.n_idx].inputs
+                        if self.i_idx > 0: inputs.move(self.i_idx, self.i_idx - 1)
+                    elif self.action == 'MOVE_INPUT_DOWN':
+                        inputs = ng_list[self.ng_idx].nodes[self.n_idx].inputs
+                        if self.i_idx < len(inputs) - 1: inputs.move(self.i_idx, self.i_idx + 1)
+
+                    elif self.action == 'MOVE_VALUE_UP':
+                        vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
+                        if self.v_idx > 0: vals.move(self.v_idx, self.v_idx - 1)
+                    elif self.action == 'MOVE_VALUE_DOWN':
+                        vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
+                        if self.v_idx < len(vals) - 1: vals.move(self.v_idx, self.v_idx + 1)
+        finally:
+            if self.action in ['PASTE_GROUP', 'PIN_GROUP', 'UNPIN_GROUP']:
+                _state["is_pasting"] = False
+
+        if self.action != 'COPY_GROUP':
+            msg = getattr(self, "_action_msg", "")
+            if not msg:
+                action_msgs = {
+                    'DEL_GROUP': "Delete Node Group Override",
+                    'PIN_GROUP': "Pin Override to Collection",
+                    'UNPIN_GROUP': "Unpin Override to Object",
+                    'PASTE_GROUP': "Paste Node Group Override",
+                    'ADD_NODE': "Add Node Target",
+                    'DEL_NODE': "Delete Node Target",
+                    'DEL_INPUT': "Delete Input Parameter",
+                    'DEL_VALUE': "Delete Parameter Value",
+                    'DEL_VALUE_OR_INPUT': "Delete Value/Input",
+                    'MOVE_GROUP_UP': "Move Node Group Up",
+                    'MOVE_GROUP_DOWN': "Move Node Group Down",
+                    'MOVE_NODE_UP': "Move Node Up",
+                    'MOVE_NODE_DOWN': "Move Node Down",
+                    'MOVE_INPUT_UP': "Move Input Parameter Up",
+                    'MOVE_INPUT_DOWN': "Move Input Parameter Down",
+                    'MOVE_VALUE_UP': "Move Parameter Value Up",
+                    'MOVE_VALUE_DOWN': "Move Parameter Value Down",
+                }
+                msg = action_msgs.get(self.action, "Table Action")
+            bpy.ops.ed.undo_push(message=msg)
 
         mark_dirty()
         return {'FINISHED'}
@@ -2083,7 +2241,12 @@ class BATCH_STL_UL_collections(bpy.types.UIList):
         row.prop_search(item, "collection_name", bpy.data, "collections", text="", icon='OUTLINER_COLLECTION')
         row.separator(factor=0.5)
         sub_row = row.row(align=True)
-        sub_row.prop(item, "use_tag", text="", icon='BOOKMARKS')
+
+        # Converted implicit UI property toggle to a fully controlled internal operator
+        op = sub_row.operator("batch_stl.table_action", text="", icon='BOOKMARKS', depress=item.use_tag)
+        op.action = 'TOGGLE_COLLECTION_USE_TAG'
+        op.c_idx = index
+
         sub_row.separator(factor=0.5)
         tag_row = sub_row.row(align=True)
         tag_row.prop(item, "tag", text="", emboss=False)
@@ -2095,7 +2258,12 @@ class BATCH_STL_UL_objects(bpy.types.UIList):
 
         # Left side: Export toggle and name
         row = split.row(align=True)
-        row.prop(item, "export", text="", icon='CHECKBOX_HLT' if item.export else 'CHECKBOX_DEHLT', emboss=False)
+
+        # Converted implicit UI property toggle to a fully controlled internal operator
+        op = row.operator("batch_stl.table_action", text="", icon='CHECKBOX_HLT' if item.export else 'CHECKBOX_DEHLT', emboss=False)
+        op.action = 'TOGGLE_OBJECT_EXPORT'
+        op.o_idx = index
+
         row.label(text=item.name)
 
         # Right side: Tag and Directory settings (No boolean toggles, just labels)
@@ -2281,9 +2449,17 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
 
                     c_dir = s_val.row(align=True)
                     is_permutation = len(inp.values) > 1 or any(getattr(v, "use_sweep", False) for v in inp.values)
+
                     if is_permutation:
-                        c_dir.prop(val, "use_dir", text="", icon='FILE_FOLDER')
-                        c_dir.prop(val, "use_tag", text="", icon='BOOKMARKS')
+                        # Converted implicit UI property toggles to fully controlled internal operators
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='FILE_FOLDER', depress=val.use_dir)
+                        op.action = 'TOGGLE_VALUE_USE_DIR'
+                        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='BOOKMARKS', depress=val.use_tag)
+                        op.action = 'TOGGLE_VALUE_USE_TAG'
+                        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+
                         c_dir.prop(val, "tag", text="")
 
                     if i_first:
@@ -2504,22 +2680,22 @@ def register():
         bpy.utils.register_class(cls)
 
     # Attach our custom variables directly to Blender's Scene object so they are saved per-file.
-    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH", update=mark_dirty)
+    bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH", update=upd_root_dir)
     bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
-    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0, update=mark_dirty)
-    bpy.types.Scene.batch_stl_verbose_console = bpy.props.BoolProperty(name="Verbose Console Output", default=False)
+    bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0, update=upd_preset_idx)
+    bpy.types.Scene.batch_stl_verbose_console = bpy.props.BoolProperty(name="Verbose Console Output", default=False, options={'SKIP_SAVE'})
 
-    bpy.types.Scene.batch_stl_ui_presets = bpy.props.BoolProperty(default=True)
-    bpy.types.Scene.batch_stl_ui_collections = bpy.props.BoolProperty(default=True)
-    bpy.types.Scene.batch_stl_ui_objects = bpy.props.BoolProperty(default=True)
-    bpy.types.Scene.batch_stl_ui_global_ovr = bpy.props.BoolProperty(default=True)
-    bpy.types.Scene.batch_stl_ui_local_ovr = bpy.props.BoolProperty(default=True)
-    bpy.types.Scene.batch_stl_ui_global_ovr_nested = bpy.props.BoolProperty(default=False)
-    bpy.types.Scene.batch_stl_ui_local_ovr_nested = bpy.props.BoolProperty(default=False)
-    bpy.types.Scene.batch_stl_ui_tips = bpy.props.BoolProperty(default=False)
-    bpy.types.Scene.batch_stl_show_tree = bpy.props.BoolProperty(default=True, update=update_show_tree)
-    bpy.types.Scene.batch_stl_show_console = bpy.props.BoolProperty(default=False)
-    bpy.types.Scene.batch_stl_collapsed_dirs = bpy.props.StringProperty(default="[]")
+    bpy.types.Scene.batch_stl_ui_presets = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_ui_collections = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_ui_objects = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_ui_global_ovr = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_ui_local_ovr = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_ui_global_ovr_nested = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_ui_local_ovr_nested = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_ui_tips = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_show_tree = bpy.props.BoolProperty(default=True, update=update_show_tree, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_show_console = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_collapsed_dirs = bpy.props.StringProperty(default="[]", options={'SKIP_SAVE'})
 
     is_headless = "--batch-stl-headless" in sys.argv
 
