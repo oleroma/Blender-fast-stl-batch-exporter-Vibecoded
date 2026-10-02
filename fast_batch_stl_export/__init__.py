@@ -1071,7 +1071,14 @@ def run_headless_export(job_file_path):
         # Exclude all collections not currently being processed (only if overrides are applied)
         isolated_collections = []
         if len(all_overrides) > 0:
-            batch_col_names = {item[0].collection_name for item in batch_items}
+
+            # Extract the exact collections containing the active target objects
+            batch_col_names = set()
+            for item in batch_items:
+                bl_obj = item[2]
+                for col in bl_obj.users_collection:
+                    batch_col_names.add(col.name)
+
             visible_hierarchy = set()
             for c_name in batch_col_names:
                 curr = c_name
