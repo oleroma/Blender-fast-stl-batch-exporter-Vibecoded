@@ -987,41 +987,15 @@ def run_headless_export(preset_index):
         root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
 
     print(f"\n=== STARTING HEADLESS ISOLATED EXPORT: {preset.name} ===")
-    print("\n  [Phase 0] Aggressive Global Depsgraph Culling...")
-    t_phase0_start = time.perf_counter()
 
-    # The 'Depsgraph' is Blender's internal system that tracks what depends on what.
-    # Here, we figure out what isn't exporting, and mute it so the computer doesn't waste time thinking about it.
-    active_export_objects = set()
+    # Pre-sync collection objects to ensure accuracy before building batches
     for c in preset.collections:
         c_ptr = bpy.data.collections.get(c.collection_name)
         if c_ptr and not is_collection_excluded(bpy.context, c_ptr):
             sync_collection_objects(c, c_ptr)
-            for obj_prop in c.objects:
-                if obj_prop.export:
-                    bl_obj = c_ptr.all_objects.get(obj_prop.name)
-                    if bl_obj: active_export_objects.add(bl_obj)
 
-    muted_count = 0
-    batch_isolation_map = {} # Tracks modifiers to toggle per-batch to guarantee strict batch isolation
-
-    for obj in bpy.context.view_layer.objects:
-        if obj not in active_export_objects:
-            # Permanently mute non-export objects
-            for mod in getattr(obj, 'modifiers', []):
-                if mod.type == 'NODES' and mod.show_viewport:
-                    mod.show_viewport = False
-                    muted_count += 1
-        else:
-            # Temporarily mute active export objects, to be unmuted ONLY during their specific batch
-            batch_isolation_map[obj] = []
-            for mod in getattr(obj, 'modifiers', []):
-                if mod.type == 'NODES' and mod.show_viewport:
-                    batch_isolation_map[obj].append(mod)
-                    mod.show_viewport = False
-                    muted_count += 1
-
-    print(f"    ├─ Muted {muted_count} GN modifiers for strict batch isolation in {time.perf_counter() - t_phase0_start:.4f}s")
+    print("\n  [Phase 0] Evaluating Targets and Building Depsgraph Culling Maps...")
+    t_phase0_start = time.perf_counter()
 
     execution_batches = {}
 
@@ -1043,6 +1017,22 @@ def run_headless_export(preset_index):
             # Groups items with identical required steps together in 'execution_batches'
             if full_sig not in execution_batches: execution_batches[full_sig] = []
             execution_batches[full_sig].append((c, obj_prop, bl_obj))
+
+    # Build layer collection maps for native depsgraph culling
+    layer_collection_map = {}
+    layer_collection_parents = {}
+
+    def map_layer_collections(layer_collection, parent=None):
+        if layer_collection.collection:
+            name = layer_collection.collection.name
+            layer_collection_map[name] = layer_collection
+            layer_collection_parents[name] = parent
+        for child in layer_collection.children:
+            map_layer_collections(child, layer_collection)
+
+    map_layer_collections(bpy.context.view_layer.layer_collection)
+
+    print(f"    ├─ Mapped {len(layer_collection_map)} collections for depsgraph culling in {time.perf_counter() - t_phase0_start:.4f}s")
 
     if not execution_batches:
         print("  └─ No active objects to export.")
@@ -1083,10 +1073,22 @@ def run_headless_export(preset_index):
         batch_export_targets = batch_items
 
         # --- STRICT BATCH ISOLATION START ---
-        # Unmute GN Modifiers for ONLY the objects in this specific batch
-        for obj in batch_objects:
-            for mod in batch_isolation_map.get(obj, []):
-                mod.show_viewport = True
+        # Exclude all collections not currently being processed (only if overrides are applied)
+        isolated_collections = []
+        if len(all_overrides) > 0:
+            batch_col_names = {item[0].collection_name for item in batch_items}
+            visible_hierarchy = set()
+            for c_name in batch_col_names:
+                curr = c_name
+                while curr in layer_collection_map:
+                    visible_hierarchy.add(curr)
+                    parent_lc = layer_collection_parents.get(curr)
+                    curr = parent_lc.collection.name if (parent_lc and parent_lc.collection) else None
+
+            for name, lc in layer_collection_map.items():
+                if name not in visible_hierarchy and not lc.exclude:
+                    lc.exclude = True
+                    isolated_collections.append(name)
         # ------------------------------------
 
         # OPTIMIZATION: Capture baseline state once for the entire batch to avoid O(N) depsgraph rebuilds
@@ -1166,10 +1168,10 @@ def run_headless_export(preset_index):
             print(f"  │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
 
         # --- STRICT BATCH ISOLATION END ---
-        # Mute GN Modifiers again so they are ignored by the depsgraph in the next batch
-        for obj in batch_objects:
-            for mod in batch_isolation_map.get(obj, []):
-                mod.show_viewport = False
+        # Restore previously visible collections
+        for name in isolated_collections:
+            if name in layer_collection_map:
+                layer_collection_map[name].exclude = False
         # ----------------------------------
 
         # OPTIMIZED: Moved RAM Purge completely out of permutation loop to run per-batch
