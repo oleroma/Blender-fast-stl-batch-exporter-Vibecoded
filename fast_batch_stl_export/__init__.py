@@ -100,8 +100,8 @@ def get_modifier_socket_identifier(node_group, socket_name):
     # 'hasattr' checks if an object has a specific property (attribute) without crashing if it doesn't.
     if hasattr(node_group, "interface"):
         for item in node_group.interface.items_tree:
-            # We look for a socket that matches the name the user wants to change.
-            if getattr(item, "item_type", "") == 'SOCKET' and item.name == socket_name:
+            # We look for an INPUT socket that matches the name the user wants to change (filters out outputs with same name).
+            if getattr(item, "item_type", "") == 'SOCKET' and getattr(item, "in_out", "INPUT") == 'INPUT' and item.name == socket_name:
                 return item.identifier
     else:
         # Fallback for older versions of Blender that used a different property structure.
@@ -114,7 +114,7 @@ def get_modifier_socket_identifier(node_group, socket_name):
 def get_modifier_socket_default(node_group, socket_name):
     if hasattr(node_group, "interface"):
         for item in node_group.interface.items_tree:
-            if getattr(item, "item_type", "") == 'SOCKET' and item.name == socket_name:
+            if getattr(item, "item_type", "") == 'SOCKET' and getattr(item, "in_out", "INPUT") == 'INPUT' and item.name == socket_name:
                 return getattr(item, "default_value", None)
     else:
         for inp in node_group.inputs:
@@ -183,39 +183,42 @@ def get_override_signature(overrides):
     return tuple(sig)
 
 # --- PERMUTATION ENGINE (Adapters) ---
-# Classes are blueprints for creating objects. These "Mock" classes create fake, temporary copies
-# of Blender properties so we can do math on them without altering the user's actual saved data.
-class TempMockInput:
-    # __init__ is the constructor. It runs automatically when you create a new TempMockInput object.
-    def __init__(self, name, o_type, val_obj):
-        # 'self' refers to the specific object being created right now.
-        self.input_name = name
-        self.override_type = o_type
-        self.use_tag = val_obj.use_tag
-        self.tag = val_obj.tag
-        self.use_dir = val_obj.use_dir
-        self.use_sweep = val_obj.use_sweep
-        self.sweep_range = val_obj.sweep_range
-        self._val_obj = val_obj
+# Unified lightweight Mock wrappers to avoid boilerplate class declarations
+class MockInput:
+    def __init__(self, base_inp, override_val, is_temp=False):
+        self.input_name = getattr(base_inp, 'input_name', getattr(base_inp, 'name', ''))
+        self.override_type = base_inp.override_type
 
-    # @property makes a function act like a regular variable. You can say 'obj.value_bool' instead of 'obj.value_bool()'.
-    @property
-    def value_bool(self): return self._val_obj.value_bool
-    @property
-    def value_int(self): return self._val_obj.value_int
-    @property
-    def value_float(self): return self._val_obj.value_float
-    @property
-    def value_string(self): return self._val_obj.value_string
-    @property
-    def value_menu(self): return self._val_obj.value_menu
+        # When extracting from Blender properties (is_temp=True), tags/sweeps live on the Value object.
+        # When cloning for permutations (is_temp=False), tags/sweeps live on the base MockInput.
+        source = override_val if is_temp else base_inp
 
-class TempMockOverride:
-    def __init__(self, target, ptr, node_name, temp_inputs):
+        self.use_tag = getattr(source, "use_tag", False)
+        self.tag = getattr(source, "tag", "")
+        self.use_dir = getattr(source, "use_dir", False)
+        self.use_sweep = getattr(source, "use_sweep", False)
+        self.sweep_range = getattr(source, "sweep_range", "")
+
+        self._val = override_val
+        self._is_temp = is_temp
+
+    @property
+    def value_bool(self): return self._val.value_bool if self._is_temp else bool(self._val)
+    @property
+    def value_int(self): return self._val.value_int if self._is_temp else (int(self._val) if self._val is not None else 0)
+    @property
+    def value_float(self): return self._val.value_float if self._is_temp else (float(self._val) if self._val is not None else 0.0)
+    @property
+    def value_string(self): return self._val.value_string if self._is_temp else str(self._val)
+    @property
+    def value_menu(self): return self._val.value_menu if self._is_temp else str(self._val)
+
+class MockOverride:
+    def __init__(self, target, ptr, node_name, inputs):
         self.override_target = target
         self.parent_group_ptr = ptr
         self.node_name = node_name
-        self.inputs = temp_inputs
+        self.inputs = inputs
 
 # Grabs every override requested by the user and flattens them into one big list.
 def get_flat_overrides(nodegroups):
@@ -230,38 +233,10 @@ def get_flat_overrides(nodegroups):
             temp_inputs = []
             for inp in node.inputs:
                 for val in inp.values:
-                    temp_inputs.append(TempMockInput(inp.name, inp.override_type, val))
+                    temp_inputs.append(MockInput(inp, val, is_temp=True))
             if temp_inputs:
-                overrides.append(TempMockOverride(target, ng_ptr, node.name, temp_inputs))
+                overrides.append(MockOverride(target, ng_ptr, node.name, temp_inputs))
     return overrides
-
-class MockInput:
-    def __init__(self, base_inp, override_val):
-        self.input_name = base_inp.input_name
-        self.override_type = base_inp.override_type
-        self.use_tag = base_inp.use_tag
-        self.tag = base_inp.tag
-        self.use_dir = base_inp.use_dir
-        self.use_sweep = getattr(base_inp, "use_sweep", False)
-        self.sweep_range = getattr(base_inp, "sweep_range", "")
-        self._val = override_val
-    @property
-    def value_bool(self): return bool(self._val)
-    @property
-    def value_int(self): return int(self._val) if self._val is not None else 0
-    @property
-    def value_float(self): return float(self._val) if self._val is not None else 0.0
-    @property
-    def value_string(self): return str(self._val)
-    @property
-    def value_menu(self): return str(self._val)
-
-class MockOverride:
-    def __init__(self, override_target, parent_group_ptr, node_name, inputs):
-        self.override_target = override_target
-        self.parent_group_ptr = parent_group_ptr
-        self.node_name = node_name
-        self.inputs = inputs
 
 # If the user sets a "Sweep" (e.g., test sizes from 1 to 10), this parses their text string into actual numbers.
 def parse_sweep_values(ovr, inp):
@@ -324,12 +299,13 @@ def parse_sweep_values(ovr, inp):
     return []
 
 # Combines different variable sweeps together using `itertools.product`.
-# If you have sizes [1, 2] and colors [Red, Blue], it creates [[1, Red], [1, Blue], [2, Red], [2, Blue]].
 def generate_override_combinations(overrides):
     grouped_inputs = {}
     for ovr in overrides:
+        group_name = ovr.parent_group_ptr.name if ovr.parent_group_ptr else ""
         for inp in ovr.inputs:
-            param_key = (ovr.override_target, ovr.node_name, inp.input_name)
+            # Added group_name to param_key to prevent cross-group socket collisions
+            param_key = (ovr.override_target, group_name, ovr.node_name, inp.input_name)
             if param_key not in grouped_inputs:
                 grouped_inputs[param_key] = []
             grouped_inputs[param_key].append((ovr, inp))
@@ -582,8 +558,14 @@ def write_fast_binary_stl(filepath, mesh, matrix_world, verbose=False):
     data['normals'] = tri_normals
     # Uses 'fancy indexing' in numpy to map the final positions to the exact triangle corners (v0, v1, v2)
     data['v0'] = verts[tri_verts[:, 0]]
-    data['v1'] = verts[tri_verts[:, 1]]
-    data['v2'] = verts[tri_verts[:, 2]]
+
+    # CRITICAL FIX: Correctly reverse winding order for mirrored objects using matrix determinant safely
+    if matrix_world.determinant() < 0.0:
+        data['v1'] = verts[tri_verts[:, 2]]
+        data['v2'] = verts[tri_verts[:, 1]]
+    else:
+        data['v1'] = verts[tri_verts[:, 1]]
+        data['v2'] = verts[tri_verts[:, 2]]
 
     t_format = time.perf_counter()
     if verbose:
@@ -688,13 +670,13 @@ def paste_preset_from_dict(new_p, data):
 # Background timer executes heavy calculation outside of `draw()`
 def rebuild_ui_cache_if_dirty():
     if not _ui_cache.get("is_dirty", False):
-        return 0.25 # Wait 0.25s before checking the dirty flag again
+        return 1.0 # Wait 1.0s before checking the dirty flag again to prevent UI lag
 
     _ui_cache["is_dirty"] = False
     context = bpy.context
     if not hasattr(context, "scene"):
         _ui_cache["is_dirty"] = True
-        return 0.25
+        return 1.0
 
     scene = context.scene
 
@@ -713,7 +695,7 @@ def rebuild_ui_cache_if_dirty():
     preset = get_active_preset(scene)
     if not preset:
         _ui_cache["metrics"] = {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0}
-        _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0}
+        _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0},
         _ui_cache["tree"] = ({}, set())
 
         if getattr(context, "window_manager", None):
@@ -721,7 +703,7 @@ def rebuild_ui_cache_if_dirty():
                 for area in window.screen.areas:
                     if area.type == 'VIEW_3D':
                         area.tag_redraw()
-        return 0.25
+        return 1.0
 
     # 2. Re-calculate metrics fully decoupled from UI
     total_collections = len(preset.collections)
@@ -760,9 +742,10 @@ def rebuild_ui_cache_if_dirty():
         total_inputs = 0
 
         for o in all_ovrs:
+            group_name = o.parent_group_ptr.name if o.parent_group_ptr else ""
             total_inputs += len(o.inputs)
             for i in o.inputs:
-                unique_targets.add((o.override_target, o.node_name, i.input_name))
+                unique_targets.add((o.override_target, group_name, o.node_name, i.input_name))
 
         num_targets = len(unique_targets)
         num_combos = len(generate_override_combinations(all_ovrs))
@@ -790,7 +773,7 @@ def rebuild_ui_cache_if_dirty():
                 if area.type == 'VIEW_3D':
                     area.tag_redraw()
 
-    return 0.25
+    return 1.0
 
 @persistent
 def batch_stl_depsgraph_handler(scene, depsgraph):
@@ -844,8 +827,9 @@ def build_tree_dict(context, preset, visibility_cache=None):
             all_overrides = c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups)
             freq_dict = {}
             for o in all_overrides:
+                group_name = o.parent_group_ptr.name if getattr(o, "parent_group_ptr", None) else ""
                 for i in o.inputs:
-                    key = (o.override_target, o.node_name, i.input_name)
+                    key = (o.override_target, group_name, o.node_name, i.input_name)
                     weight = 2 if getattr(i, "use_sweep", False) else 1
                     freq_dict[key] = freq_dict.get(key, 0) + weight
 
@@ -874,7 +858,8 @@ def build_tree_dict(context, preset, visibility_cache=None):
 
                 processed_params = set()
                 for ovr, inp in combo:
-                    param_key = (ovr.override_target, ovr.node_name, inp.input_name)
+                    group_name = ovr.parent_group_ptr.name if ovr.parent_group_ptr else ""
+                    param_key = (ovr.override_target, group_name, ovr.node_name, inp.input_name)
                     if param_key not in processed_params:
                         val = get_input_value(inp)
                         # Formats floats nicely. The ":g" string format removes trailing zeros (e.g., 2.0 -> 2).
@@ -972,8 +957,18 @@ def draw_tree_dict(layout, tree_node, current_path="", toggled_list=None, duplic
 # --- HEADLESS EXPORT EXECUTION ROUTINE ---
 # "Headless" means running the software without a screen or graphical window.
 # This is used for massive background exports, so the user can keep working on other things.
-def run_headless_export(preset_index):
+def run_headless_export(job_file_path):
     total_time_start = time.perf_counter()
+
+    try:
+        with open(job_file_path, 'r') as f:
+            job_data = json.load(f)
+        preset_index = job_data["preset_index"]
+        root_dir = job_data["root_dir"]
+    except Exception as e:
+        print(f"ERROR: Failed to load job manifest: {e}")
+        sys.exit(1)
+
     scene = bpy.context.scene
 
     # Error handling to make sure the program exits safely if bad data is given.
@@ -982,7 +977,6 @@ def run_headless_export(preset_index):
         sys.exit(1) # system exit code 1 means an error occurred
 
     preset = scene.batch_stl_presets[preset_index]
-    root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
     if preset.preset_prefix:
         root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
 
@@ -1058,8 +1052,9 @@ def run_headless_export(preset_index):
 
         freq_dict = {}
         for o in all_overrides:
+            group_name = o.parent_group_ptr.name if o.parent_group_ptr else ""
             for i in o.inputs:
-                key = (o.override_target, o.node_name, i.input_name)
+                key = (o.override_target, group_name, o.node_name, i.input_name)
                 weight = 2 if getattr(i, "use_sweep", False) else 1
                 freq_dict[key] = freq_dict.get(key, 0) + weight
 
@@ -1093,6 +1088,7 @@ def run_headless_export(preset_index):
 
         # OPTIMIZATION: Capture baseline state once for the entire batch to avoid O(N) depsgraph rebuilds
         baseline_global_states, baseline_mod_states = capture_baseline_states(all_overrides, batch_objects)
+        depsgraph = bpy.context.evaluated_depsgraph_get()
 
         try:
             # This loop walks through every mathematical combination (permutation) we created and runs the export
@@ -1102,7 +1098,8 @@ def run_headless_export(preset_index):
                 combo_subpath = ""
                 processed_params = set()
                 for ovr, inp in combo:
-                    param_key = (ovr.override_target, ovr.node_name, inp.input_name)
+                    group_name = ovr.parent_group_ptr.name if ovr.parent_group_ptr else ""
+                    param_key = (ovr.override_target, group_name, ovr.node_name, inp.input_name)
                     if param_key not in processed_params:
                         val = get_input_value(inp)
                         val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
@@ -1119,12 +1116,14 @@ def run_headless_export(preset_index):
 
                 t_ovr = time.perf_counter()
 
-                # Apply the current setup iteration and ask Blender to evaluate what the 3D scene looks like now
+                # Apply the current setup iteration.
                 active_overrides = reconstruct_overrides_for_combo(combo)
                 apply_overrides(active_overrides, batch_objects)
+
+                # CRITICAL FIX: Force Blender to evaluate the modifier parameter changes before grabbing the mesh!
                 bpy.context.view_layer.update()
-                depsgraph = bpy.context.evaluated_depsgraph_get() # Added back missing depsgraph assignment
-                print(f"  │    │    ├─ Applied & Synced Graph: {time.perf_counter() - t_ovr:.4f}s")
+
+                print(f"  │    │    ├─ Applied & Synced Modifiers: {time.perf_counter() - t_ovr:.4f}s")
 
                 for c, obj_prop, bl_obj in batch_export_targets:
                     # Apply Object sub-directory implicitly
@@ -1155,8 +1154,10 @@ def run_headless_export(preset_index):
                         # Our custom fast function is called right here!
                         write_fast_binary_stl(filepath, mesh, bl_obj.matrix_world, verbose=True)
                         obj_eval.to_mesh_clear() # Very important to throw away data so we don't leak memory.
-                        current_op_step += 1
-                        print(f"BATCH_STL_PROGRESS:{current_op_step}", flush=True)
+
+                    # Ensure progress always continues even on empty evaluation meshes
+                    current_op_step += 1
+                    print(f"BATCH_STL_PROGRESS:{current_op_step}", flush=True)
 
         finally:
             # A 'finally' block *always* executes, even if the 'try' block crashed.
@@ -1173,12 +1174,6 @@ def run_headless_export(preset_index):
             if name in layer_collection_map:
                 layer_collection_map[name].exclude = False
         # ----------------------------------
-
-        # OPTIMIZED: Moved RAM Purge completely out of permutation loop to run per-batch
-        # This tells Blender to take out the garbage (free up unused memory).
-        t_purge = time.perf_counter()
-        bpy.ops.outliner.orphans_purge(do_local_ids=True, do_linked_ids=True, do_recursive=True)
-        print(f"  │    ├─ Batch RAM Purge: {time.perf_counter() - t_purge:.4f}s")
 
         print(f"  │    => Batch Iteration Total Time: {time.perf_counter() - t_batch_start:.4f}s\n")
         batch_counter += 1
@@ -1211,12 +1206,6 @@ def update_with_undo(action_name):
         except Exception:
             pass
     return _updater
-
-upd_val_bool = update_with_undo("Toggle Boolean Value")
-upd_val_int = update_with_undo("Update Integer Value")
-upd_val_float = update_with_undo("Update Float Value")
-upd_val_str = update_with_undo("Update String Value")
-upd_val_menu = update_with_undo("Update Menu Value")
 
 upd_val_tag = update_with_undo("Update Value Tag")
 upd_val_use_sweep = update_with_undo("Toggle Value Sweep")
@@ -1407,11 +1396,13 @@ class BatchSTLLogLine(bpy.types.PropertyGroup):
 # These classes define the exact variables Blender will track.
 # bpy.props.FloatProperty is Blender's special way of enforcing a decimal number inside its interface.
 class BatchSTLValue(bpy.types.PropertyGroup):
-    value_bool: bpy.props.BoolProperty(name="Value", default=True, update=upd_val_bool)
-    value_int: bpy.props.IntProperty(name="Value", default=0, update=upd_val_int)
-    value_float: bpy.props.FloatProperty(name="Value", default=0.0, update=upd_val_float)
-    value_string: bpy.props.StringProperty(name="Value", default="", update=upd_val_str)
-    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=upd_val_menu)
+    # OPTIMIZED: Removed update_with_undo to prevent interactive undo stack flooding.
+    # Sliders handle undo registration natively through Blender.
+    value_bool: bpy.props.BoolProperty(name="Value", default=True, update=mark_dirty)
+    value_int: bpy.props.IntProperty(name="Value", default=0, update=mark_dirty)
+    value_float: bpy.props.FloatProperty(name="Value", default=0.0, update=mark_dirty)
+    value_string: bpy.props.StringProperty(name="Value", default="", update=mark_dirty)
+    value_menu: bpy.props.StringProperty(name="Value", default="", search=search_menu_items_cb, update=mark_dirty)
 
     # Note: These properties bypass the 'update_with_undo' native hook because they are strictly manipulated via our custom Operators now
     use_tag: bpy.props.BoolProperty(name="Use Tag", default=False, update=mark_dirty)
@@ -1849,8 +1840,8 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                                         node_obj = ng_obj.nodes[self.n_idx]
                                         target = 'MODIFIER' if not node_obj.name or node_obj.name == "<Modifier Interface>" else 'NODE'
 
-                                        temp_inp = TempMockInput(inp_obj.name, inp_obj.override_type, val)
-                                        temp_ovr = TempMockOverride(target, ng_ptr, node_obj.name, [temp_inp])
+                                        temp_inp = MockInput(inp_obj, val, is_temp=True)
+                                        temp_ovr = MockOverride(target, ng_ptr, node_obj.name, [temp_inp])
 
                                         parsed_vals = parse_sweep_values(temp_ovr, temp_inp)
                                         if parsed_vals:
@@ -1896,6 +1887,12 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                     elif self.action == 'MOVE_VALUE_DOWN':
                         vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
                         if self.v_idx < len(vals) - 1: vals.move(self.v_idx, self.v_idx + 1)
+        except IndexError:
+            # Prevents hard crashes if an operator fires out-of-sync with UI list indices
+            if self.action in ['PASTE_GROUP', 'PIN_GROUP', 'UNPIN_GROUP']:
+                _state["is_pasting"] = False
+            self.report({'WARNING'}, "UI Sync Error: List mutated unexpectedly. Please try again.")
+            return {'CANCELLED'}
         finally:
             if self.action in ['PASTE_GROUP', 'PIN_GROUP', 'UNPIN_GROUP']:
                 _state["is_pasting"] = False
@@ -1976,7 +1973,7 @@ class BATCH_STL_OT_cancel_export(bpy.types.Operator):
 class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
     bl_idname = "export_scene.batch_stl_multi"
     bl_label = "Export"
-    bl_description = "Safely evaluate and batch export the mapped collections"
+    bl_description = "Safely evaluate and batch export the mapped collections via background worker"
     bl_options = {"REGISTER"}
     preset_index: bpy.props.IntProperty(default=-1)
 
@@ -2004,141 +2001,53 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
         self.preset.console_logs.clear()
         context.scene.batch_stl_show_console = True
-
-        has_overrides = any(bool(c.nodegroups) for c in self.preset.collections) or \
-                        any(bool(o.nodegroups) for c in self.preset.collections for o in c.objects)
-
         verbose = scene.batch_stl_verbose_console
 
-        # If there are no complex modifications needed, just export synchronously (freeze Blender for a moment)
-        if not has_overrides:
-            root_dir = bpy.path.abspath(scene.batch_stl_root_dir)
-            if self.preset.preset_prefix:
-                root_dir = os.path.normpath(os.path.join(root_dir, self.preset.preset_prefix))
-
-            total_objs = 0
-            for c in self.preset.collections:
-                c_ptr = bpy.data.collections.get(c.collection_name)
-                if not c_ptr or is_collection_excluded(context, c_ptr): continue
-                for obj_prop in c.objects:
-                    if not obj_prop.export: continue
-                    bl_obj = c_ptr.all_objects.get(obj_prop.name)
-                    if bl_obj and bl_obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not bl_obj.hide_viewport:
-                        total_objs += 1
-
-            context.window_manager.progress_begin(0, max(1, total_objs)) # Shows progress bar on bottom cursor
-            depsgraph = context.evaluated_depsgraph_get()
-            exported_count = 0
-
-            log_msg = f"\n=== STARTING SYNCHRONOUS EXPORT: {self.preset.name} ==="
-            if verbose: print(log_msg)
-            log_to_console(self.preset, log_msg)
-
-            for c in self.preset.collections:
-                c_ptr = bpy.data.collections.get(c.collection_name)
-                if not c_ptr or is_collection_excluded(context, c_ptr): continue
-
-                for obj_prop in c.objects:
-                    if not obj_prop.export: continue
-                    obj = c_ptr.all_objects.get(obj_prop.name)
-                    if not obj or obj.hide_viewport or obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
-                        continue
-
-                    # Apply Object Directory Logic implicitly if specified
-                    obj_subpath = obj_prop.sub_path.replace('\\', '/') if obj_prop.sub_path else ""
-                    out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path, obj_subpath))
-                    os.makedirs(out_dir, exist_ok=True)
-
-                    # Apply Object Tagging Logic implicitly if specified
-                    safe_name = bpy.path.clean_name(obj.name)
-                    if obj_prop.tag:
-                        if obj_prop.tag.startswith("_"): safe_name = safe_name + obj_prop.tag
-                        elif obj_prop.tag.endswith("_"): safe_name = obj_prop.tag + safe_name
-                        else: safe_name = obj_prop.tag
-
-                    t_eval_start = time.perf_counter()
-                    obj_eval = obj.evaluated_get(depsgraph)
-                    try: mesh = obj_eval.to_mesh()
-                    except RuntimeError: mesh = None
-                    perf_msg = f"  ├─ Evaluated {obj.name} in {time.perf_counter()-t_eval_start:.4f}s"
-                    if verbose: print(perf_msg)
-                    log_to_console(self.preset, perf_msg)
-
-                    if mesh:
-                        base_tag = c.tag if c.use_tag and c.tag else ""
-                        filepath = os.path.join(out_dir, f"{safe_name}{base_tag}.stl")
-                        write_fast_binary_stl(filepath, mesh, obj.matrix_world, verbose=verbose)
-                        obj_eval.to_mesh_clear()
-                        exported_count += 1
-                        context.window_manager.progress_update(exported_count)
-
-            context.window_manager.progress_end()
-            total_time = time.perf_counter() - self.export_start_time
-            self.preset.last_export_time = total_time
-
-            end_msg = f"=== SYNCHRONOUS EXPORT COMPLETE ({total_time:.4f}s) ==="
-            if verbose: print(end_msg)
-            log_to_console(self.preset, end_msg)
-            self.report({'INFO'}, f"Exported {exported_count} objects directly in {total_time:.2f}s.")
-            return {'FINISHED'}
-
-        # BUT... If there are overrides, they take too long. We have to spawn a background worker using 'subprocess'.
         self.preset.export_status = f"Spawning Worker... (0.0s)"
         t_spawn_start = time.perf_counter()
 
         self.temp_dir = tempfile.mkdtemp(prefix="fast_batch_stl_")
         self.temp_blend = os.path.join(self.temp_dir, "batch_stl_export_temp.blend")
+        self.job_json = os.path.join(self.temp_dir, "job.json")
 
-        # --- OPTIMIZED INIT: Write isolated datablocks instead of the full file ---
-        # 1. Create temporary scene to hold only our targets
-        temp_scene = bpy.data.scenes.new(name="BatchSTL_Headless")
+        # --- OPTIMIZED INIT: Create an exact clone of the current active .blend file ---
+        # This completely preserves scene scaling, nested assets, external linkages, and Boolean cutter references.
+        bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True)
 
-        # 2. Transfer the active preset data using our existing JSON tools
-        preset_dict = copy_preset_to_dict(self.preset)
-        paste_preset_from_dict(temp_scene.batch_stl_presets.add(), preset_dict)
-        temp_scene.batch_stl_preset_index = 0
-        temp_scene.batch_stl_root_dir = scene.batch_stl_root_dir
-
-        datablocks = {temp_scene}
-
-        # 3. Link ONLY the preset's collections to the new scene
-        for c in self.preset.collections:
-            c_ptr = bpy.data.collections.get(c.collection_name)
-            if c_ptr and not is_collection_excluded(context, c_ptr):
-                try:
-                    temp_scene.collection.children.link(c_ptr)
-                except RuntimeError:
-                    pass # Prevent crash if already linked
-                datablocks.add(c_ptr)
-
-            # Ensure node groups referenced in pinned overrides are bundled
-            for ng in c.nodegroups:
-                ng_ptr = bpy.data.node_groups.get(ng.group_name)
-                if ng_ptr: datablocks.add(ng_ptr)
-
-            # Ensure node groups referenced in local overrides are bundled
-            for obj in c.objects:
-                for ng in obj.nodegroups:
-                    ng_ptr = bpy.data.node_groups.get(ng.group_name)
-                    if ng_ptr: datablocks.add(ng_ptr)
-
-        # 4. Write isolated file to disk (Extremely fast, ignores unneeded data)
-        # Blender automatically pulls in dependency objects (like Boolean targets)
-        bpy.data.libraries.write(filepath=self.temp_blend, datablocks=datablocks, fake_user=True)
-
-        # 5. Clean up main file instantly to protect the user's workspace
-        bpy.data.scenes.remove(temp_scene)
+        # Write export manifest mapping indices and output destinations
+        job_data = {
+            "preset_index": self.preset_idx,
+            "root_dir": bpy.path.abspath(scene.batch_stl_root_dir)
+        }
+        with open(self.job_json, 'w') as f:
+            json.dump(job_data, f)
         # -------------------------------------------------------------------------
 
+        # Fallback safeguard: If executed from the Text Editor, __file__ is undefined.
+        # This reliably writes the execution code out to a temporary file for the worker process.
+        script_file = getattr(sys.modules.get(__name__), '__file__', '')
+        if not script_file or not os.path.exists(script_file):
+            script_file = os.path.join(self.temp_dir, "batch_stl_script.py")
+            script_text = ""
+            for text in bpy.data.texts:
+                if "Fast Batch STL Exporter" in text.as_string():
+                    script_text = text.as_string()
+                    break
+            with open(script_file, 'w', encoding="utf-8") as f:
+                f.write(script_text)
+
         # Build the terminal command that launches a hidden ('headless') Blender
-        # Note: We pass "0" because our temporary scene only contains this single copied preset
         cmd = [
             bpy.app.binary_path, "--factory-startup", "-b", self.temp_blend,
-            "-P", __file__, "--", "--batch-stl-headless", "0"
+            "-P", script_file, "--", "--batch-stl-headless", self.job_json
         ]
 
         try:
-            self.process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # OPTIMIZED: Set explicit encoding and errors to prevent stdout pipe drops on non-ASCII characters
+            self.process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8", errors="replace"
+            )
         except Exception as e:
             self.report({'ERROR'}, f"Failed to spawn headless Blender: {e}")
             self.cleanup(context)
@@ -2793,10 +2702,10 @@ if __name__ == "__main__":
         if not hasattr(bpy.types.Scene, "batch_stl_root_dir"):
             register()
 
-        # Find the preset number from the command line arguments and launch the headless exporter.
+        # Retrieve the JSON job manifest file argument and launch the exporter
         idx = sys.argv.index("--batch-stl-headless")
-        p_index = int(sys.argv[idx + 1])
-        run_headless_export(p_index)
+        job_file = sys.argv[idx + 1]
+        run_headless_export(job_file)
     else:
         # Standard fallback just in case the file is executed without parameters
         if not hasattr(bpy.types.Scene, "batch_stl_root_dir"):
