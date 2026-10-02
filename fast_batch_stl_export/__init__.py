@@ -46,7 +46,8 @@ _ui_cache = {
     "visibility": {},
     "metrics": {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0},
     "active_col_metrics": {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0},
-    "tree": ({}, set())
+    "tree": ({}, set()),
+    "preset_metrics": {}
 }
 
 def mark_dirty(self=None, context=None):
@@ -667,6 +668,35 @@ def paste_preset_from_dict(new_p, data):
 
 
 # --- UI CACHE ENGINE ---
+def _get_preset_status(preset):
+    has_ovr = False
+    has_perm = False
+    for c in preset.collections:
+        if len(c.nodegroups) > 0: has_ovr = True
+        if not has_perm:
+            for ng in c.nodegroups:
+                for n in ng.nodes:
+                    for i in n.inputs:
+                        if len(i.values) > 1 or any(getattr(v, "use_sweep", False) for v in i.values):
+                            has_perm = True; break
+                    if has_perm: break
+                if has_perm: break
+        for obj in c.objects:
+            if obj.export:
+                if len(obj.nodegroups) > 0: has_ovr = True
+                if not has_perm:
+                    for ng in obj.nodegroups:
+                        for n in ng.nodes:
+                            for i in n.inputs:
+                                if len(i.values) > 1 or any(getattr(v, "use_sweep", False) for v in i.values):
+                                    has_perm = True; break
+                            if has_perm: break
+                        if has_perm: break
+        if has_ovr and has_perm:
+            break
+    return has_ovr, has_perm
+
+
 # Background timer executes heavy calculation outside of `draw()`
 def rebuild_ui_cache_if_dirty():
     if not _ui_cache.get("is_dirty", False):
@@ -679,6 +709,12 @@ def rebuild_ui_cache_if_dirty():
         return 1.0
 
     scene = context.scene
+
+    preset_metrics = {}
+    for p in scene.batch_stl_presets:
+        ho, hp = _get_preset_status(p)
+        preset_metrics[p.name] = {"has_ovr": ho, "has_perm": hp}
+    _ui_cache["preset_metrics"] = preset_metrics
 
     # 1. Evaluate explicit visibility to prevent recursive outliner walks on redraw
     visibility = {}
@@ -965,6 +1001,8 @@ def run_headless_export(job_file_path):
             job_data = json.load(f)
         preset_index = job_data["preset_index"]
         root_dir = job_data["root_dir"]
+        start_time_unix = job_data.get("start_time", time.time())
+        skip_direct = job_data.get("skip_direct", False)
     except Exception as e:
         print(f"ERROR: Failed to load job manifest: {e}")
         sys.exit(1)
@@ -979,14 +1017,6 @@ def run_headless_export(job_file_path):
     preset = scene.batch_stl_presets[preset_index]
     if preset.preset_prefix:
         root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
-
-    print(f"\n=== STARTING HEADLESS ISOLATED EXPORT: {preset.name} ===")
-
-    # Pre-sync collection objects to ensure accuracy before building batches
-    for c in preset.collections:
-        c_ptr = bpy.data.collections.get(c.collection_name)
-        if c_ptr and not is_collection_excluded(bpy.context, c_ptr):
-            sync_collection_objects(c, c_ptr)
 
     print("\n  [Phase 0] Evaluating Targets and Building Depsgraph Culling Maps...")
     t_phase0_start = time.perf_counter()
@@ -1007,6 +1037,9 @@ def run_headless_export(job_file_path):
 
             sig_local = get_override_signature(get_flat_overrides(obj_prop.nodegroups))
             full_sig = sig_pinned + sig_local
+
+            if not full_sig and skip_direct:
+                continue
 
             # Groups items with identical required steps together in 'execution_batches'
             if full_sig not in execution_batches: execution_batches[full_sig] = []
@@ -1044,9 +1077,9 @@ def run_headless_export(job_file_path):
 
     current_op_step = 0
     batch_counter = 1
+    first_export_started = False
 
     for signature, batch_items in execution_batches.items():
-        t_batch_start = time.perf_counter()
         first_c, first_obj_prop, _ = batch_items[0]
         all_overrides = get_flat_overrides(first_c.nodegroups) + get_flat_overrides(first_obj_prop.nodegroups)
 
@@ -1059,11 +1092,6 @@ def run_headless_export(job_file_path):
                 freq_dict[key] = freq_dict.get(key, 0) + weight
 
         combinations = generate_override_combinations(all_overrides)
-
-        is_clean_batch = len(get_flat_overrides(first_obj_prop.nodegroups)) == 0
-        batch_type = "Clean (Pinned Only)" if is_clean_batch else f"Dirty ({len(get_flat_overrides(first_obj_prop.nodegroups))} Local Overrides)"
-        print(f"  ├─ Batch {batch_counter}/{len(execution_batches)} [{batch_type}]: Processing {len(batch_items)} mapped instances with {len(combinations)} permutation(s)")
-
         batch_objects = {item[2] for item in batch_items}
         batch_export_targets = batch_items
 
@@ -1071,7 +1099,6 @@ def run_headless_export(job_file_path):
         # Exclude all collections not currently being processed (only if overrides are applied)
         isolated_collections = []
         if len(all_overrides) > 0:
-
             # Extract the exact collections containing the active target objects
             batch_col_names = set()
             for item in batch_items:
@@ -1100,7 +1127,13 @@ def run_headless_export(job_file_path):
         try:
             # This loop walks through every mathematical combination (permutation) we created and runs the export
             for combo_idx, combo in enumerate(combinations):
-                print(f"  │    ├─ Permutation {combo_idx + 1}/{len(combinations)}")
+                t_perm_start = time.perf_counter()
+
+                if not first_export_started:
+                    init_time = time.time() - start_time_unix
+                    print(f"=== Headless init took {init_time:.2f} s to start first export ===", flush=True)
+                    first_export_started = True
+
                 combo_suffix = ""
                 combo_subpath = ""
                 processed_params = set()
@@ -1121,8 +1154,6 @@ def run_headless_export(job_file_path):
                         if is_permutation and getattr(inp, "use_dir", False): combo_subpath = os.path.join(combo_subpath, naming_str)
                         processed_params.add(param_key)
 
-                t_ovr = time.perf_counter()
-
                 # Apply the current setup iteration.
                 active_overrides = reconstruct_overrides_for_combo(combo)
                 apply_overrides(active_overrides, batch_objects)
@@ -1130,15 +1161,12 @@ def run_headless_export(job_file_path):
                 # CRITICAL FIX: Force Blender to evaluate the modifier parameter changes before grabbing the mesh!
                 bpy.context.view_layer.update()
 
-                print(f"  │    │    ├─ Applied & Synced Modifiers: {time.perf_counter() - t_ovr:.4f}s")
-
                 for c, obj_prop, bl_obj in batch_export_targets:
                     # Apply Object sub-directory implicitly
                     obj_subpath = obj_prop.sub_path.replace('\\', '/') if obj_prop.sub_path else ""
 
                     out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path, obj_subpath, combo_subpath))
                     os.makedirs(out_dir, exist_ok=True)
-                    print(f"  │    │    ├─ Exporting: {bl_obj.name}{' ['+c.tag+']' if c.tag else ''}")
 
                     # Apply Object tagging mechanism
                     safe_name = bpy.path.clean_name(bl_obj.name)
@@ -1147,11 +1175,9 @@ def run_headless_export(job_file_path):
                         elif obj_prop.tag.endswith("_"): safe_name = obj_prop.tag + safe_name
                         else: safe_name = obj_prop.tag
 
-                    t_eval = time.perf_counter()
                     obj_eval = bl_obj.evaluated_get(depsgraph) # Asks Blender to resolve all modifiers to get the final mesh
                     try: mesh = obj_eval.to_mesh()
                     except RuntimeError: mesh = None
-                    print(f"  │         ├─ Evaluated Mesh [{bl_obj.name}]: {time.perf_counter() - t_eval:.4f}s")
 
                     if mesh:
                         base_tag = c.tag if getattr(c, "use_tag", False) and c.tag else ""
@@ -1159,8 +1185,14 @@ def run_headless_export(job_file_path):
                         filepath = os.path.join(out_dir, f"{safe_name}{final_tag}.stl")
 
                         # Our custom fast function is called right here!
-                        write_fast_binary_stl(filepath, mesh, bl_obj.matrix_world, verbose=True)
+                        write_fast_binary_stl(filepath, mesh, bl_obj.matrix_world, verbose=False)
                         obj_eval.to_mesh_clear() # Very important to throw away data so we don't leak memory.
+
+                    perm_time = time.perf_counter() - t_perm_start
+                    msg1 = f"{preset.name} | {c.collection_name} | {bl_obj.name} | Permutation {combo_idx + 1}/{len(combinations)} | Batch {batch_counter}/{len(execution_batches)}"
+                    msg2 = f"  └─ {filepath} | {perm_time:.2f} s"
+                    print(msg1)
+                    print(msg2)
 
                     # Ensure progress always continues even on empty evaluation meshes
                     current_op_step += 1
@@ -1170,10 +1202,8 @@ def run_headless_export(job_file_path):
             # A 'finally' block *always* executes, even if the 'try' block crashed.
             # This guarantees we don't leave Blender broken after an error.
             # OPTIMIZATION: Revert states ONCE after all permutations complete, breaking the Revert-Update trap
-            t_rev = time.perf_counter()
             revert_overrides(baseline_global_states, baseline_mod_states, batch_objects)
             bpy.context.view_layer.update()
-            print(f"  │    ├─ Reverted permutation overrides: {time.perf_counter() - t_rev:.4f}s")
 
         # --- STRICT BATCH ISOLATION END ---
         # Restore previously visible collections
@@ -1181,11 +1211,8 @@ def run_headless_export(job_file_path):
             if name in layer_collection_map:
                 layer_collection_map[name].exclude = False
         # ----------------------------------
-
-        print(f"  │    => Batch Iteration Total Time: {time.perf_counter() - t_batch_start:.4f}s\n")
         batch_counter += 1
 
-    print(f"\n=== HEADLESS EXPORT COMPLETE: {time.perf_counter() - total_time_start:.4f}s Subprocess Execution ===\n")
     print("BATCH_STL_DONE", flush=True)
     sys.exit(0)
 
@@ -2010,6 +2037,84 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         context.scene.batch_stl_show_console = True
         verbose = scene.batch_stl_verbose_console
 
+        # --- PRE-EVALUATE AND DIRECT EXPORT BYPASS FOR NO-OVERRIDE OBJECTS ---
+        objects_to_export_directly = []
+        objects_needing_headless = []
+
+        preset_root = bpy.path.abspath(scene.batch_stl_root_dir)
+        if self.preset.preset_prefix:
+            preset_root = os.path.normpath(os.path.join(preset_root, self.preset.preset_prefix))
+
+        for c in self.preset.collections:
+            c_ptr = bpy.data.collections.get(c.collection_name)
+            if not c_ptr or is_collection_excluded(bpy.context, c_ptr): continue
+            sync_collection_objects(c, c_ptr)
+
+            c_pinned_ovrs = get_flat_overrides(c.nodegroups)
+            for obj_prop in c.objects:
+                if not obj_prop.export: continue
+                bl_obj = c_ptr.all_objects.get(obj_prop.name)
+                if not bl_obj or bl_obj.hide_viewport or bl_obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
+                    continue
+
+                obj_ovrs = get_flat_overrides(obj_prop.nodegroups)
+                if len(c_pinned_ovrs) == 0 and len(obj_ovrs) == 0:
+                    objects_to_export_directly.append((c, obj_prop, bl_obj))
+                else:
+                    objects_needing_headless.append((c, obj_prop, bl_obj))
+
+        # Native direct evaluation logic to skip headless bottleneck on plain items
+        if objects_to_export_directly:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            log_to_console(self.preset, f"=== STARTING NATIVE DIRECT EXPORT ({len(objects_to_export_directly)} Objects) ===")
+
+            for c, obj_prop, bl_obj in objects_to_export_directly:
+                t_dir_start = time.perf_counter()
+
+                obj_subpath = obj_prop.sub_path.replace('\\', '/') if obj_prop.sub_path else ""
+                out_dir = os.path.normpath(os.path.join(preset_root, c.sub_path, obj_subpath))
+                os.makedirs(out_dir, exist_ok=True)
+
+                safe_name = bpy.path.clean_name(bl_obj.name)
+                if obj_prop.tag:
+                    if obj_prop.tag.startswith("_"): safe_name = safe_name + obj_prop.tag
+                    elif obj_prop.tag.endswith("_"): safe_name = obj_prop.tag + safe_name
+                    else: safe_name = obj_prop.tag
+
+                base_tag = c.tag if getattr(c, "use_tag", False) and c.tag else ""
+                filepath = os.path.join(out_dir, f"{safe_name}{base_tag}.stl")
+
+                obj_eval = bl_obj.evaluated_get(depsgraph)
+                try: mesh = obj_eval.to_mesh()
+                except RuntimeError: mesh = None
+
+                if mesh:
+                    write_fast_binary_stl(filepath, mesh, bl_obj.matrix_world, verbose=False)
+                    obj_eval.to_mesh_clear()
+
+                time_str = f"{time.perf_counter() - t_dir_start:.2f} s"
+                msg1 = f"{self.preset.name} | {c.collection_name} | {bl_obj.name} | Permutation 1/1 | Batch 1/1"
+                msg2 = f"  └─ {filepath} | {time_str}"
+
+                log_to_console(self.preset, f"[{self.preset.name}] {msg1}")
+                log_to_console(self.preset, f"[{self.preset.name}] {msg2}")
+                if context.scene.batch_stl_verbose_console:
+                    print(f"[{self.preset.name}] {msg1}")
+                    print(f"[{self.preset.name}] {msg2}")
+
+        if not objects_needing_headless:
+            self.preset.export_progress = 1.0
+            total_time = time.perf_counter() - self.export_start_time
+            self.preset.last_export_time = total_time
+            end_msg = f"=== BATCH EXPORT COMPLETE ({total_time:.4f}s) ==="
+            if context.scene.batch_stl_verbose_console: print(end_msg)
+            log_to_console(self.preset, end_msg)
+            self.report({'INFO'}, f"Batch Export {self.preset.name} Complete in {total_time:.2f}s.")
+            for area in context.screen.areas: area.tag_redraw()
+            self.cleanup(context)
+            return {'FINISHED'}
+        # -------------------------------------------------------------------------
+
         self.preset.export_status = f"Spawning Worker... (0.0s)"
         t_spawn_start = time.perf_counter()
 
@@ -2024,7 +2129,9 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         # Write export manifest mapping indices and output destinations
         job_data = {
             "preset_index": self.preset_idx,
-            "root_dir": bpy.path.abspath(scene.batch_stl_root_dir)
+            "root_dir": bpy.path.abspath(scene.batch_stl_root_dir),
+            "start_time": time.time(),
+            "skip_direct": True
         }
         with open(self.job_json, 'w') as f:
             json.dump(job_data, f)
@@ -2183,6 +2290,16 @@ class BATCH_STL_UL_presets(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True) # row(align=True) snaps buttons together without spacing
         row.prop(item, "name", text="", emboss=False) # 'emboss=False' makes it look like plain text, not a button
+
+        metrics = _ui_cache.get("preset_metrics", {}).get(item.name, {"has_ovr": False, "has_perm": False})
+        icon_ovr = 'NODETREE' if metrics["has_ovr"] else 'BLANK1'
+        icon_perm = 'FILE_REFRESH' if metrics["has_perm"] else 'BLANK1'
+
+        icon_row = row.row(align=True)
+        icon_row.alignment = 'RIGHT'
+        icon_row.label(text="", icon=icon_perm)
+        icon_row.label(text="", icon=icon_ovr)
+
         row.prop(item, "preset_prefix", text="", emboss=False, icon='FILE_FOLDER')
 
         if item.is_exporting:
