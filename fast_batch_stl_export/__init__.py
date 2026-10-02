@@ -2088,13 +2088,53 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
         self.temp_dir = tempfile.mkdtemp(prefix="fast_batch_stl_")
         self.temp_blend = os.path.join(self.temp_dir, "batch_stl_export_temp.blend")
-        # Save a copy of the scene to a temporary folder
-        bpy.ops.wm.save_as_mainfile(filepath=self.temp_blend, copy=True, compress=False)
+
+        # --- OPTIMIZED INIT: Write isolated datablocks instead of the full file ---
+        # 1. Create temporary scene to hold only our targets
+        temp_scene = bpy.data.scenes.new(name="BatchSTL_Headless")
+
+        # 2. Transfer the active preset data using our existing JSON tools
+        preset_dict = copy_preset_to_dict(self.preset)
+        paste_preset_from_dict(temp_scene.batch_stl_presets.add(), preset_dict)
+        temp_scene.batch_stl_preset_index = 0
+        temp_scene.batch_stl_root_dir = scene.batch_stl_root_dir
+
+        datablocks = {temp_scene}
+
+        # 3. Link ONLY the preset's collections to the new scene
+        for c in self.preset.collections:
+            c_ptr = bpy.data.collections.get(c.collection_name)
+            if c_ptr and not is_collection_excluded(context, c_ptr):
+                try:
+                    temp_scene.collection.children.link(c_ptr)
+                except RuntimeError:
+                    pass # Prevent crash if already linked
+                datablocks.add(c_ptr)
+
+            # Ensure node groups referenced in pinned overrides are bundled
+            for ng in c.nodegroups:
+                ng_ptr = bpy.data.node_groups.get(ng.group_name)
+                if ng_ptr: datablocks.add(ng_ptr)
+
+            # Ensure node groups referenced in local overrides are bundled
+            for obj in c.objects:
+                for ng in obj.nodegroups:
+                    ng_ptr = bpy.data.node_groups.get(ng.group_name)
+                    if ng_ptr: datablocks.add(ng_ptr)
+
+        # 4. Write isolated file to disk (Extremely fast, ignores unneeded data)
+        # Blender automatically pulls in dependency objects (like Boolean targets)
+        bpy.data.libraries.write(filepath=self.temp_blend, datablocks=datablocks, fake_user=True)
+
+        # 5. Clean up main file instantly to protect the user's workspace
+        bpy.data.scenes.remove(temp_scene)
+        # -------------------------------------------------------------------------
 
         # Build the terminal command that launches a hidden ('headless') Blender
+        # Note: We pass "0" because our temporary scene only contains this single copied preset
         cmd = [
             bpy.app.binary_path, "--factory-startup", "-b", self.temp_blend,
-            "-P", __file__, "--", "--batch-stl-headless", str(self.preset_idx)
+            "-P", __file__, "--", "--batch-stl-headless", "0"
         ]
 
         try:
