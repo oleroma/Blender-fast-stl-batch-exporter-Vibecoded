@@ -2457,6 +2457,9 @@ def reset_batch_stl_state(scene):
             p.export_progress = 0.0
             p.export_status = ""
     except Exception: pass
+    if "--batch-stl-headless" not in sys.argv:
+            if not bpy.app.timers.is_registered(rebuild_ui_cache_if_dirty):
+                bpy.app.timers.register(rebuild_ui_cache_if_dirty)
 
 # A list of everything Blender needs to load.
 classes = (
