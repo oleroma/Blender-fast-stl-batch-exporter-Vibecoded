@@ -675,6 +675,14 @@ def _get_preset_status(preset):
     has_perm = False
 
     if len(preset.nodegroups) > 0: has_ovr = True
+    if not has_perm:
+        for ng in preset.nodegroups:
+            for n in ng.nodes:
+                for i in n.inputs:
+                    if len(i.values) > 1 or any(getattr(v, "use_sweep", False) for v in i.values):
+                        has_perm = True; break
+                if has_perm: break
+            if has_perm: break
 
     for c in preset.collections:
         if len(c.nodegroups) > 0: has_ovr = True
@@ -859,8 +867,7 @@ def build_tree_dict(context, preset, visibility_cache=None):
                     c_root = c_root[part]
                     c_root_path.append(part)
 
-        # Specifically excluding preset overrides here so they don't visually affect the tree view per requirements
-        c_pinned_ovrs = get_flat_overrides(c.nodegroups)
+        c_pinned_ovrs = get_flat_overrides(preset.nodegroups) + get_flat_overrides(c.nodegroups)
 
         for obj_prop in c.objects:
             if not obj_prop.export: continue
@@ -1715,14 +1722,12 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         action = properties.action
         if action == 'ADD_GROUP': return "Add a new Node Group override"
         elif action == 'DEL_GROUP': return "Delete this Node Group override"
-        elif action == 'PIN_GROUP': return "Pin Group to Collection Overrides (Applies to all objects)"
-        elif action == 'UNPIN_GROUP': return "Unpin Group to Object Overrides (Specific to all valid objects in collection)"
         elif action == 'COPY_GROUP': return "Copy Node Group to clipboard"
         elif action == 'PASTE_GROUP': return "Paste Node Group from clipboard"
         elif action == 'ADD_NODE': return "Add a new Node to override"
         elif action == 'DEL_NODE': return "Delete this Node"
-        elif action == 'MOVE_GROUP_UP': return "Move Group Up"
-        elif action == 'MOVE_GROUP_DOWN': return "Move Group Down"
+        elif action == 'MOVE_GROUP_UP': return "Move Group Up (Shift-Click: Move to parent hierarchy level)"
+        elif action == 'MOVE_GROUP_DOWN': return "Move Group Down (Shift-Click: Move to child hierarchy level)"
         elif action == 'MOVE_NODE_UP': return "Move Node Up"
         elif action == 'MOVE_NODE_DOWN': return "Move Node Down"
         elif action == 'ADD_INPUT': return "Add an Input (Shift-Click: Auto-populate all inputs from Node/Modifier)"
@@ -1752,7 +1757,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         if not preset: return {'CANCELLED'}
 
         global _state
-        if self.action in ['PASTE_GROUP', 'PIN_GROUP', 'UNPIN_GROUP']:
+        if self.action == 'PASTE_GROUP' or (self.action in ['MOVE_GROUP_UP', 'MOVE_GROUP_DOWN'] and self.shift_pressed):
             _state["is_pasting"] = True
 
         try:
@@ -1799,24 +1804,6 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                     self._action_msg = "Add Node Group Override"
                 elif self.action == 'DEL_GROUP':
                     ng_list.remove(self.ng_idx)
-                elif self.action == 'PIN_GROUP':
-                    if not self.is_pinned and not self.is_preset:
-                        src_ng = ng_list[self.ng_idx]
-                        dst_ng = active_col.nodegroups.add()
-                        paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
-                        ng_list.remove(self.ng_idx)
-                elif self.action == 'UNPIN_GROUP':
-                    if self.is_pinned and not self.is_preset:
-                        src_ng = ng_list[self.ng_idx]
-                        ng_dict = copy_ng_to_dict(src_ng)
-
-                        # Paste the copied override into every object's local list
-                        for obj in active_col.objects:
-                            dst_ng = obj.nodegroups.add()
-                            paste_ng_from_dict(dst_ng, ng_dict)
-
-                        # Remove the original pinned override from the collection
-                        ng_list.remove(self.ng_idx)
                 elif self.action == 'COPY_GROUP':
                     global _clipboard
                     _clipboard["nodegroup"] = copy_ng_to_dict(ng_list[self.ng_idx])
@@ -1943,9 +1930,44 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                                 self._action_msg = "Disable Sweep Mode"
 
                 elif self.action == 'MOVE_GROUP_UP':
-                    if self.ng_idx > 0: ng_list.move(self.ng_idx, self.ng_idx - 1)
+                    if self.shift_pressed:
+                        if self.is_pinned and not self.is_preset:
+                            src_ng = ng_list[self.ng_idx]
+                            dst_ng = preset.nodegroups.add()
+                            paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
+                            ng_list.remove(self.ng_idx)
+                            self._action_msg = "Move Override to Preset Level"
+                        elif not self.is_pinned and not self.is_preset:
+                            src_ng = ng_list[self.ng_idx]
+                            active_col = get_active_collection(preset)
+                            if active_col:
+                                dst_ng = active_col.nodegroups.add()
+                                paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
+                                ng_list.remove(self.ng_idx)
+                                self._action_msg = "Move Override to Collection Level"
+                    else:
+                        if self.ng_idx > 0: ng_list.move(self.ng_idx, self.ng_idx - 1)
                 elif self.action == 'MOVE_GROUP_DOWN':
-                    if self.ng_idx < len(ng_list) - 1: ng_list.move(self.ng_idx, self.ng_idx + 1)
+                    if self.shift_pressed:
+                        if self.is_preset:
+                            src_ng = ng_list[self.ng_idx]
+                            active_col = get_active_collection(preset)
+                            if active_col:
+                                dst_ng = active_col.nodegroups.add()
+                                paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
+                                ng_list.remove(self.ng_idx)
+                                self._action_msg = "Move Override to Collection Level"
+                        elif self.is_pinned and not self.is_preset:
+                            src_ng = ng_list[self.ng_idx]
+                            active_col = get_active_collection(preset)
+                            active_obj = get_active_object(active_col) if active_col else None
+                            if active_obj:
+                                dst_ng = active_obj.nodegroups.add()
+                                paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
+                                ng_list.remove(self.ng_idx)
+                                self._action_msg = "Move Override to Object Level"
+                    else:
+                        if self.ng_idx < len(ng_list) - 1: ng_list.move(self.ng_idx, self.ng_idx + 1)
 
                 elif self.action == 'MOVE_NODE_UP':
                     nodes = ng_list[self.ng_idx].nodes
@@ -1969,12 +1991,12 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                     if self.v_idx < len(vals) - 1: vals.move(self.v_idx, self.v_idx + 1)
         except IndexError:
             # Prevents hard crashes if an operator fires out-of-sync with UI list indices
-            if self.action in ['PASTE_GROUP', 'PIN_GROUP', 'UNPIN_GROUP']:
+            if self.action == 'PASTE_GROUP' or (self.action in ['MOVE_GROUP_UP', 'MOVE_GROUP_DOWN'] and getattr(self, 'shift_pressed', False)):
                 _state["is_pasting"] = False
             self.report({'WARNING'}, "UI Sync Error: List mutated unexpectedly. Please try again.")
             return {'CANCELLED'}
         finally:
-            if self.action in ['PASTE_GROUP', 'PIN_GROUP', 'UNPIN_GROUP']:
+            if self.action == 'PASTE_GROUP' or (self.action in ['MOVE_GROUP_UP', 'MOVE_GROUP_DOWN'] and getattr(self, 'shift_pressed', False)):
                 _state["is_pasting"] = False
 
         if self.action != 'COPY_GROUP':
@@ -1982,8 +2004,6 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
             if not msg:
                 action_msgs = {
                     'DEL_GROUP': "Delete Node Group Override",
-                    'PIN_GROUP': "Pin Override to Collection",
-                    'UNPIN_GROUP': "Unpin Override to Object",
                     'PASTE_GROUP': "Paste Node Group Override",
                     'ADD_NODE': "Add Node Target",
                     'DEL_NODE': "Delete Node Target",
@@ -2457,12 +2477,9 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
 
         ng_row.prop_search(ng, "group_name", bpy.data, "node_groups", text="")
 
-        if len(nodegroups) > 1:
-            op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
-            op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
 
-        if not is_preset:
-            op = ng_row.operator("batch_stl.table_action", text="", icon='PINNED' if is_pinned else 'UNPINNED'); op.action = 'UNPIN_GROUP' if is_pinned else 'PIN_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
         op = ng_row.operator("batch_stl.table_action", text="", icon='COPYDOWN'); op.action = 'COPY_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
         op = ng_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
 
@@ -2673,6 +2690,10 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         if scene.batch_stl_ui_presets:
             p_box.template_list("BATCH_STL_UL_presets", "", scene, "batch_stl_presets", scene, "batch_stl_preset_index", rows=3)
 
+        if active_preset:
+            p_box.separator(factor=0.5)
+            draw_overrides_table(p_box, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Preset Overrides ({active_preset.name})", is_preset=True)
+
         if not active_preset:
             rest_col = layout.column()
             rest_col.enabled = not any_exporting
@@ -2699,9 +2720,13 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         if scene.batch_stl_ui_collections:
             m_box.template_list("BATCH_STL_UL_collections", "", active_preset, "collections", active_preset, "collection_index", rows=5)
 
+        active_col = get_active_collection(active_preset)
+        if active_col:
+            m_box.separator(factor=0.5)
+            draw_overrides_table(m_box, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides ({active_col.collection_name or 'Shared'})")
+
         main_col.separator()
 
-        active_col = get_active_collection(active_preset)
         if active_col:
 
             o_box = main_col.box()
@@ -2714,6 +2739,9 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 o_box.template_list("BATCH_STL_UL_objects", "", active_col, "objects", active_col, "object_index", rows=5)
 
             active_obj = get_active_object(active_col)
+            if active_obj:
+                o_box.separator(factor=0.5)
+                draw_overrides_table(o_box, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Object Overrides ({active_obj.name})")
 
             main_col.separator()
             col_metrics = _ui_cache.get("active_col_metrics", {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0})
@@ -2722,22 +2750,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             header.label(text=metric_str, icon='MODIFIER')
             main_col.separator()
 
-            if active_preset:
-                # Preset Global Baseline Overrides
-                draw_overrides_table(main_col, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Preset Overrides ({active_preset.name})", is_preset=True)
-                main_col.separator(factor=0.5)
-
-            if active_col:
-                # Collection Pinned (Shared Overrides)
-                draw_overrides_table(main_col, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides ({active_col.collection_name or 'Shared'})")
-
-            main_col.separator(factor=0.5)
-
-            if active_obj:
-                # Object Local
-                draw_overrides_table(main_col, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Object Overrides ({active_obj.name})")
-
-            main_col.separator(factor=0.5)
             tip_box = main_col.box()
             tip_header = tip_box.row()
             icon_tip = 'TRIA_DOWN' if scene.batch_stl_ui_tips else 'TRIA_RIGHT'
