@@ -626,7 +626,8 @@ def copy_collection_to_dict(c):
 def copy_preset_to_dict(src):
     return {
         "name": src.name, "preset_prefix": src.preset_prefix,
-        "collections": [copy_collection_to_dict(c) for c in src.collections]
+        "collections": [copy_collection_to_dict(c) for c in src.collections],
+        "nodegroups": [copy_ng_to_dict(ng) for ng in src.nodegroups]
     }
 
 # The Paste functions do the exact reverse. They read a JSON dictionary and assign the values back to Blender.
@@ -665,12 +666,16 @@ def paste_preset_from_dict(new_p, data):
     new_p.name = data.get("name", "Imported Preset")
     new_p.preset_prefix = data.get("preset_prefix", "")
     for c_data in data.get("collections", []): paste_collection_from_dict(new_p.collections.add(), c_data)
+    for ng_data in data.get("nodegroups", []): paste_ng_from_dict(new_p.nodegroups.add(), ng_data)
 
 
 # --- UI CACHE ENGINE ---
 def _get_preset_status(preset):
     has_ovr = False
     has_perm = False
+
+    if len(preset.nodegroups) > 0: has_ovr = True
+
     for c in preset.collections:
         if len(c.nodegroups) > 0: has_ovr = True
         if not has_perm:
@@ -746,6 +751,8 @@ def rebuild_ui_cache_if_dirty():
     total_objects = 0
     total_preset_combos = 0
 
+    preset_ovrs = get_flat_overrides(preset.nodegroups)
+
     for c in preset.collections:
         c_ptr = bpy.data.collections.get(c.collection_name)
         sync_collection_objects(c, c_ptr)
@@ -753,7 +760,7 @@ def rebuild_ui_cache_if_dirty():
         if not c_ptr or visibility.get(c.collection_name, True):
             continue
 
-        c_pinned_ovrs = get_flat_overrides(c.nodegroups)
+        c_pinned_ovrs = preset_ovrs + get_flat_overrides(c.nodegroups)
         for obj_prop in c.objects:
             if not obj_prop.export: continue
             bl_obj = c_ptr.all_objects.get(obj_prop.name)
@@ -773,7 +780,7 @@ def rebuild_ui_cache_if_dirty():
     active_col = get_active_collection(preset)
     if active_col:
         active_obj = get_active_object(active_col)
-        all_ovrs = get_flat_overrides(active_col.nodegroups) + (get_flat_overrides(active_obj.nodegroups) if active_obj else [])
+        all_ovrs = preset_ovrs + get_flat_overrides(active_col.nodegroups) + (get_flat_overrides(active_obj.nodegroups) if active_obj else [])
         unique_targets = set()
         total_inputs = 0
 
@@ -852,6 +859,7 @@ def build_tree_dict(context, preset, visibility_cache=None):
                     c_root = c_root[part]
                     c_root_path.append(part)
 
+        # Specifically excluding preset overrides here so they don't visually affect the tree view per requirements
         c_pinned_ovrs = get_flat_overrides(c.nodegroups)
 
         for obj_prop in c.objects:
@@ -1022,12 +1030,14 @@ def run_headless_export(job_file_path):
     t_phase0_start = time.perf_counter()
 
     execution_batches = {}
+    preset_ovrs = get_flat_overrides(preset.nodegroups)
+    sig_preset = get_override_signature(preset_ovrs)
 
     for c in preset.collections:
         c_ptr = bpy.data.collections.get(c.collection_name)
         if not c_ptr or is_collection_excluded(bpy.context, c_ptr): continue
 
-        sig_pinned = get_override_signature(get_flat_overrides(c.nodegroups))
+        sig_pinned = sig_preset + get_override_signature(get_flat_overrides(c.nodegroups))
 
         for obj_prop in c.objects:
             if not obj_prop.export: continue
@@ -1069,7 +1079,7 @@ def run_headless_export(job_file_path):
     total_operations = 0
     for signature, batch_items in execution_batches.items():
         first_c, first_obj_prop, _ = batch_items[0]
-        all_overrides = get_flat_overrides(first_c.nodegroups) + get_flat_overrides(first_obj_prop.nodegroups)
+        all_overrides = preset_ovrs + get_flat_overrides(first_c.nodegroups) + get_flat_overrides(first_obj_prop.nodegroups)
         combinations = generate_override_combinations(all_overrides)
         total_operations += (len(batch_items) * len(combinations))
 
@@ -1081,7 +1091,8 @@ def run_headless_export(job_file_path):
 
     for signature, batch_items in execution_batches.items():
         first_c, first_obj_prop, _ = batch_items[0]
-        all_overrides = get_flat_overrides(first_c.nodegroups) + get_flat_overrides(first_obj_prop.nodegroups)
+        # Applies preset overrides before anything else as a global override
+        all_overrides = preset_ovrs + get_flat_overrides(first_c.nodegroups) + get_flat_overrides(first_obj_prop.nodegroups)
 
         freq_dict = {}
         for o in all_overrides:
@@ -1227,13 +1238,14 @@ def run_headless_export(job_file_path):
 # Globals state check for import/pasting to prevent undo floods
 _state = {
     "is_importing": False,
-    "is_pasting": False
+    "is_pasting": False,
+    "is_populating": False
 }
 
 def update_with_undo(action_name):
     def _updater(self, context):
         mark_dirty()
-        if _state.get("is_importing", False) or _state.get("is_pasting", False):
+        if _state.get("is_importing", False) or _state.get("is_pasting", False) or _state.get("is_populating", False):
             return
         try:
             bpy.ops.ed.undo_push(message=action_name)
@@ -1307,20 +1319,26 @@ def on_input_name_update(self, context):
         preset = get_active_preset(context.scene)
 
         if preset:
-            active_col = get_active_collection(preset)
-            if active_col:
-                for ng in active_col.nodegroups:
-                    for n in ng.nodes:
-                        if self in n.inputs.values(): found_ng, found_node = ng, n; break
-                    if found_ng: break
+            for ng in preset.nodegroups:
+                for n in ng.nodes:
+                    if self in n.inputs.values(): found_ng, found_node = ng, n; break
+                if found_ng: break
 
-                if not found_ng:
-                    active_obj = get_active_object(active_col)
-                    if active_obj:
-                        for ng in active_obj.nodegroups:
-                            for n in ng.nodes:
-                                if self in n.inputs.values(): found_ng, found_node = ng, n; break
-                            if found_ng: break
+            if not found_ng:
+                active_col = get_active_collection(preset)
+                if active_col:
+                    for ng in active_col.nodegroups:
+                        for n in ng.nodes:
+                            if self in n.inputs.values(): found_ng, found_node = ng, n; break
+                        if found_ng: break
+
+                    if not found_ng:
+                        active_obj = get_active_object(active_col)
+                        if active_obj:
+                            for ng in active_obj.nodegroups:
+                                for n in ng.nodes:
+                                    if self in n.inputs.values(): found_ng, found_node = ng, n; break
+                                if found_ng: break
 
         if found_ng and found_node:
             ng_ptr = bpy.data.node_groups.get(found_ng.group_name)
@@ -1328,7 +1346,7 @@ def on_input_name_update(self, context):
             for v in self.values: v.use_sweep = False
     except Exception: pass
 
-    if not (_state.get("is_importing", False) or _state.get("is_pasting", False)):
+    if not (_state.get("is_importing", False) or _state.get("is_pasting", False) or _state.get("is_populating", False)):
         try: bpy.ops.ed.undo_push(message="Update Input Socket Name")
         except Exception: pass
 
@@ -1340,16 +1358,20 @@ def search_target_node_cb(self, context, edit_text):
     preset = get_active_preset(context.scene)
 
     if preset:
-        active_col = get_active_collection(preset)
-        if active_col:
-            for ng in active_col.nodegroups:
-                if self in ng.nodes.values(): found_ng = ng; break
+        for ng in preset.nodegroups:
+            if self in ng.nodes.values(): found_ng = ng; break
 
-            if not found_ng:
-                active_obj = get_active_object(active_col)
-                if active_obj:
-                    for ng in active_obj.nodegroups:
-                        if self in ng.nodes.values(): found_ng = ng; break
+        if not found_ng:
+            active_col = get_active_collection(preset)
+            if active_col:
+                for ng in active_col.nodegroups:
+                    if self in ng.nodes.values(): found_ng = ng; break
+
+                if not found_ng:
+                    active_obj = get_active_object(active_col)
+                    if active_obj:
+                        for ng in active_obj.nodegroups:
+                            if self in ng.nodes.values(): found_ng = ng; break
 
     ng_ptr = bpy.data.node_groups.get(found_ng.group_name) if found_ng else None
     if ng_ptr:
@@ -1369,24 +1391,32 @@ def search_menu_items_cb(self, context, edit_text):
     preset = get_active_preset(context.scene)
 
     if preset:
-        active_col = get_active_collection(preset)
-        if active_col:
-            for ng in active_col.nodegroups:
-                for n in ng.nodes:
-                    for i in n.inputs:
-                        if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
-                    if found_inp: break
+        for ng in preset.nodegroups:
+            for n in ng.nodes:
+                for i in n.inputs:
+                    if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
                 if found_inp: break
+            if found_inp: break
 
-            if not found_inp:
-                active_obj = get_active_object(active_col)
-                if active_obj:
-                    for ng in active_obj.nodegroups:
-                        for n in ng.nodes:
-                            for i in n.inputs:
-                                if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
-                            if found_inp: break
+        if not found_inp:
+            active_col = get_active_collection(preset)
+            if active_col:
+                for ng in active_col.nodegroups:
+                    for n in ng.nodes:
+                        for i in n.inputs:
+                            if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
                         if found_inp: break
+                    if found_inp: break
+
+                if not found_inp:
+                    active_obj = get_active_object(active_col)
+                    if active_obj:
+                        for ng in active_obj.nodegroups:
+                            for n in ng.nodes:
+                                for i in n.inputs:
+                                    if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
+                                if found_inp: break
+                            if found_inp: break
 
     items = []
     ng_ptr = bpy.data.node_groups.get(found_ng.group_name) if found_ng else None
@@ -1484,6 +1514,8 @@ class BatchSTLExportPreset(bpy.types.PropertyGroup):
 
     collections: bpy.props.CollectionProperty(type=BatchSTLCollection)
     collection_index: bpy.props.IntProperty(name="Collection Index", default=0, update=upd_preset_col_idx)
+
+    nodegroups: bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
 
     is_exporting: bpy.props.BoolProperty(default=False)
     cancel_export: bpy.props.BoolProperty(default=False)
@@ -1667,6 +1699,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
     # Operators can have variables passed into them to specify their target!
     # By taking indices for group (ng), node (n), input (i) and value (v), one operator controls the entire table.
     action: bpy.props.StringProperty()
+    is_preset: bpy.props.BoolProperty(default=False)
     is_pinned: bpy.props.BoolProperty()
     c_idx: bpy.props.IntProperty(default=-1)
     o_idx: bpy.props.IntProperty(default=-1)
@@ -1728,157 +1761,168 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                     c = preset.collections[self.c_idx]
                     c.use_tag = not c.use_tag
                     self._action_msg = "Toggle Collection Tagging"
-            else:
+            elif self.action == 'TOGGLE_OBJECT_EXPORT':
                 active_col = get_active_collection(preset)
-                if not active_col: return {'CANCELLED'}
-
-                if self.action == 'TOGGLE_OBJECT_EXPORT':
-                    if 0 <= self.o_idx < len(active_col.objects):
-                        obj = active_col.objects[self.o_idx]
-                        obj.export = not obj.export
-                        self._action_msg = "Toggle Object Export"
+                if active_col and 0 <= self.o_idx < len(active_col.objects):
+                    obj = active_col.objects[self.o_idx]
+                    obj.export = not obj.export
+                    self._action_msg = "Toggle Object Export"
+            else:
+                if self.is_preset:
+                    ng_list = preset.nodegroups
+                elif self.is_pinned:
+                    active_col = get_active_collection(preset)
+                    if not active_col: return {'CANCELLED'}
+                    ng_list = active_col.nodegroups
                 else:
-                    if self.is_pinned:
-                        ng_list = active_col.nodegroups
-                    else:
-                        active_obj = get_active_object(active_col)
-                        if not active_obj: return {'CANCELLED'}
-                        ng_list = active_obj.nodegroups
+                    active_col = get_active_collection(preset)
+                    if not active_col: return {'CANCELLED'}
+                    active_obj = get_active_object(active_col)
+                    if not active_obj: return {'CANCELLED'}
+                    ng_list = active_obj.nodegroups
 
-                    if self.action == 'TOGGLE_VALUE_USE_DIR':
-                        val = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx]
-                        val.use_dir = not val.use_dir
-                        self._action_msg = "Toggle Value Directory Mapping"
-                    elif self.action == 'TOGGLE_VALUE_USE_TAG':
-                        val = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx]
-                        val.use_tag = not val.use_tag
-                        self._action_msg = "Toggle Value Tagging"
+                if self.action == 'TOGGLE_VALUE_USE_DIR':
+                    val = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx]
+                    val.use_dir = not val.use_dir
+                    self._action_msg = "Toggle Value Directory Mapping"
+                elif self.action == 'TOGGLE_VALUE_USE_TAG':
+                    val = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values[self.v_idx]
+                    val.use_tag = not val.use_tag
+                    self._action_msg = "Toggle Value Tagging"
 
-                    elif self.action == 'ADD_GROUP':
-                        ng = ng_list.add()
-                        node = ng.nodes.add()
-                        node.name = "<Modifier Interface>"
-                        inp = node.inputs.add()
-                        inp.values.add()
-                        self._action_msg = "Add Node Group Override"
-                    elif self.action == 'DEL_GROUP':
+                elif self.action == 'ADD_GROUP':
+                    ng = ng_list.add()
+                    node = ng.nodes.add()
+                    node.name = "<Modifier Interface>"
+                    inp = node.inputs.add()
+                    inp.values.add()
+                    self._action_msg = "Add Node Group Override"
+                elif self.action == 'DEL_GROUP':
+                    ng_list.remove(self.ng_idx)
+                elif self.action == 'PIN_GROUP':
+                    if not self.is_pinned and not self.is_preset:
+                        src_ng = ng_list[self.ng_idx]
+                        dst_ng = active_col.nodegroups.add()
+                        paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
                         ng_list.remove(self.ng_idx)
-                    elif self.action == 'PIN_GROUP':
-                        if not self.is_pinned:
-                            src_ng = ng_list[self.ng_idx]
-                            dst_ng = active_col.nodegroups.add()
-                            paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
-                            ng_list.remove(self.ng_idx)
-                    elif self.action == 'UNPIN_GROUP':
-                        if self.is_pinned:
-                            src_ng = ng_list[self.ng_idx]
-                            ng_dict = copy_ng_to_dict(src_ng)
+                elif self.action == 'UNPIN_GROUP':
+                    if self.is_pinned and not self.is_preset:
+                        src_ng = ng_list[self.ng_idx]
+                        ng_dict = copy_ng_to_dict(src_ng)
 
-                            # Paste the copied override into every object's local list
-                            for obj in active_col.objects:
-                                dst_ng = obj.nodegroups.add()
-                                paste_ng_from_dict(dst_ng, ng_dict)
+                        # Paste the copied override into every object's local list
+                        for obj in active_col.objects:
+                            dst_ng = obj.nodegroups.add()
+                            paste_ng_from_dict(dst_ng, ng_dict)
 
-                            # Remove the original pinned override from the collection
-                            ng_list.remove(self.ng_idx)
-                    elif self.action == 'COPY_GROUP':
-                        global _clipboard
-                        _clipboard["nodegroup"] = copy_ng_to_dict(ng_list[self.ng_idx])
-                    elif self.action == 'PASTE_GROUP':
-                        if _clipboard.get("nodegroup"):
-                            paste_ng_from_dict(ng_list.add(), _clipboard["nodegroup"])
+                        # Remove the original pinned override from the collection
+                        ng_list.remove(self.ng_idx)
+                elif self.action == 'COPY_GROUP':
+                    global _clipboard
+                    _clipboard["nodegroup"] = copy_ng_to_dict(ng_list[self.ng_idx])
+                elif self.action == 'PASTE_GROUP':
+                    if _clipboard.get("nodegroup"):
+                        paste_ng_from_dict(ng_list.add(), _clipboard["nodegroup"])
 
-                    elif self.action == 'ADD_NODE':
-                        node = ng_list[self.ng_idx].nodes.add()
-                        node.name = "<Modifier Interface>"
-                        inp = node.inputs.add()
-                        inp.values.add()
-                        self._action_msg = "Add Node Target"
-                    elif self.action == 'DEL_NODE':
-                        ng_list[self.ng_idx].nodes.remove(self.n_idx)
+                elif self.action == 'ADD_NODE':
+                    node = ng_list[self.ng_idx].nodes.add()
+                    node.name = "<Modifier Interface>"
+                    inp = node.inputs.add()
+                    inp.values.add()
+                    self._action_msg = "Add Node Target"
+                elif self.action == 'DEL_NODE':
+                    ng_list[self.ng_idx].nodes.remove(self.n_idx)
 
-                    elif self.action == 'ADD_INPUT':
-                        ng = ng_list[self.ng_idx]
-                        node = ng.nodes[self.n_idx]
-                        ng_ptr = bpy.data.node_groups.get(ng.group_name)
+                elif self.action == 'ADD_INPUT':
+                    ng = ng_list[self.ng_idx]
+                    node = ng.nodes[self.n_idx]
+                    ng_ptr = bpy.data.node_groups.get(ng.group_name)
 
-                        # Auto-populates all available inputs automatically if the user holds SHIFT
-                        if self.shift_pressed and ng_ptr:
-                            is_mod = not node.name or node.name == "<Modifier Interface>"
-                            source_inputs = []
-                            if is_mod and hasattr(ng_ptr, "interface"):
-                                for item in ng_ptr.interface.items_tree:
-                                    if getattr(item, "item_type", "SOCKET") == 'SOCKET' and getattr(item, "in_out", "INPUT") == 'INPUT':
-                                        source_inputs.append(item.name)
-                            elif not is_mod and node.name:
-                                target_n = ng_ptr.nodes.get(node.name.split(" [")[0].strip())
-                                if target_n:
-                                    for i in target_n.inputs:
-                                        if not getattr(i, "is_unavailable", False) and not getattr(i, "hide", False):
-                                            source_inputs.append(i.name)
+                    # Auto-populates all available inputs automatically if the user holds SHIFT
+                    if self.shift_pressed and ng_ptr:
+                        is_mod = not node.name or node.name == "<Modifier Interface>"
+                        source_inputs = []
+                        if is_mod and hasattr(ng_ptr, "interface"):
+                            for item in ng_ptr.interface.items_tree:
+                                if getattr(item, "item_type", "SOCKET") == 'SOCKET' and getattr(item, "in_out", "INPUT") == 'INPUT':
+                                    source_inputs.append(item.name)
+                        elif not is_mod and node.name:
+                            target_n = ng_ptr.nodes.get(node.name.split(" [")[0].strip())
+                            if target_n:
+                                for i in target_n.inputs:
+                                    if not getattr(i, "is_unavailable", False) and not getattr(i, "hide", False):
+                                        source_inputs.append(i.name)
 
-                            if source_inputs:
-                                existing_names = {i.name for i in node.inputs}
-                                added = False
+                        if source_inputs:
+                            existing_names = {i.name for i in node.inputs}
+                            added = False
+
+                            _state["is_populating"] = True
+                            try:
                                 for s_name in source_inputs:
                                     if s_name and s_name not in existing_names:
                                         inp = node.inputs.add()
                                         inp.name = s_name
                                         inp.values.add()
                                         added = True
-                                if added:
-                                    mark_dirty()
-                                    bpy.ops.ed.undo_push(message="Auto-Populate Input Parameters")
-                                    return {'FINISHED'}
+                            finally:
+                                _state["is_populating"] = False
 
-                        inp = node.inputs.add()
-                        inp.values.add()
-                        self._action_msg = "Add Input Parameter"
-                    elif self.action == 'DEL_INPUT':
+                            if added:
+                                mark_dirty()
+                                bpy.ops.ed.undo_push(message="Auto-Populate Input Parameters")
+                                return {'FINISHED'}
+
+                    inp = node.inputs.add()
+                    inp.values.add()
+                    self._action_msg = "Add Input Parameter"
+                elif self.action == 'DEL_INPUT':
+                    ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
+
+                elif self.action == 'DEL_VALUE':
+                    ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.remove(self.v_idx)
+
+                elif self.action == 'DEL_VALUE_OR_INPUT':
+                    inp = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
+                    if len(inp.values) > 1:
+                        inp.values.remove(self.v_idx)
+                    else:
                         ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
 
-                    elif self.action == 'DEL_VALUE':
-                        ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values.remove(self.v_idx)
+                elif self.action in ['ADD_VALUE', 'TOGGLE_SWEEP', 'VALUE_ACTION']:
+                    vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
 
-                    elif self.action == 'DEL_VALUE_OR_INPUT':
-                        inp = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
-                        if len(inp.values) > 1:
-                            inp.values.remove(self.v_idx)
-                        else:
-                            ng_list[self.ng_idx].nodes[self.n_idx].inputs.remove(self.i_idx)
-
-                    elif self.action in ['ADD_VALUE', 'TOGGLE_SWEEP', 'VALUE_ACTION']:
-                        vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
-
-                        if self.v_idx < 0:
-                            vals.add()
-                            self._action_msg = "Add Parameter Value"
-                        else:
-                            val = vals[self.v_idx]
-                            if not val.use_sweep:
-                                if self.shift_pressed:
-                                    val.use_sweep = True
-                                    for j in reversed(range(len(vals))):
-                                        if j != self.v_idx: vals.remove(j)
-                                    self._action_msg = "Enable Sweep Mode"
-                                else:
-                                    vals.add()
-                                    self._action_msg = "Add Parameter Value"
+                    if self.v_idx < 0:
+                        vals.add()
+                        self._action_msg = "Add Parameter Value"
+                    else:
+                        val = vals[self.v_idx]
+                        if not val.use_sweep:
+                            if self.shift_pressed:
+                                val.use_sweep = True
+                                for j in reversed(range(len(vals))):
+                                    if j != self.v_idx: vals.remove(j)
+                                self._action_msg = "Enable Sweep Mode"
                             else:
-                                val.use_sweep = False
-                                if self.shift_pressed:
-                                    inp_obj = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
-                                    if inp_obj.override_type in ['FLOAT', 'INT', 'MENU', 'BOOLEAN']:
-                                        ng_obj = ng_list[self.ng_idx]
-                                        ng_ptr = bpy.data.node_groups.get(ng_obj.group_name)
-                                        node_obj = ng_obj.nodes[self.n_idx]
-                                        target = 'MODIFIER' if not node_obj.name or node_obj.name == "<Modifier Interface>" else 'NODE'
+                                vals.add()
+                                self._action_msg = "Add Parameter Value"
+                        else:
+                            val.use_sweep = False
+                            if self.shift_pressed:
+                                inp_obj = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx]
+                                if inp_obj.override_type in ['FLOAT', 'INT', 'MENU', 'BOOLEAN']:
+                                    ng_obj = ng_list[self.ng_idx]
+                                    ng_ptr = bpy.data.node_groups.get(ng_obj.group_name)
+                                    node_obj = ng_obj.nodes[self.n_idx]
+                                    target = 'MODIFIER' if not node_obj.name or node_obj.name == "<Modifier Interface>" else 'NODE'
 
-                                        temp_inp = MockInput(inp_obj, val, is_temp=True)
-                                        temp_ovr = MockOverride(target, ng_ptr, node_obj.name, [temp_inp])
+                                    temp_inp = MockInput(inp_obj, val, is_temp=True)
+                                    temp_ovr = MockOverride(target, ng_ptr, node_obj.name, [temp_inp])
 
-                                        parsed_vals = parse_sweep_values(temp_ovr, temp_inp)
-                                        if parsed_vals:
+                                    parsed_vals = parse_sweep_values(temp_ovr, temp_inp)
+                                    if parsed_vals:
+                                        _state["is_populating"] = True
+                                        try:
                                             first_val = parsed_vals[0]
                                             if inp_obj.override_type == 'FLOAT': val.value_float = first_val
                                             elif inp_obj.override_type == 'INT': val.value_int = first_val
@@ -1892,35 +1936,37 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                                                 elif inp_obj.override_type == 'INT': new_val.value_int = p_val
                                                 elif inp_obj.override_type == 'MENU': new_val.value_menu = str(p_val)
                                                 elif inp_obj.override_type == 'BOOLEAN': new_val.value_bool = bool(p_val)
-                                    self._action_msg = "Populate Sweep Values"
-                                else:
-                                    self._action_msg = "Disable Sweep Mode"
+                                        finally:
+                                            _state["is_populating"] = False
+                                self._action_msg = "Populate Sweep Values"
+                            else:
+                                self._action_msg = "Disable Sweep Mode"
 
-                    elif self.action == 'MOVE_GROUP_UP':
-                        if self.ng_idx > 0: ng_list.move(self.ng_idx, self.ng_idx - 1)
-                    elif self.action == 'MOVE_GROUP_DOWN':
-                        if self.ng_idx < len(ng_list) - 1: ng_list.move(self.ng_idx, self.ng_idx + 1)
+                elif self.action == 'MOVE_GROUP_UP':
+                    if self.ng_idx > 0: ng_list.move(self.ng_idx, self.ng_idx - 1)
+                elif self.action == 'MOVE_GROUP_DOWN':
+                    if self.ng_idx < len(ng_list) - 1: ng_list.move(self.ng_idx, self.ng_idx + 1)
 
-                    elif self.action == 'MOVE_NODE_UP':
-                        nodes = ng_list[self.ng_idx].nodes
-                        if self.n_idx > 0: nodes.move(self.n_idx, self.n_idx - 1)
-                    elif self.action == 'MOVE_NODE_DOWN':
-                        nodes = ng_list[self.ng_idx].nodes
-                        if self.n_idx < len(nodes) - 1: nodes.move(self.n_idx, self.n_idx + 1)
+                elif self.action == 'MOVE_NODE_UP':
+                    nodes = ng_list[self.ng_idx].nodes
+                    if self.n_idx > 0: nodes.move(self.n_idx, self.n_idx - 1)
+                elif self.action == 'MOVE_NODE_DOWN':
+                    nodes = ng_list[self.ng_idx].nodes
+                    if self.n_idx < len(nodes) - 1: nodes.move(self.n_idx, self.n_idx + 1)
 
-                    elif self.action == 'MOVE_INPUT_UP':
-                        inputs = ng_list[self.ng_idx].nodes[self.n_idx].inputs
-                        if self.i_idx > 0: inputs.move(self.i_idx, self.i_idx - 1)
-                    elif self.action == 'MOVE_INPUT_DOWN':
-                        inputs = ng_list[self.ng_idx].nodes[self.n_idx].inputs
-                        if self.i_idx < len(inputs) - 1: inputs.move(self.i_idx, self.i_idx + 1)
+                elif self.action == 'MOVE_INPUT_UP':
+                    inputs = ng_list[self.ng_idx].nodes[self.n_idx].inputs
+                    if self.i_idx > 0: inputs.move(self.i_idx, self.i_idx - 1)
+                elif self.action == 'MOVE_INPUT_DOWN':
+                    inputs = ng_list[self.ng_idx].nodes[self.n_idx].inputs
+                    if self.i_idx < len(inputs) - 1: inputs.move(self.i_idx, self.i_idx + 1)
 
-                    elif self.action == 'MOVE_VALUE_UP':
-                        vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
-                        if self.v_idx > 0: vals.move(self.v_idx, self.v_idx - 1)
-                    elif self.action == 'MOVE_VALUE_DOWN':
-                        vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
-                        if self.v_idx < len(vals) - 1: vals.move(self.v_idx, self.v_idx + 1)
+                elif self.action == 'MOVE_VALUE_UP':
+                    vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
+                    if self.v_idx > 0: vals.move(self.v_idx, self.v_idx - 1)
+                elif self.action == 'MOVE_VALUE_DOWN':
+                    vals = ng_list[self.ng_idx].nodes[self.n_idx].inputs[self.i_idx].values
+                    if self.v_idx < len(vals) - 1: vals.move(self.v_idx, self.v_idx + 1)
         except IndexError:
             # Prevents hard crashes if an operator fires out-of-sync with UI list indices
             if self.action in ['PASTE_GROUP', 'PIN_GROUP', 'UNPIN_GROUP']:
@@ -2045,6 +2091,8 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         if self.preset.preset_prefix:
             preset_root = os.path.normpath(os.path.join(preset_root, self.preset.preset_prefix))
 
+        preset_ovrs = get_flat_overrides(self.preset.nodegroups)
+
         for c in self.preset.collections:
             c_ptr = bpy.data.collections.get(c.collection_name)
             if not c_ptr or is_collection_excluded(bpy.context, c_ptr): continue
@@ -2058,7 +2106,7 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
                     continue
 
                 obj_ovrs = get_flat_overrides(obj_prop.nodegroups)
-                if len(c_pinned_ovrs) == 0 and len(obj_ovrs) == 0:
+                if len(preset_ovrs) == 0 and len(c_pinned_ovrs) == 0 and len(obj_ovrs) == 0:
                     objects_to_export_directly.append((c, obj_prop, bl_obj))
                 else:
                     objects_needing_headless.append((c, obj_prop, bl_obj))
@@ -2377,20 +2425,22 @@ def draw_inline_controls(layout, operator_id, use_clipboard=False):
         row.operator(operator_id, icon='PASTEDOWN', text="").action = 'PASTE'
 
 
-def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, title_text):
+def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, title_text, is_preset=False):
     box = layout.box()
 
     header_row = box.row()
     is_open = getattr(scene, is_open_prop)
     icon_open = 'TRIA_DOWN' if is_open else 'TRIA_RIGHT'
     header_row.prop(scene, is_open_prop, text="", icon=icon_open, emboss=False)
-    header_row.label(text=title_text, icon='PINNED' if is_pinned else 'UNPINNED')
+
+    icon_header = 'PRESET' if is_preset else ('OUTLINER_COLLECTION' if is_pinned else 'OUTLINER_OB_MESH')
+    header_row.label(text=title_text, icon=icon_header)
 
     op_row = header_row.row(align=True)
     op = op_row.operator("batch_stl.table_action", text="", icon='ADD')
-    op.action = 'ADD_GROUP'; op.is_pinned = is_pinned
+    op.action = 'ADD_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset
     op = op_row.operator("batch_stl.table_action", text="", icon='PASTEDOWN')
-    op.action = 'PASTE_GROUP'; op.is_pinned = is_pinned
+    op.action = 'PASTE_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset
 
     if not is_open:
         return
@@ -2403,16 +2453,18 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
         ng_box = box.box()
         ng_layout = ng_box.column()
         ng_row = ng_layout.row(align=True)
-        op = ng_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
 
         ng_row.prop_search(ng, "group_name", bpy.data, "node_groups", text="")
 
         if len(nodegroups) > 1:
-            op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
-            op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
-        op = ng_row.operator("batch_stl.table_action", text="", icon='PINNED' if is_pinned else 'UNPINNED'); op.action = 'UNPIN_GROUP' if is_pinned else 'PIN_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
-        op = ng_row.operator("batch_stl.table_action", text="", icon='COPYDOWN'); op.action = 'COPY_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
-        op = ng_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+            op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
+            op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
+
+        if not is_preset:
+            op = ng_row.operator("batch_stl.table_action", text="", icon='PINNED' if is_pinned else 'UNPINNED'); op.action = 'UNPIN_GROUP' if is_pinned else 'PIN_GROUP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='COPYDOWN'); op.action = 'COPY_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
 
         if not ng.nodes:
             continue
@@ -2428,13 +2480,13 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
             node_layout = node_container.column()
 
             n_row = node_layout.row(align=True)
-            op = n_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+            op = n_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx
             n_row.prop(node, "name", text="", icon='NODETREE')
 
             if len(ng.nodes) > 1:
-                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_NODE_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
-                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_NODE_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
-                op = n_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_NODE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_NODE_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_NODE_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_NODE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx
 
             if not node.inputs:
                 continue
@@ -2453,8 +2505,11 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                     s_main = i_row.split(factor=0.35, align=False)
                     c_inp = s_main.row(align=True)
 
-                    op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
-                    op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = -1
+                    if not is_preset:
+                        op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
+                        op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = -1
+                    else:
+                        c_inp.label(text="", icon='BLANK1')
 
                     ng_ptr = bpy.data.node_groups.get(ng.group_name)
                     is_mod = not node.name or node.name == "<Modifier Interface>"
@@ -2472,9 +2527,9 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                     c_dir = s_val.row(align=True)
 
                     if len(node.inputs) > 1:
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                    op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                    op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
 
                     continue
 
@@ -2486,11 +2541,14 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                     c_inp = s_main.row(align=True)
 
                     if i_first:
-                        if getattr(val, "use_sweep", False):
-                            op = c_inp.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
+                        if not is_preset:
+                            if getattr(val, "use_sweep", False):
+                                op = c_inp.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
+                            else:
+                                op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
+                            op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
                         else:
-                            op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
-                        op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
+                            c_inp.label(text="", icon='BLANK1')
 
                         ng_ptr = bpy.data.node_groups.get(ng.group_name)
                         is_mod = not node.name or node.name == "<Modifier Interface>"
@@ -2532,31 +2590,34 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                             c_val.prop(val, "value_menu", text="")
 
                     c_dir = s_val.row(align=True)
-                    is_permutation = len(inp.values) > 1 or any(getattr(v, "use_sweep", False) for v in inp.values)
 
-                    if is_permutation:
-                        # Converted implicit UI property toggles to fully controlled internal operators
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='FILE_FOLDER', depress=val.use_dir)
-                        op.action = 'TOGGLE_VALUE_USE_DIR'
-                        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                    if not is_preset:
+                        is_permutation = len(inp.values) > 1 or any(getattr(v, "use_sweep", False) for v in inp.values)
 
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='BOOKMARKS', depress=val.use_tag)
-                        op.action = 'TOGGLE_VALUE_USE_TAG'
-                        op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                        if is_permutation:
+                            # Converted implicit UI property toggles to fully controlled internal operators
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='FILE_FOLDER', depress=val.use_dir)
+                            op.action = 'TOGGLE_VALUE_USE_DIR'
+                            op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
-                        c_dir.prop(val, "tag", text="")
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='BOOKMARKS', depress=val.use_tag)
+                            op.action = 'TOGGLE_VALUE_USE_TAG'
+                            op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+
+                            c_dir.prop(val, "tag", text="")
 
                     if i_first:
                         if len(node.inputs) > 1:
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
 
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE_OR_INPUT'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE_OR_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
                     else:
-                        if len(inp.values) > 1:
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_VALUE_UP'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                        if not is_preset:
+                            if len(inp.values) > 1:
+                                op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_VALUE_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                                op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
 # This class defines the massive main panel in the 3D Viewport Toolbar ('N' panel).
 class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
@@ -2631,7 +2692,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         icon_m = 'TRIA_DOWN' if scene.batch_stl_ui_collections else 'TRIA_RIGHT'
         m_header.prop(scene, "batch_stl_ui_collections", text="", icon=icon_m, emboss=False)
 
-        m_title = f"{active_preset.name} | {metrics['total_collections']} collections | {metrics['total_objects']} files map"
+        m_title = f"{active_preset.name} | {metrics['total_collections']} collections | {metrics['total_objects']} files"
         m_header.label(text=m_title, icon='OUTLINER_COLLECTION')
         draw_inline_controls(m_header, "batch_stl.collection_actions", use_clipboard=True)
 
@@ -2661,6 +2722,11 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             header.label(text=metric_str, icon='MODIFIER')
             main_col.separator()
 
+            if active_preset:
+                # Preset Global Baseline Overrides
+                draw_overrides_table(main_col, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Preset Overrides ({active_preset.name})", is_preset=True)
+                main_col.separator(factor=0.5)
+
             if active_col:
                 # Collection Pinned (Shared Overrides)
                 draw_overrides_table(main_col, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides ({active_col.collection_name or 'Shared'})")
@@ -2680,7 +2746,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
             if scene.batch_stl_ui_tips:
                 col = tip_box.column()
-                col.label(text="Hierarchy: Collection > Object > NodeGroup > Node.", icon='BLANK1')
+                col.label(text="Hierarchy: Preset > Collection > Object > NodeGroup > Node.", icon='BLANK1')
                 col.label(text="For modifier targets, leave Node blank or set as <Modifier Interface>", icon='BLANK1')
                 col.separator()
 
@@ -2789,6 +2855,7 @@ def register():
     bpy.types.Scene.batch_stl_ui_presets = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_collections = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_objects = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
+    bpy.types.Scene.batch_stl_ui_preset_ovr = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_global_ovr = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_local_ovr = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_global_ovr_nested = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
@@ -2830,7 +2897,7 @@ def unregister():
     properties_to_remove = [
         "batch_stl_root_dir", "batch_stl_presets", "batch_stl_preset_index",
         "batch_stl_verbose_console", "batch_stl_ui_presets", "batch_stl_ui_collections", "batch_stl_ui_objects",
-        "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr",
+        "batch_stl_ui_preset_ovr", "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr",
         "batch_stl_show_tree", "batch_stl_show_console", "batch_stl_collapsed_dirs",
         "batch_stl_ui_tips", "batch_stl_ui_global_ovr_nested", "batch_stl_ui_local_ovr_nested"
     ]
