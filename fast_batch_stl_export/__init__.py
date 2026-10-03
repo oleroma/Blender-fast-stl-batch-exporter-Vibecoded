@@ -2195,6 +2195,11 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
     def modal(self, context, event):
         try:
+            # INTERCEPT UNDO: Block Ctrl+Z from erasing export state in the active file and convert to safe cancel instead
+            if event.type == 'Z' and event.value == 'PRESS' and (event.ctrl or event.oskey):
+                self.preset.cancel_export = True
+                return {'RUNNING_MODAL'}
+
             if self.preset.cancel_export:
                 self.cleanup(context)
                 self.report({'WARNING'}, f"Export cancelled for {self.preset.name}.")
@@ -2288,19 +2293,23 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 class BATCH_STL_UL_presets(bpy.types.UIList):
     # 'draw_item' tells Blender how to format a single row in the visual list.
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        any_exporting = any(p.is_exporting for p in context.scene.batch_stl_presets)
         row = layout.row(align=True) # row(align=True) snaps buttons together without spacing
-        row.prop(item, "name", text="", emboss=False) # 'emboss=False' makes it look like plain text, not a button
+
+        prop_row = row.row(align=True)
+        prop_row.enabled = not any_exporting
+        prop_row.prop(item, "name", text="", emboss=False) # 'emboss=False' makes it look like plain text, not a button
 
         metrics = _ui_cache.get("preset_metrics", {}).get(item.name, {"has_ovr": False, "has_perm": False})
         icon_ovr = 'NODETREE' if metrics["has_ovr"] else 'BLANK1'
         icon_perm = 'FILE_REFRESH' if metrics["has_perm"] else 'BLANK1'
 
-        icon_row = row.row(align=True)
+        icon_row = prop_row.row(align=True)
         icon_row.alignment = 'RIGHT'
         icon_row.label(text="", icon=icon_perm)
         icon_row.label(text="", icon=icon_ovr)
 
-        row.prop(item, "preset_prefix", text="", emboss=False, icon='FILE_FOLDER')
+        prop_row.prop(item, "preset_prefix", text="", emboss=False, icon='FILE_FOLDER')
 
         if item.is_exporting:
             row.prop(item, "export_progress", text=item.export_status, slider=True)
@@ -2560,7 +2569,11 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
 
-        dir_row = layout.row(align=True)
+        any_exporting = any(p.is_exporting for p in scene.batch_stl_presets)
+
+        dir_col = layout.column()
+        dir_col.enabled = not any_exporting
+        dir_row = dir_col.row(align=True)
         dir_row.operator("batch_stl.import_presets_json", text="", icon='IMPORT')
         dir_row.operator("batch_stl.export_presets_json", text="", icon='EXPORT')
         dir_row.prop(scene, "batch_stl_show_console", text="", icon='CONSOLE', toggle=True)
@@ -2573,7 +2586,9 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             c_box.label(text="Global Export Console Log", icon='CONSOLE')
             if active_preset:
                 c_box.template_list("BATCH_STL_UL_console_logs", "", active_preset, "console_logs", active_preset, "console_index", rows=6)
-                c_box.operator("batch_stl.clear_console", text="Clear Log", icon='TRASH')
+                clear_col = c_box.column()
+                clear_col.enabled = not any_exporting
+                clear_col.operator("batch_stl.clear_console", text="Clear Log", icon='TRASH')
             else:
                 c_box.label(text="Select a preset to view logs.")
 
@@ -2582,25 +2597,36 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         p_box = layout.box()
         p_header = p_box.row()
         icon = 'TRIA_DOWN' if scene.batch_stl_ui_presets else 'TRIA_RIGHT'
-        p_header.prop(scene, "batch_stl_ui_presets", text="", icon=icon, emboss=False)
-        p_header.label(text="Presets", icon='PRESET')
 
-        if active_preset: p_header.label(text=f"Last: {active_preset.last_export_time:.2f}s", icon='TIME')
-        draw_inline_controls(p_header, "batch_stl.preset_actions", use_clipboard=True)
+        p_header_props = p_header.row()
+        p_header_props.enabled = not any_exporting
+        p_header_props.prop(scene, "batch_stl_ui_presets", text="", icon=icon, emboss=False)
+        p_header_props.label(text="Presets", icon='PRESET')
+
+        if active_preset: p_header_props.label(text=f"Last: {active_preset.last_export_time:.2f}s", icon='TIME')
+
+        inline_col = p_header.column()
+        inline_col.enabled = not any_exporting
+        draw_inline_controls(inline_col, "batch_stl.preset_actions", use_clipboard=True)
 
         if scene.batch_stl_ui_presets:
             p_box.template_list("BATCH_STL_UL_presets", "", scene, "batch_stl_presets", scene, "batch_stl_preset_index", rows=3)
 
         if not active_preset:
-            layout.separator()
-            layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
+            rest_col = layout.column()
+            rest_col.enabled = not any_exporting
+            rest_col.separator()
+            rest_col.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
             return
 
-        # OPTIMIZED: UI data explicitly provided by the background UI Timer Cache
+        # UI Freeze Container for all details beneath presets
+        main_col = layout.column()
+        main_col.enabled = not any_exporting
+
         metrics = _ui_cache.get("metrics", {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0})
 
-        layout.separator(factor=0.5)
-        m_box = layout.box()
+        main_col.separator(factor=0.5)
+        m_box = main_col.box()
         m_header = m_box.row()
         icon_m = 'TRIA_DOWN' if scene.batch_stl_ui_collections else 'TRIA_RIGHT'
         m_header.prop(scene, "batch_stl_ui_collections", text="", icon=icon_m, emboss=False)
@@ -2612,12 +2638,12 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         if scene.batch_stl_ui_collections:
             m_box.template_list("BATCH_STL_UL_collections", "", active_preset, "collections", active_preset, "collection_index", rows=5)
 
-        layout.separator()
+        main_col.separator()
 
         active_col = get_active_collection(active_preset)
         if active_col:
 
-            o_box = layout.box()
+            o_box = main_col.box()
             o_header = o_box.row()
             icon_o = 'TRIA_DOWN' if scene.batch_stl_ui_objects else 'TRIA_RIGHT'
             o_header.prop(scene, "batch_stl_ui_objects", text="", icon=icon_o, emboss=False)
@@ -2628,25 +2654,25 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
             active_obj = get_active_object(active_col)
 
-            layout.separator()
+            main_col.separator()
             col_metrics = _ui_cache.get("active_col_metrics", {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0})
             metric_str = f"{col_metrics['c_name']} | {col_metrics['num_targets']} targets | {col_metrics['total_inputs']} inputs | {col_metrics['mapping_total_objects']} output files"
-            header = layout.row()
+            header = main_col.row()
             header.label(text=metric_str, icon='MODIFIER')
-            layout.separator()
+            main_col.separator()
 
             if active_col:
                 # Collection Pinned (Shared Overrides)
-                draw_overrides_table(layout, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides ({active_col.collection_name or 'Shared'})")
+                draw_overrides_table(main_col, scene, active_col.nodegroups, True, "batch_stl_ui_global_ovr", f"Collection Overrides ({active_col.collection_name or 'Shared'})")
 
-            layout.separator(factor=0.5)
+            main_col.separator(factor=0.5)
 
             if active_obj:
                 # Object Local
-                draw_overrides_table(layout, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Object Overrides ({active_obj.name})")
+                draw_overrides_table(main_col, scene, active_obj.nodegroups, False, "batch_stl_ui_local_ovr", f"Object Overrides ({active_obj.name})")
 
-            layout.separator(factor=0.5)
-            tip_box = layout.box()
+            main_col.separator(factor=0.5)
+            tip_box = main_col.box()
             tip_header = tip_box.row()
             icon_tip = 'TRIA_DOWN' if scene.batch_stl_ui_tips else 'TRIA_RIGHT'
             tip_header.prop(scene, "batch_stl_ui_tips", text="", icon=icon_tip, emboss=False)
@@ -2671,8 +2697,8 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
                 col.label(text="Tag Formatting:", icon='BLANK1')
                 col.label(text="  • [ tag ] replaces input value, [ _tag ] appends, [ tag_ ] prepends", icon='BLANK1')
 
-        layout.separator()
-        t_box = layout.box()
+        main_col.separator()
+        t_box = main_col.box()
         t_header = t_box.row(align=True)
         icon_t = 'TRIA_DOWN' if scene.batch_stl_show_tree else 'TRIA_RIGHT'
         t_header.prop(scene, "batch_stl_show_tree", text="", icon=icon_t, emboss=False)
@@ -2688,8 +2714,8 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             col = t_box.column(align=True)
             draw_tree_dict(col, tree_dict, duplicates=duplicates)
 
-        layout.separator()
-        layout.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
+        main_col.separator()
+        main_col.prop(scene, "batch_stl_verbose_console", toggle=True, icon='CONSOLE')
 
 
 # ==============================================================================
