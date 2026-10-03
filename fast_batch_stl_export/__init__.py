@@ -215,14 +215,15 @@ class MockInput:
     def value_menu(self): return self._val.value_menu if self._is_temp else str(self._val)
 
 class MockOverride:
-    def __init__(self, target, ptr, node_name, inputs):
+    def __init__(self, target, ptr, node_name, inputs, level="NONE"):
         self.override_target = target
         self.parent_group_ptr = ptr
         self.node_name = node_name
         self.inputs = inputs
+        self.level = level
 
 # Grabs every override requested by the user and flattens them into one big list.
-def get_flat_overrides(nodegroups):
+def get_flat_overrides(nodegroups, level="NONE"):
     overrides = []
     if not nodegroups: return overrides
     for ng in nodegroups:
@@ -236,7 +237,7 @@ def get_flat_overrides(nodegroups):
                 for val in inp.values:
                     temp_inputs.append(MockInput(inp, val, is_temp=True))
             if temp_inputs:
-                overrides.append(MockOverride(target, ng_ptr, node.name, temp_inputs))
+                overrides.append(MockOverride(target, ng_ptr, node.name, temp_inputs, level))
     return overrides
 
 # If the user sets a "Sweep" (e.g., test sizes from 1 to 10), this parses their text string into actual numbers.
@@ -342,12 +343,12 @@ def generate_override_combinations(overrides):
 def reconstruct_overrides_for_combo(combo):
     grouped = {}
     for ovr, inp in combo:
-        target_key = (ovr.override_target, ovr.parent_group_ptr, ovr.node_name)
+        target_key = (ovr.override_target, ovr.parent_group_ptr, ovr.node_name, getattr(ovr, "level", "NONE"))
         if target_key not in grouped: grouped[target_key] = []
         grouped[target_key].append(inp)
     active_overrides = []
-    for (target, group_ptr, node_name), inputs in grouped.items():
-        active_overrides.append(MockOverride(target, group_ptr, node_name, inputs))
+    for (target, group_ptr, node_name, lvl), inputs in grouped.items():
+        active_overrides.append(MockOverride(target, group_ptr, node_name, inputs, lvl))
     return active_overrides
 
 # OPTIMIZED: Captures the initial state of the scene before applying any permutations,
@@ -754,7 +755,7 @@ def rebuild_ui_cache_if_dirty():
     preset = get_active_preset(scene)
     if not preset:
         _ui_cache["metrics"] = {"total_collections": 0, "total_preset_combos": 0, "total_objects": 0}
-        _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0},
+        _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0}
         _ui_cache["tree"] = ({}, set())
 
         if getattr(context, "window_manager", None):
@@ -769,8 +770,8 @@ def rebuild_ui_cache_if_dirty():
     total_objects = 0
     total_preset_combos = 0
 
-    global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups)
-    preset_ovrs = global_ovrs + get_flat_overrides(preset.nodegroups)
+    global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL")
+    preset_ovrs = global_ovrs + get_flat_overrides(preset.nodegroups, "PRESET")
 
     for c in preset.collections:
         c_ptr = bpy.data.collections.get(c.collection_name)
@@ -779,12 +780,12 @@ def rebuild_ui_cache_if_dirty():
         if not c_ptr or visibility.get(c.collection_name, True):
             continue
 
-        c_pinned_ovrs = preset_ovrs + get_flat_overrides(c.nodegroups)
+        c_pinned_ovrs = preset_ovrs + get_flat_overrides(c.nodegroups, "COLLECTION")
         for obj_prop in c.objects:
             if not obj_prop.export: continue
             bl_obj = c_ptr.all_objects.get(obj_prop.name)
             if bl_obj and bl_obj.type in {"MESH", "CURVE", "SURFACE", "META", "FONT"} and not bl_obj.hide_viewport:
-                obj_ovrs = c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups)
+                obj_ovrs = c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups, "OBJECT")
                 combos = len(generate_override_combinations(obj_ovrs))
                 total_preset_combos += combos
                 total_objects += combos
@@ -799,7 +800,7 @@ def rebuild_ui_cache_if_dirty():
     active_col = get_active_collection(preset)
     if active_col:
         active_obj = get_active_object(active_col)
-        all_ovrs = preset_ovrs + get_flat_overrides(active_col.nodegroups) + (get_flat_overrides(active_obj.nodegroups) if active_obj else [])
+        all_ovrs = preset_ovrs + get_flat_overrides(active_col.nodegroups, "COLLECTION") + (get_flat_overrides(active_obj.nodegroups, "OBJECT") if active_obj else [])
         unique_targets = set()
         total_inputs = 0
 
@@ -825,8 +826,8 @@ def rebuild_ui_cache_if_dirty():
     else:
         _ui_cache["active_col_metrics"] = {"c_name": "", "num_targets": 0, "total_inputs": 0, "num_combos": 0, "mapping_total_objects": 0}
 
-    # 4. Build visualization tree
-    tree_dict, duplicates = build_tree_dict(context, preset, visibility)
+    # 4. Build visualization tree across all presets
+    tree_dict, duplicates = build_tree_dict(context, visibility)
     _ui_cache["tree"] = (tree_dict, duplicates)
 
     if getattr(context, "window_manager", None):
@@ -846,118 +847,115 @@ def batch_stl_depsgraph_handler(scene, depsgraph):
 # --- TREE VISUALIZER LOGIC ---
 # This builds an artificial file-folder structure in memory so the script can
 # visually show you what files will be created and where, before you actually click export.
-def build_tree_dict(context, preset, visibility_cache=None):
+def build_tree_dict(context, visibility_cache=None):
     scene = context.scene
     root_name = bpy.path.abspath(scene.batch_stl_root_dir) if scene.batch_stl_root_dir else "//"
     tree = {}
     all_filepaths = set()
     duplicates = set()
 
-    current_root = tree
-    if preset.preset_prefix:
-        current_root[preset.preset_prefix] = {}
-        current_root = current_root[preset.preset_prefix]
+    global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL")
 
-    for c in preset.collections:
-        c_ptr = bpy.data.collections.get(c.collection_name)
-        if c_ptr:
-            if visibility_cache is not None:
-                if visibility_cache.get(c.collection_name, True): continue
+    for preset in scene.batch_stl_presets:
+        preset_ovrs = get_flat_overrides(preset.nodegroups, "PRESET")
+
+        for c in preset.collections:
+            c_ptr = bpy.data.collections.get(c.collection_name)
+            if c_ptr:
+                if visibility_cache is not None:
+                    if visibility_cache.get(c.collection_name, True): continue
+                else:
+                    if is_collection_excluded(context, c_ptr): continue
             else:
-                if is_collection_excluded(context, c_ptr): continue
-        else:
-            continue
-
-        c_root = current_root
-        c_root_path = []
-        if c.sub_path:
-            parts = c.sub_path.replace('\\', '/').split('/')
-            for part in parts:
-                if part:
-                    if part not in c_root: c_root[part] = {}
-                    c_root = c_root[part]
-                    c_root_path.append(part)
-
-        c_pinned_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups) + get_flat_overrides(preset.nodegroups) + get_flat_overrides(c.nodegroups)
-
-        for obj_prop in c.objects:
-            if not obj_prop.export: continue
-            bl_obj = c_ptr.all_objects.get(obj_prop.name)
-            if not bl_obj or bl_obj.hide_viewport or bl_obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
                 continue
 
-            all_overrides = c_pinned_ovrs + get_flat_overrides(obj_prop.nodegroups)
-            freq_dict = {}
-            for o in all_overrides:
-                group_name = o.parent_group_ptr.name if getattr(o, "parent_group_ptr", None) else ""
-                for i in o.inputs:
-                    key = (o.override_target, group_name, o.node_name, i.input_name)
-                    weight = 2 if getattr(i, "use_sweep", False) else 1
-                    freq_dict[key] = freq_dict.get(key, 0) + weight
+            c_path_parts = [p for p in c.sub_path.replace('\\', '/').split('/') if p] if c.sub_path else []
+            col_ovrs = get_flat_overrides(c.nodegroups, "COLLECTION")
 
-            combinations = generate_override_combinations(all_overrides)
-            if not combinations: combinations = [[]]
+            for obj_prop in c.objects:
+                if not obj_prop.export: continue
+                bl_obj = c_ptr.all_objects.get(obj_prop.name)
+                if not bl_obj or bl_obj.hide_viewport or bl_obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
+                    continue
 
-            # 1. Resolve Object Tag String Logic
-            safe_name = bpy.path.clean_name(bl_obj.name)
-            if obj_prop.tag:
-                if obj_prop.tag.startswith("_"): safe_name = safe_name + obj_prop.tag
-                elif obj_prop.tag.endswith("_"): safe_name = obj_prop.tag + safe_name
-                else: safe_name = obj_prop.tag # Completely replaces object name
+                obj_ovrs = get_flat_overrides(obj_prop.nodegroups, "OBJECT")
+                all_overrides = global_ovrs + preset_ovrs + col_ovrs + obj_ovrs
 
-            for combo in combinations:
-                combo_root = c_root
-                combo_suffix = ""
-                combo_subpath = []
+                freq_dict = {}
+                for o in all_overrides:
+                    group_name = o.parent_group_ptr.name if getattr(o, "parent_group_ptr", None) else ""
+                    for i in o.inputs:
+                        key = (o.override_target, group_name, o.node_name, i.input_name)
+                        weight = 2 if getattr(i, "use_sweep", False) else 1
+                        freq_dict[key] = freq_dict.get(key, 0) + weight
 
-                # 2. Insert Object sub_path into directory tree structure
-                obj_path_parts = []
-                if obj_prop.sub_path:
-                    obj_path_parts = [p for p in obj_prop.sub_path.replace('\\', '/').split('/') if p]
-                    for part in obj_path_parts:
+                combinations = generate_override_combinations(all_overrides)
+                if not combinations: combinations = [[]]
+
+                # 1. Resolve Object Tag String Logic
+                safe_name = bpy.path.clean_name(bl_obj.name)
+                if obj_prop.tag:
+                    if obj_prop.tag.startswith("_"): safe_name = safe_name + obj_prop.tag
+                    elif obj_prop.tag.endswith("_"): safe_name = obj_prop.tag + safe_name
+                    else: safe_name = obj_prop.tag # Completely replaces object name
+
+                obj_path_parts = [p for p in obj_prop.sub_path.replace('\\', '/').split('/') if p] if obj_prop.sub_path else []
+
+                for combo in combinations:
+                    combo_suffix = ""
+                    paths_by_level = {"GLOBAL": [], "PRESET": [], "COLLECTION": [], "OBJECT": [], "NONE": []}
+                    processed_params = set()
+
+                    for ovr, inp in combo:
+                        group_name = ovr.parent_group_ptr.name if ovr.parent_group_ptr else ""
+                        param_key = (ovr.override_target, group_name, ovr.node_name, inp.input_name)
+                        if param_key not in processed_params:
+                            val = get_input_value(inp)
+                            # Formats floats nicely. The ":g" string format removes trailing zeros (e.g., 2.0 -> 2).
+                            val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
+                            if inp.tag:
+                                if inp.tag.startswith("_"): naming_str = val_str + inp.tag
+                                elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
+                                else: naming_str = inp.tag
+                            else: naming_str = val_str
+
+                            is_permutation = freq_dict.get(param_key, 0) > 1
+
+                            if is_permutation and getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
+                            if is_permutation and getattr(inp, "use_dir", False):
+                                lvl = getattr(ovr, "level", "NONE")
+                                if lvl in paths_by_level:
+                                    paths_by_level[lvl].append(naming_str)
+                            processed_params.add(param_key)
+
+                    # Compose directory path maintaining hierarchical insertion correctly
+                    full_dir_parts = []
+                    full_dir_parts.extend(paths_by_level.get("GLOBAL", []))
+                    if preset.preset_prefix: full_dir_parts.append(preset.preset_prefix)
+                    full_dir_parts.extend(paths_by_level.get("PRESET", []))
+                    full_dir_parts.extend(c_path_parts)
+                    full_dir_parts.extend(paths_by_level.get("COLLECTION", []))
+                    full_dir_parts.extend(obj_path_parts)
+                    full_dir_parts.extend(paths_by_level.get("OBJECT", []))
+                    full_dir_parts.extend(paths_by_level.get("NONE", []))
+
+                    combo_root = tree
+                    for part in full_dir_parts:
                         if part not in combo_root: combo_root[part] = {}
                         combo_root = combo_root[part]
 
-                processed_params = set()
-                for ovr, inp in combo:
-                    group_name = ovr.parent_group_ptr.name if ovr.parent_group_ptr else ""
-                    param_key = (ovr.override_target, group_name, ovr.node_name, inp.input_name)
-                    if param_key not in processed_params:
-                        val = get_input_value(inp)
-                        # Formats floats nicely. The ":g" string format removes trailing zeros (e.g., 2.0 -> 2).
-                        val_str = str(val) if isinstance(val, (int, str)) else f"{val:g}" if isinstance(val, float) else str(val)
-                        if inp.tag:
-                            if inp.tag.startswith("_"): naming_str = val_str + inp.tag
-                            elif inp.tag.endswith("_"): naming_str = inp.tag + val_str
-                            else: naming_str = inp.tag
-                        else: naming_str = val_str
+                    if '_files' not in combo_root: combo_root['_files'] = []
+                    base_tag = c.tag if getattr(c, "use_tag", False) and c.tag else ""
+                    final_tag = base_tag + combo_suffix
 
-                        is_permutation = freq_dict.get(param_key, 0) > 1
+                    dir_path_str = os.path.normpath(os.path.join(root_name, *full_dir_parts)) if full_dir_parts else root_name
 
-                        if is_permutation and getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
-                        if is_permutation and getattr(inp, "use_dir", False):
-                            if naming_str not in combo_root: combo_root[naming_str] = {}
-                            combo_root = combo_root[naming_str]
-                            combo_subpath.append(naming_str)
-                        processed_params.add(param_key)
+                    filename = f"{safe_name}{final_tag}.stl"
+                    combo_root['_files'].append(filename)
 
-                if '_files' not in combo_root: combo_root['_files'] = []
-                base_tag = c.tag if getattr(c, "use_tag", False) and c.tag else ""
-                final_tag = base_tag + combo_suffix
-
-                full_dir_parts = [preset.preset_prefix] if preset.preset_prefix else []
-                full_dir_parts.extend(c_root_path)
-                full_dir_parts.extend(obj_path_parts) # Include object sub folder
-                full_dir_parts.extend(combo_subpath)
-
-                dir_path_str = os.path.normpath(os.path.join(root_name, *full_dir_parts))
-
-                filename = f"{safe_name}{final_tag}.stl"
-                combo_root['_files'].append(filename)
-                full_path = os.path.join(dir_path_str, filename)
-
-                if full_path in all_filepaths: duplicates.add(full_path)
-                else: all_filepaths.add(full_path)
+                    full_path = os.path.join(dir_path_str, filename)
+                    if full_path in all_filepaths: duplicates.add(full_path)
+                    else: all_filepaths.add(full_path)
 
     return {root_name: tree}, duplicates
 
@@ -1041,21 +1039,21 @@ def run_headless_export(job_file_path):
         sys.exit(1) # system exit code 1 means an error occurred
 
     preset = scene.batch_stl_presets[preset_index]
-    if preset.preset_prefix:
-        root_dir = os.path.normpath(os.path.join(root_dir, preset.preset_prefix))
 
     print("\n  [Phase 0] Evaluating Targets and Building Depsgraph Culling Maps...")
     t_phase0_start = time.perf_counter()
 
     execution_batches = {}
-    preset_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups) + get_flat_overrides(preset.nodegroups)
-    sig_preset = get_override_signature(preset_ovrs)
+    global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL")
+    preset_ovrs = get_flat_overrides(preset.nodegroups, "PRESET")
+    sig_preset = get_override_signature(global_ovrs + preset_ovrs)
 
     for c in preset.collections:
         c_ptr = bpy.data.collections.get(c.collection_name)
         if not c_ptr or is_collection_excluded(bpy.context, c_ptr): continue
 
-        sig_pinned = sig_preset + get_override_signature(get_flat_overrides(c.nodegroups))
+        col_ovrs = get_flat_overrides(c.nodegroups, "COLLECTION")
+        sig_pinned = sig_preset + get_override_signature(col_ovrs)
 
         for obj_prop in c.objects:
             if not obj_prop.export: continue
@@ -1063,7 +1061,8 @@ def run_headless_export(job_file_path):
             if not bl_obj or bl_obj.hide_viewport or bl_obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
                 continue
 
-            sig_local = get_override_signature(get_flat_overrides(obj_prop.nodegroups))
+            obj_ovrs = get_flat_overrides(obj_prop.nodegroups, "OBJECT")
+            sig_local = get_override_signature(obj_ovrs)
             full_sig = sig_pinned + sig_local
 
             if not full_sig and skip_direct:
@@ -1097,7 +1096,12 @@ def run_headless_export(job_file_path):
     total_operations = 0
     for signature, batch_items in execution_batches.items():
         first_c, first_obj_prop, _ = batch_items[0]
-        all_overrides = preset_ovrs + get_flat_overrides(first_c.nodegroups) + get_flat_overrides(first_obj_prop.nodegroups)
+
+        all_overrides = (get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL") +
+                         get_flat_overrides(preset.nodegroups, "PRESET") +
+                         get_flat_overrides(first_c.nodegroups, "COLLECTION") +
+                         get_flat_overrides(first_obj_prop.nodegroups, "OBJECT"))
+
         combinations = generate_override_combinations(all_overrides)
         total_operations += (len(batch_items) * len(combinations))
 
@@ -1109,8 +1113,11 @@ def run_headless_export(job_file_path):
 
     for signature, batch_items in execution_batches.items():
         first_c, first_obj_prop, _ = batch_items[0]
-        # Applies preset overrides before anything else as a global override
-        all_overrides = preset_ovrs + get_flat_overrides(first_c.nodegroups) + get_flat_overrides(first_obj_prop.nodegroups)
+
+        all_overrides = (get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL") +
+                         get_flat_overrides(preset.nodegroups, "PRESET") +
+                         get_flat_overrides(first_c.nodegroups, "COLLECTION") +
+                         get_flat_overrides(first_obj_prop.nodegroups, "OBJECT"))
 
         freq_dict = {}
         for o in all_overrides:
@@ -1164,8 +1171,9 @@ def run_headless_export(job_file_path):
                     first_export_started = True
 
                 combo_suffix = ""
-                combo_subpath = ""
+                paths_by_level = {"GLOBAL": [], "PRESET": [], "COLLECTION": [], "OBJECT": [], "NONE": []}
                 processed_params = set()
+
                 for ovr, inp in combo:
                     group_name = ovr.parent_group_ptr.name if ovr.parent_group_ptr else ""
                     param_key = (ovr.override_target, group_name, ovr.node_name, inp.input_name)
@@ -1180,7 +1188,10 @@ def run_headless_export(job_file_path):
 
                         is_permutation = freq_dict.get(param_key, 0) > 1
                         if is_permutation and getattr(inp, "use_tag", False): combo_suffix += f"_{naming_str}"
-                        if is_permutation and getattr(inp, "use_dir", False): combo_subpath = os.path.join(combo_subpath, naming_str)
+                        if is_permutation and getattr(inp, "use_dir", False):
+                            lvl = getattr(ovr, "level", "NONE")
+                            if lvl in paths_by_level:
+                                paths_by_level[lvl].append(naming_str)
                         processed_params.add(param_key)
 
                 # Apply the current setup iteration.
@@ -1192,9 +1203,20 @@ def run_headless_export(job_file_path):
 
                 for c, obj_prop, bl_obj in batch_export_targets:
                     # Apply Object sub-directory implicitly
-                    obj_subpath = obj_prop.sub_path.replace('\\', '/') if obj_prop.sub_path else ""
+                    c_path_parts = [p for p in c.sub_path.replace('\\', '/').split('/') if p] if c.sub_path else []
+                    obj_path_parts = [p for p in obj_prop.sub_path.replace('\\', '/').split('/') if p] if obj_prop.sub_path else []
 
-                    out_dir = os.path.normpath(os.path.join(root_dir, c.sub_path, obj_subpath, combo_subpath))
+                    full_dir_parts = []
+                    full_dir_parts.extend(paths_by_level.get("GLOBAL", []))
+                    if preset.preset_prefix: full_dir_parts.append(preset.preset_prefix)
+                    full_dir_parts.extend(paths_by_level.get("PRESET", []))
+                    full_dir_parts.extend(c_path_parts)
+                    full_dir_parts.extend(paths_by_level.get("COLLECTION", []))
+                    full_dir_parts.extend(obj_path_parts)
+                    full_dir_parts.extend(paths_by_level.get("OBJECT", []))
+                    full_dir_parts.extend(paths_by_level.get("NONE", []))
+
+                    out_dir = os.path.normpath(os.path.join(root_dir, *full_dir_parts)) if full_dir_parts else root_dir
                     os.makedirs(out_dir, exist_ok=True)
 
                     # Apply Object tagging mechanism
@@ -2158,25 +2180,23 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         objects_needing_headless = []
 
         preset_root = bpy.path.abspath(scene.batch_stl_root_dir)
-        if self.preset.preset_prefix:
-            preset_root = os.path.normpath(os.path.join(preset_root, self.preset.preset_prefix))
 
-        global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups)
-        preset_ovrs = global_ovrs + get_flat_overrides(self.preset.nodegroups)
+        global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups, "GLOBAL")
+        preset_ovrs = global_ovrs + get_flat_overrides(self.preset.nodegroups, "PRESET")
 
         for c in self.preset.collections:
             c_ptr = bpy.data.collections.get(c.collection_name)
             if not c_ptr or is_collection_excluded(bpy.context, c_ptr): continue
             sync_collection_objects(c, c_ptr)
 
-            c_pinned_ovrs = get_flat_overrides(c.nodegroups)
+            c_pinned_ovrs = get_flat_overrides(c.nodegroups, "COLLECTION")
             for obj_prop in c.objects:
                 if not obj_prop.export: continue
                 bl_obj = c_ptr.all_objects.get(obj_prop.name)
                 if not bl_obj or bl_obj.hide_viewport or bl_obj.type not in {"MESH", "CURVE", "SURFACE", "META", "FONT"}:
                     continue
 
-                obj_ovrs = get_flat_overrides(obj_prop.nodegroups)
+                obj_ovrs = get_flat_overrides(obj_prop.nodegroups, "OBJECT")
                 if len(preset_ovrs) == 0 and len(c_pinned_ovrs) == 0 and len(obj_ovrs) == 0:
                     objects_to_export_directly.append((c, obj_prop, bl_obj))
                 else:
@@ -2190,8 +2210,15 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
             for c, obj_prop, bl_obj in objects_to_export_directly:
                 t_dir_start = time.perf_counter()
 
-                obj_subpath = obj_prop.sub_path.replace('\\', '/') if obj_prop.sub_path else ""
-                out_dir = os.path.normpath(os.path.join(preset_root, c.sub_path, obj_subpath))
+                c_path_parts = [p for p in c.sub_path.replace('\\', '/').split('/') if p] if c.sub_path else []
+                obj_path_parts = [p for p in obj_prop.sub_path.replace('\\', '/').split('/') if p] if obj_prop.sub_path else []
+
+                full_dir_parts = []
+                if self.preset.preset_prefix: full_dir_parts.append(self.preset.preset_prefix)
+                full_dir_parts.extend(c_path_parts)
+                full_dir_parts.extend(obj_path_parts)
+
+                out_dir = os.path.normpath(os.path.join(preset_root, *full_dir_parts)) if full_dir_parts else preset_root
                 os.makedirs(out_dir, exist_ok=True)
 
                 safe_name = bpy.path.clean_name(bl_obj.name)
@@ -2715,6 +2742,14 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
         layout.separator()
 
+        # Global Overrides moved before Presets
+        g_col = layout.column()
+        g_col.enabled = not any_exporting
+        g_box = g_col.box()
+        draw_overrides_table(g_box, scene, scene.batch_stl_global_nodegroups, False, "batch_stl_ui_global_ovr_main", "Global Overrides", is_global=True)
+
+        layout.separator()
+
         p_box = layout.box()
         p_header = p_box.row()
         icon = 'TRIA_DOWN' if scene.batch_stl_ui_presets else 'TRIA_RIGHT'
@@ -2734,8 +2769,6 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             p_box.template_list("BATCH_STL_UL_presets", "", scene, "batch_stl_presets", scene, "batch_stl_preset_index", rows=3)
 
         if active_preset:
-            p_box.separator(factor=0.5)
-            draw_overrides_table(p_box, scene, scene.batch_stl_global_nodegroups, False, "batch_stl_ui_global_ovr_main", "Global Overrides", is_global=True)
             p_box.separator(factor=0.5)
             draw_overrides_table(p_box, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Preset Overrides ({active_preset.name})", is_preset=True)
 
@@ -2827,7 +2860,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
         t_header.prop(scene, "batch_stl_show_tree", text="", icon=icon_t, emboss=False)
         t_header.label(text="Export Structure & Files", icon='OUTLINER_OB_EMPTY')
 
-        if scene.batch_stl_show_tree and active_preset:
+        if scene.batch_stl_show_tree:
             tree_dict, duplicates = _ui_cache.get("tree", ({}, set()))
             if duplicates:
                 warn_box = t_box.box()
