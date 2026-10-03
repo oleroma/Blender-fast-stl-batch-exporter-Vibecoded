@@ -1,7 +1,7 @@
 """
 Fast Batch STL Exporter
 Architecture: Single-File Monolithic (Optimized for Agentic Environments)
-Data Hierarchy: Preset > Collection > Object > NodeGroup > Node > Input > Value
+Data Hierarchy: Global > Preset > Collection > Object > NodeGroup > Node > Input > Value
 """
 
 # ==============================================================================
@@ -670,9 +670,19 @@ def paste_preset_from_dict(new_p, data):
 
 
 # --- UI CACHE ENGINE ---
-def _get_preset_status(preset):
+def _get_preset_status(scene, preset):
     has_ovr = False
     has_perm = False
+
+    if len(scene.batch_stl_global_nodegroups) > 0: has_ovr = True
+    if not has_perm:
+        for ng in scene.batch_stl_global_nodegroups:
+            for n in ng.nodes:
+                for i in n.inputs:
+                    if len(i.values) > 1 or any(getattr(v, "use_sweep", False) for v in i.values):
+                        has_perm = True; break
+                if has_perm: break
+            if has_perm: break
 
     if len(preset.nodegroups) > 0: has_ovr = True
     if not has_perm:
@@ -725,7 +735,7 @@ def rebuild_ui_cache_if_dirty():
 
     preset_metrics = {}
     for p in scene.batch_stl_presets:
-        ho, hp = _get_preset_status(p)
+        ho, hp = _get_preset_status(scene, p)
         preset_metrics[p.name] = {"has_ovr": ho, "has_perm": hp}
     _ui_cache["preset_metrics"] = preset_metrics
 
@@ -759,7 +769,8 @@ def rebuild_ui_cache_if_dirty():
     total_objects = 0
     total_preset_combos = 0
 
-    preset_ovrs = get_flat_overrides(preset.nodegroups)
+    global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups)
+    preset_ovrs = global_ovrs + get_flat_overrides(preset.nodegroups)
 
     for c in preset.collections:
         c_ptr = bpy.data.collections.get(c.collection_name)
@@ -867,7 +878,7 @@ def build_tree_dict(context, preset, visibility_cache=None):
                     c_root = c_root[part]
                     c_root_path.append(part)
 
-        c_pinned_ovrs = get_flat_overrides(preset.nodegroups) + get_flat_overrides(c.nodegroups)
+        c_pinned_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups) + get_flat_overrides(preset.nodegroups) + get_flat_overrides(c.nodegroups)
 
         for obj_prop in c.objects:
             if not obj_prop.export: continue
@@ -1037,7 +1048,7 @@ def run_headless_export(job_file_path):
     t_phase0_start = time.perf_counter()
 
     execution_batches = {}
-    preset_ovrs = get_flat_overrides(preset.nodegroups)
+    preset_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups) + get_flat_overrides(preset.nodegroups)
     sig_preset = get_override_signature(preset_ovrs)
 
     for c in preset.collections:
@@ -1325,7 +1336,15 @@ def on_input_name_update(self, context):
         found_ng, found_node = None, None
         preset = get_active_preset(context.scene)
 
-        if preset:
+        # 1. Search Global
+        if not found_ng:
+            for ng in context.scene.batch_stl_global_nodegroups:
+                for n in ng.nodes:
+                    if self in n.inputs.values(): found_ng, found_node = ng, n; break
+                if found_ng: break
+
+        # 2. Search Preset
+        if preset and not found_ng:
             for ng in preset.nodegroups:
                 for n in ng.nodes:
                     if self in n.inputs.values(): found_ng, found_node = ng, n; break
@@ -1364,7 +1383,11 @@ def search_target_node_cb(self, context, edit_text):
     found_ng = None
     preset = get_active_preset(context.scene)
 
-    if preset:
+    if not found_ng:
+        for ng in context.scene.batch_stl_global_nodegroups:
+            if self in ng.nodes.values(): found_ng = ng; break
+
+    if preset and not found_ng:
         for ng in preset.nodegroups:
             if self in ng.nodes.values(): found_ng = ng; break
 
@@ -1397,7 +1420,15 @@ def search_menu_items_cb(self, context, edit_text):
     found_inp, found_n, found_ng = None, None, None
     preset = get_active_preset(context.scene)
 
-    if preset:
+    if not found_inp:
+        for ng in context.scene.batch_stl_global_nodegroups:
+            for n in ng.nodes:
+                for i in n.inputs:
+                    if self in i.values.values(): found_inp, found_n, found_ng = i, n, ng; break
+                if found_inp: break
+            if found_inp: break
+
+    if preset and not found_inp:
         for ng in preset.nodegroups:
             for n in ng.nodes:
                 for i in n.inputs:
@@ -1706,6 +1737,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
     # Operators can have variables passed into them to specify their target!
     # By taking indices for group (ng), node (n), input (i) and value (v), one operator controls the entire table.
     action: bpy.props.StringProperty()
+    is_global: bpy.props.BoolProperty(default=False)
     is_preset: bpy.props.BoolProperty(default=False)
     is_pinned: bpy.props.BoolProperty()
     c_idx: bpy.props.IntProperty(default=-1)
@@ -1757,7 +1789,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
         if not preset: return {'CANCELLED'}
 
         global _state
-        if self.action == 'PASTE_GROUP' or (self.action in ['MOVE_GROUP_UP', 'MOVE_GROUP_DOWN'] and self.shift_pressed):
+        if self.action == 'PASTE_GROUP' or (self.action in ['MOVE_GROUP_UP', 'MOVE_GROUP_DOWN'] and getattr(self, 'shift_pressed', False)):
             _state["is_pasting"] = True
 
         try:
@@ -1773,7 +1805,9 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                     obj.export = not obj.export
                     self._action_msg = "Toggle Object Export"
             else:
-                if self.is_preset:
+                if self.is_global:
+                    ng_list = context.scene.batch_stl_global_nodegroups
+                elif self.is_preset:
                     ng_list = preset.nodegroups
                 elif self.is_pinned:
                     active_col = get_active_collection(preset)
@@ -1931,13 +1965,19 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
 
                 elif self.action == 'MOVE_GROUP_UP':
                     if self.shift_pressed:
-                        if self.is_pinned and not self.is_preset:
+                        if self.is_preset:
+                            src_ng = ng_list[self.ng_idx]
+                            dst_ng = context.scene.batch_stl_global_nodegroups.add()
+                            paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
+                            ng_list.remove(self.ng_idx)
+                            self._action_msg = "Move Override to Global Level"
+                        elif self.is_pinned:
                             src_ng = ng_list[self.ng_idx]
                             dst_ng = preset.nodegroups.add()
                             paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
                             ng_list.remove(self.ng_idx)
                             self._action_msg = "Move Override to Preset Level"
-                        elif not self.is_pinned and not self.is_preset:
+                        elif not self.is_global:
                             src_ng = ng_list[self.ng_idx]
                             active_col = get_active_collection(preset)
                             if active_col:
@@ -1949,7 +1989,13 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                         if self.ng_idx > 0: ng_list.move(self.ng_idx, self.ng_idx - 1)
                 elif self.action == 'MOVE_GROUP_DOWN':
                     if self.shift_pressed:
-                        if self.is_preset:
+                        if self.is_global:
+                            src_ng = ng_list[self.ng_idx]
+                            dst_ng = preset.nodegroups.add()
+                            paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
+                            ng_list.remove(self.ng_idx)
+                            self._action_msg = "Move Override to Preset Level"
+                        elif self.is_preset:
                             src_ng = ng_list[self.ng_idx]
                             active_col = get_active_collection(preset)
                             if active_col:
@@ -1957,7 +2003,7 @@ class BATCH_STL_OT_table_action(bpy.types.Operator):
                                 paste_ng_from_dict(dst_ng, copy_ng_to_dict(src_ng))
                                 ng_list.remove(self.ng_idx)
                                 self._action_msg = "Move Override to Collection Level"
-                        elif self.is_pinned and not self.is_preset:
+                        elif self.is_pinned:
                             src_ng = ng_list[self.ng_idx]
                             active_col = get_active_collection(preset)
                             active_obj = get_active_object(active_col) if active_col else None
@@ -2092,6 +2138,10 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
 
         self.preset_idx = self.preset_index if self.preset_index >= 0 else scene.batch_stl_preset_index
         if self.preset_idx < 0 or self.preset_idx >= len(scene.batch_stl_presets): return {"CANCELLED"}
+
+        # Select the active list item automatically to view its console output
+        context.scene.batch_stl_preset_index = self.preset_idx
+
         self.preset = scene.batch_stl_presets[self.preset_idx]
 
         if self.preset.is_exporting: return {'CANCELLED'}
@@ -2111,7 +2161,8 @@ class EXPORT_OT_batch_stl_multi(bpy.types.Operator):
         if self.preset.preset_prefix:
             preset_root = os.path.normpath(os.path.join(preset_root, self.preset.preset_prefix))
 
-        preset_ovrs = get_flat_overrides(self.preset.nodegroups)
+        global_ovrs = get_flat_overrides(scene.batch_stl_global_nodegroups)
+        preset_ovrs = global_ovrs + get_flat_overrides(self.preset.nodegroups)
 
         for c in self.preset.collections:
             c_ptr = bpy.data.collections.get(c.collection_name)
@@ -2445,7 +2496,7 @@ def draw_inline_controls(layout, operator_id, use_clipboard=False):
         row.operator(operator_id, icon='PASTEDOWN', text="").action = 'PASTE'
 
 
-def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, title_text, is_preset=False):
+def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, title_text, is_preset=False, is_global=False):
     box = layout.box()
 
     header_row = box.row()
@@ -2453,14 +2504,14 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
     icon_open = 'TRIA_DOWN' if is_open else 'TRIA_RIGHT'
     header_row.prop(scene, is_open_prop, text="", icon=icon_open, emboss=False)
 
-    icon_header = 'PRESET' if is_preset else ('OUTLINER_COLLECTION' if is_pinned else 'OUTLINER_OB_MESH')
+    icon_header = 'WORLD' if is_global else ('PRESET' if is_preset else ('OUTLINER_COLLECTION' if is_pinned else 'OUTLINER_OB_MESH'))
     header_row.label(text=title_text, icon=icon_header)
 
     op_row = header_row.row(align=True)
     op = op_row.operator("batch_stl.table_action", text="", icon='ADD')
-    op.action = 'ADD_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset
+    op.action = 'ADD_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global
     op = op_row.operator("batch_stl.table_action", text="", icon='PASTEDOWN')
-    op.action = 'PASTE_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset
+    op.action = 'PASTE_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global
 
     if not is_open:
         return
@@ -2473,15 +2524,15 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
         ng_box = box.box()
         ng_layout = ng_box.column()
         ng_row = ng_layout.row(align=True)
-        op = ng_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_NODE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
 
         ng_row.prop_search(ng, "group_name", bpy.data, "node_groups", text="")
 
-        op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
-        op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_GROUP_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_GROUP_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
 
-        op = ng_row.operator("batch_stl.table_action", text="", icon='COPYDOWN'); op.action = 'COPY_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
-        op = ng_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='COPYDOWN'); op.action = 'COPY_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
+        op = ng_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_GROUP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx
 
         if not ng.nodes:
             continue
@@ -2497,13 +2548,13 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
             node_layout = node_container.column()
 
             n_row = node_layout.row(align=True)
-            op = n_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx
+            op = n_row.operator("batch_stl.table_action", text="", icon='ADD'); op.action = 'ADD_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
             n_row.prop(node, "name", text="", icon='NODETREE')
 
             if len(ng.nodes) > 1:
-                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_NODE_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx
-                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_NODE_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx
-                op = n_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_NODE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_NODE_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_NODE_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
+                op = n_row.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_NODE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx
 
             if not node.inputs:
                 continue
@@ -2522,11 +2573,8 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                     s_main = i_row.split(factor=0.35, align=False)
                     c_inp = s_main.row(align=True)
 
-                    if not is_preset:
-                        op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
-                        op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = -1
-                    else:
-                        c_inp.label(text="", icon='BLANK1')
+                    op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
+                    op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = -1
 
                     ng_ptr = bpy.data.node_groups.get(ng.group_name)
                     is_mod = not node.name or node.name == "<Modifier Interface>"
@@ -2544,9 +2592,9 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                     c_dir = s_val.row(align=True)
 
                     if len(node.inputs) > 1:
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                    op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                    op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
 
                     continue
 
@@ -2558,14 +2606,11 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
                     c_inp = s_main.row(align=True)
 
                     if i_first:
-                        if not is_preset:
-                            if getattr(val, "use_sweep", False):
-                                op = c_inp.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
-                            else:
-                                op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
-                            op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
+                        if getattr(val, "use_sweep", False):
+                            op = c_inp.operator("batch_stl.table_action", text="", icon='FILE_REFRESH', depress=True)
                         else:
-                            c_inp.label(text="", icon='BLANK1')
+                            op = c_inp.operator("batch_stl.table_action", text="", icon='ADD')
+                        op.action = 'VALUE_ACTION'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
 
                         ng_ptr = bpy.data.node_groups.get(ng.group_name)
                         is_mod = not node.name or node.name == "<Modifier Interface>"
@@ -2608,33 +2653,31 @@ def draw_overrides_table(layout, scene, nodegroups, is_pinned, is_open_prop, tit
 
                     c_dir = s_val.row(align=True)
 
-                    if not is_preset:
-                        is_permutation = len(inp.values) > 1 or any(getattr(v, "use_sweep", False) for v in inp.values)
+                    is_permutation = len(inp.values) > 1 or any(getattr(v, "use_sweep", False) for v in inp.values)
 
-                        if is_permutation:
-                            # Converted implicit UI property toggles to fully controlled internal operators
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='FILE_FOLDER', depress=val.use_dir)
-                            op.action = 'TOGGLE_VALUE_USE_DIR'
-                            op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                    if is_permutation:
+                        # Converted implicit UI property toggles to fully controlled internal operators
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='FILE_FOLDER', depress=val.use_dir)
+                        op.action = 'TOGGLE_VALUE_USE_DIR'
+                        op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='BOOKMARKS', depress=val.use_tag)
-                            op.action = 'TOGGLE_VALUE_USE_TAG'
-                            op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='BOOKMARKS', depress=val.use_tag)
+                        op.action = 'TOGGLE_VALUE_USE_TAG'
+                        op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
-                            c_dir.prop(val, "tag", text="")
+                        c_dir.prop(val, "tag", text="")
 
                     if i_first:
                         if len(node.inputs) > 1:
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_INPUT_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_INPUT_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx
 
-                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE_OR_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE_OR_INPUT'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = 0
                     else:
-                        if not is_preset:
-                            if len(inp.values) > 1:
-                                op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_VALUE_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-                                op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
-                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                        if len(inp.values) > 1:
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_UP'); op.action = 'MOVE_VALUE_UP'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                            op = c_dir.operator("batch_stl.table_action", text="", icon='TRIA_DOWN'); op.action = 'MOVE_VALUE_DOWN'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
+                        op = c_dir.operator("batch_stl.table_action", text="", icon='TRASH'); op.action = 'DEL_VALUE'; op.is_pinned = is_pinned; op.is_preset = is_preset; op.is_global = is_global; op.ng_idx = ng_idx; op.n_idx = n_idx; op.i_idx = i_idx; op.v_idx = v_idx
 
 # This class defines the massive main panel in the 3D Viewport Toolbar ('N' panel).
 class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
@@ -2691,6 +2734,8 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
             p_box.template_list("BATCH_STL_UL_presets", "", scene, "batch_stl_presets", scene, "batch_stl_preset_index", rows=3)
 
         if active_preset:
+            p_box.separator(factor=0.5)
+            draw_overrides_table(p_box, scene, scene.batch_stl_global_nodegroups, False, "batch_stl_ui_global_ovr_main", "Global Overrides", is_global=True)
             p_box.separator(factor=0.5)
             draw_overrides_table(p_box, scene, active_preset.nodegroups, False, "batch_stl_ui_preset_ovr", f"Preset Overrides ({active_preset.name})", is_preset=True)
 
@@ -2758,7 +2803,7 @@ class VIEW3D_PT_batch_export_stl_multi(bpy.types.Panel):
 
             if scene.batch_stl_ui_tips:
                 col = tip_box.column()
-                col.label(text="Hierarchy: Preset > Collection > Object > NodeGroup > Node.", icon='BLANK1')
+                col.label(text="Hierarchy: Global > Preset > Collection > Object > NodeGroup > Node.", icon='BLANK1')
                 col.label(text="For modifier targets, leave Node blank or set as <Modifier Interface>", icon='BLANK1')
                 col.separator()
 
@@ -2861,15 +2906,22 @@ def register():
     # Attach our custom variables directly to Blender's Scene object so they are saved per-file.
     bpy.types.Scene.batch_stl_root_dir = bpy.props.StringProperty(name="Root Export Dir", default="//", subtype="DIR_PATH", update=upd_root_dir)
     bpy.types.Scene.batch_stl_presets = bpy.props.CollectionProperty(type=BatchSTLExportPreset)
+
+    # NEW: Global overrides attached directly to the scene
+    bpy.types.Scene.batch_stl_global_nodegroups = bpy.props.CollectionProperty(type=BatchSTLNodeGroup)
+
     bpy.types.Scene.batch_stl_preset_index = bpy.props.IntProperty(name="Active Preset", default=0, update=upd_preset_idx)
     bpy.types.Scene.batch_stl_verbose_console = bpy.props.BoolProperty(name="Verbose Console Output", default=False, options={'SKIP_SAVE'})
 
     bpy.types.Scene.batch_stl_ui_presets = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_collections = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_objects = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
+
+    bpy.types.Scene.batch_stl_ui_global_ovr_main = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_preset_ovr = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_global_ovr = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_local_ovr = bpy.props.BoolProperty(default=True, options={'SKIP_SAVE'})
+
     bpy.types.Scene.batch_stl_ui_global_ovr_nested = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_local_ovr_nested = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
     bpy.types.Scene.batch_stl_ui_tips = bpy.props.BoolProperty(default=False, options={'SKIP_SAVE'})
@@ -2908,6 +2960,7 @@ def unregister():
 
     properties_to_remove = [
         "batch_stl_root_dir", "batch_stl_presets", "batch_stl_preset_index",
+        "batch_stl_global_nodegroups", "batch_stl_ui_global_ovr_main",
         "batch_stl_verbose_console", "batch_stl_ui_presets", "batch_stl_ui_collections", "batch_stl_ui_objects",
         "batch_stl_ui_preset_ovr", "batch_stl_ui_global_ovr", "batch_stl_ui_local_ovr",
         "batch_stl_show_tree", "batch_stl_show_console", "batch_stl_collapsed_dirs",
